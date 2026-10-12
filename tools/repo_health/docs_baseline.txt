@@ -1,0 +1,3 @@
+﻿missing include/ninfer/ops/<family>.h (from docs/maintainer/op-development.md)
+missing src/ops/{wrapper,launcher,kernel} (from docs/maintainer/op-development.md)
+missing src/ops/<family>/sources.cmake (from docs/maintainer/op-development.md)

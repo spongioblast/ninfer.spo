@@ -1,0 +1,14 @@
+# Preserve repository-pinned upstream sources byte-for-byte; NInfer-owned files retain Git's
+# default whitespace checks.
+/third_party/spdlog/include/** -whitespace
+/third_party/spdlog/src/** -whitespace
+
+# One line-ending convention for the whole tree. `text=auto` leaves git's binary detection
+# alone. eol=lf overrides core.autocrlf so byte-exact fixtures and chat templates stay LF.
+* text=auto eol=lf
+bench/fixtures/ttft/**/*.json text eol=lf
+bench/fixtures/ttft/**/*.txt text eol=lf
+bench/fixtures/ttft/**/*.md text eol=lf
+examples/cli/messages/**/*.json text eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf

@@ -1,0 +1,34 @@
+# path reason
+tools/bench/run_serve_concurrency.py over the Python cap at the R2 baseline
+tools/bench/run_serve_corpus.py over the Python cap at the R2 baseline
+tools/bench/ttft/cases.py over the Python cap at the R2 baseline
+tools/bench/ttft/report.py over the Python cap at the R2 baseline
+tools/convert/qwen3_5.py over the Python cap at the R2 baseline
+tools/bench/make_bench_corpus.py Unicode test data
+tools/bench/ttft/cases.py Unicode test data
+tests/test_cli_options.cpp Unicode test data
+tests/test_grammar.cpp Unicode test data
+tests/test_ninfer_bench_support.cpp Unicode test data
+tests/test_openai_schema.cpp Unicode test data
+tests/bench/ttft/test_measurements.py Unicode test data
+tests/models/qwen3_5/test_engine_grammar_real.cpp Unicode test data
+tests/models/qwen3_5/test_engine_prefix_real.cpp Unicode test data
+tests/models/qwen3_5/test_engine_tools_real.cpp Unicode test data
+tests/models/qwen3_5/test_frontend.cpp Unicode test data
+tests/models/qwen3_5/test_tool_constraints.cpp Unicode test data
+tests/models/qwen3_5/test_tool_schema.py Unicode test data
+tests/text/test_chat_templates.py Unicode test data
+tests/text/test_jinja.cpp Unicode test data
+tests/text/test_json_schema.cpp Unicode test data
+tests/text/test_json_schema.py Unicode test data
+tests/text/test_regex_choice.cpp Unicode test data
+docs/cli.md upstream doc, rewrite in R9
+docs/serving.md upstream doc, rewrite in R9
+docs/maintainer/artifact-container.md upstream doc, rewrite in R9
+docs/maintainer/constrained-decoding.md upstream doc, rewrite in R9
+docs/maintainer/linear-benchmark.md upstream doc, rewrite in R9
+docs/maintainer/paged-kv-cache.md upstream doc, rewrite in R9
+docs/maintainer/replayssm-gdn.md upstream doc, rewrite in R9
+docs/maintainer/examples/q4-linear.md upstream doc, rewrite in R9
+src/models/qwen3_5/program/program.h::src/models/qwen3_8_flash_next/program/v3_contract.h the same engine-facing handle classes (RequestBasePlan, ResumeState, ContextReclaimPlan), each over its own model's private Impl
+src/models/qwen3_5/program/program_impl.cpp::src/models/qwen3_8_flash_next/program/p_score.cpp call sites of program/execution/causal_score.h around each model's own prefill and projection

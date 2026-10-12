@@ -1,0 +1,40 @@
+# Flash-Next mathematical and complete Engine qualification.
+ninfer_add_op_test(ninfer_hyperconnection_test SOURCES ops/test_hyperconnection.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_flash_next_ple_test SOURCES ops/test_flash_next_ple.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_flash_next_moe_test SOURCES ops/test_flash_next_moe.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_flash_next_qsa_test SOURCES ops/test_flash_next_qsa.cpp LIBRARIES ninfer_ops)
+ninfer_add_op_test(ninfer_flash_next_gdn_test SOURCES ops/test_flash_next_gdn.cpp LIBRARIES ninfer_ops)
+ninfer_add_test(ninfer_qwen3_8_flash_next_real_test
+  SOURCES models/qwen3_8_flash_next_125b_a6b/test_engine_real.cpp LIBRARIES ninfer_engine)
+add_test(NAME ninfer_qwen3_8_flash_next_graph_real_test
+  COMMAND ninfer_qwen3_8_flash_next_real_test --graph-equivalence)
+add_test(NAME ninfer_qwen3_8_flash_next_prefill_graph_mtp_real_test
+  COMMAND ninfer_qwen3_8_flash_next_real_test --prefill-graph-mtp)
+add_test(NAME ninfer_qwen3_8_flash_next_kv_pressure_real_test
+  COMMAND ninfer_qwen3_8_flash_next_real_test --kv-pressure)
+set_tests_properties(
+  ninfer_qwen3_8_flash_next_real_test
+  ninfer_qwen3_8_flash_next_graph_real_test
+  ninfer_qwen3_8_flash_next_prefill_graph_mtp_real_test
+  ninfer_qwen3_8_flash_next_kv_pressure_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
+ninfer_add_test(ninfer_qwen3_8_flash_next_ple_table_test
+  SOURCES models/qwen3_8_flash_next/test_ple_table.cpp LIBRARIES ninfer_model_runtime)
+ninfer_add_test(ninfer_qwen3_8_flash_next_rewrite_grouping_test
+  SOURCES models/qwen3_8_flash_next/test_rewrite_grouping.cpp LIBRARIES ninfer_model_runtime)
+ninfer_add_test(ninfer_qwen3_8_flash_next_prefill_graph_test
+  SOURCES models/qwen3_8_flash_next/test_prefill_graph.cpp LIBRARIES ninfer_model_runtime)
+ninfer_add_test(ninfer_qwen3_8_flash_next_load_plan_test
+  SOURCES models/qwen3_8_flash_next_125b_a6b/test_load_plan.cpp LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen3_8_flash_next_load_plan_test PROPERTIES SKIP_RETURN_CODE 77)
+if(NINFER_PERFORMANCE_TRACE)
+  ninfer_add_test(ninfer_performance_trace_fixture
+    SOURCES performance_trace_fixture.cu LIBRARIES ninfer_ops)
+endif()
+ninfer_add_test(ninfer_qwen3_8_flash_next_frontend_test
+  SOURCES models/qwen3_8_flash_next/test_frontend.cpp LIBRARIES ninfer_model_runtime)
+set_tests_properties(ninfer_qwen3_8_flash_next_frontend_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_op_test(ninfer_activation_steering_test SOURCES ops/test_activation_steering.cpp LIBRARIES ninfer_ops)
+
+ninfer_add_test(ninfer_activation_control_test SOURCES models/qwen3_8_flash_next/test_activation_control.cpp LIBRARIES ninfer_model_runtime)

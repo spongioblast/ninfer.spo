@@ -1,0 +1,63 @@
+{
+  "artifact_type": "ninfer_context_cost_presets",
+  "machines": [
+    {
+      "hardware_class": "nvidia-rtx-pro-6000-blackwell-max-q-workstation-edition-sm120",
+      "prefill": [
+        {
+          "coefficients": {
+            "attention_pair_ns_q32": 1346790669,
+            "chunk_ns": 50924757,
+            "token_ns_q32": 392981521560597,
+            "vision_item_ns": 6261586,
+            "vision_patch_ns_q32": 27859561244360
+          },
+          "prefill_signature": "qwen3_8_flash_next_125b_a6b-nvfp4-v3-1",
+          "provenance": {
+            "architecture": "Qwen3_8FlashNextForCausalLM",
+            "artifact_path": "D:\\99_LLM_MODELS\\ninfer\\qwen3_8_flash_next_125b_a6b_nvfp4_fp8proj_nvfp4mtp.ninfer",
+            "compute_capability": "12.0",
+            "corpus": "D:\\01_PROJECTS\\PICOT\\NInfer.spo\\ninfer\\bench\\fixtures\\qwen3_8_flash_next_context.ids",
+            "cuda_driver": "13.4",
+            "cuda_runtime": "13.4",
+            "device": 0,
+            "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+            "max_context": 262144,
+            "prefill_chunk": 8192,
+            "prefill_repetitions": 5,
+            "suite": "prefill"
+          }
+        }
+      ],
+      "transfer": {
+        "d2d": {
+          "batch_ns": 2129,
+          "ns_per_byte_q32": 1966087,
+          "operation_ns": 7878
+        },
+        "d2h": {
+          "batch_ns": 94671,
+          "ns_per_byte_q32": 328757010,
+          "operation_ns": 5099
+        },
+        "h2d": {
+          "batch_ns": 60150,
+          "ns_per_byte_q32": 331924659,
+          "operation_ns": 6223
+        }
+      },
+      "transfer_provenance": {
+        "compute_capability": "12.0",
+        "cuda_driver": "13.4",
+        "cuda_runtime": "13.4",
+        "device": 0,
+        "gpu": "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition",
+        "suite": "transfer",
+        "transfer_p95_limit": 0.5,
+        "transfer_repetitions": 41,
+        "transfer_warmup": 5
+      }
+    }
+  ],
+  "schema_version": 3
+}

@@ -1,0 +1,5 @@
+#!/bin/sh
+cd "$(dirname "$0")/.." || exit 1
+python tools/repo_health/health.py --changed sizes || exit 1
+python tools/repo_health/health.py --changed layers || exit 1
+python tools/repo_health/health.py --changed lang || exit 1

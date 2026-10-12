@@ -1,0 +1,10 @@
+platform src/artifact/file_io.cpp
+platform src/artifact/file_io.h
+platform src/artifact/reader.cpp
+platform src/product/logging/logging.cpp
+platform src/product/logging/startup_log.cpp
+platform src/product/media_acquire/acquire.cpp
+platform src/runtime/engine/context_cache/context_cost.cpp
+platform src/serve/request_log.cpp
+platform src/artifact/resident_memory.cpp
+platform src/models/qwen3_8_flash_next_125b_a6b/impl/load_plan.cpp

@@ -1,0 +1,340 @@
+#pragma once
+#include "core/host_worker_pool.h"
+#include "models/qwen3_8_flash_next/impl/runtime/instance.h"
+
+#include "core/arena.h"
+#include "core/device.h"
+#include "core/gdn_replay_records.h"
+#include "core/linear_attention_state.h"
+#include "core/tensor.h"
+#include "core/weight.h"
+#include "ninfer/ops/sampling.h"
+#include "ninfer/ops/softmax_attention.h"
+#include <ninfer/models/qwen3_8_flash_next/decoder_state.h>
+#include <ninfer/models/qwen3_8_flash_next/prepared_prompt.h>
+#include <ninfer/models/qwen3_8_flash_next/round_state.h>
+
+#include <array>
+#include <cstddef>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+namespace ninfer::models::qwen3_8_flash_next::detail::qwen3_8_flash_next_125b_a6b_runtime::
+    schedule {
+
+// Target-private compatibility vocabulary for the mechanically preserved fixed schedule. It is
+// data-only: TextContext is constructed on the stack for one schedule recording/execution and owns
+// neither weights nor device state.
+struct ModelConfig {
+    static constexpr int hidden              = TextConfig::hidden;
+    static constexpr int n_layers            = TextConfig::layers;
+    static constexpr int intermediate        = TextConfig::intermediate;
+    static constexpr int vocab               = TextConfig::output_rows;
+    static constexpr int token_domain        = TextConfig::token_domain;
+    static constexpr int gdn_k_heads         = TextConfig::gdn_key_heads;
+    static constexpr int gdn_k_dim           = TextConfig::gdn_key_head_dim;
+    static constexpr int gdn_v_heads         = TextConfig::gdn_value_heads;
+    static constexpr int gdn_v_dim           = TextConfig::gdn_value_head_dim;
+    static constexpr int n_q                 = TextConfig::query_heads;
+    static constexpr int n_kv                = TextConfig::kv_heads;
+    static constexpr int head_dim            = TextConfig::head_dim;
+    static constexpr int rotary_dim          = TextConfig::rotary_dim;
+    static constexpr int key_dim             = TextConfig::key_dim;
+    static constexpr int value_dim           = TextConfig::value_dim;
+    static constexpr int conv_dim            = TextConfig::convolution_dim;
+    static constexpr int q_size              = TextConfig::query_size;
+    static constexpr int kv_size             = TextConfig::kv_size;
+    static constexpr int mtp_fc_in           = TextConfig::mtp_input_rows;
+    static constexpr int mtp_attn_in         = TextConfig::mtp_attention_input_rows;
+    static constexpr int mtp_mlp_gateup_rows = TextConfig::mtp_mlp_gate_up_rows;
+    static constexpr float rms_eps           = TextConfig::rms_epsilon;
+    static constexpr float rope_theta        = TextConfig::rope_theta;
+    static constexpr int mtp_layers          = TextConfig::mtp_layers;
+
+    [[nodiscard]] static constexpr bool is_full(int layer) {
+        return TextConfig::is_full_attention(layer);
+    }
+
+    [[nodiscard]] static constexpr int n_full() { return TextConfig::full_attention_layers(); }
+
+    [[nodiscard]] static constexpr int n_gdn() { return TextConfig::gdn_layers(); }
+
+    [[nodiscard]] static constexpr int full_idx(int layer) {
+        return TextConfig::full_attention_index(layer);
+    }
+
+    [[nodiscard]] static constexpr int gdn_idx(int layer) { return TextConfig::gdn_index(layer); }
+};
+
+inline constexpr ModelConfig kCfg{};
+inline constexpr float kAttnScale                     = kAttentionScale;
+inline constexpr std::uint32_t kPrefillChunkAlignment = 128;
+
+struct MlpW {
+    const MlpWeights* payload = nullptr;
+};
+
+struct FullLayerW {
+    const Tensor* input_norm                         = nullptr;
+    const FullAttentionProjectionWeights* projection = nullptr;
+    const Weight* o_proj                             = nullptr;
+    const Tensor* q_norm                             = nullptr;
+    const Tensor* k_norm                             = nullptr;
+    const Tensor* post_attn_norm                     = nullptr;
+    MlpW mlp;
+};
+
+struct GdnLayerW {
+    const Tensor* input_norm               = nullptr;
+    const GdnProjectionWeights* projection = nullptr;
+    const Tensor* conv1d                   = nullptr;
+    const Tensor* gdn_norm                 = nullptr;
+    const Weight* out_proj                 = nullptr;
+    const Tensor* post_attn_norm           = nullptr;
+    MlpW mlp;
+};
+
+struct MtpW {
+    const MtpWeights* payload           = nullptr;
+    const Weight* fc                    = nullptr;
+    const Tensor* pre_fc_norm_embedding = nullptr;
+    const Tensor* pre_fc_norm_hidden    = nullptr;
+    const Tensor* input_norm            = nullptr;
+    const Tensor* q_norm                = nullptr;
+    const Tensor* k_norm                = nullptr;
+    const Weight* o_proj                = nullptr;
+    const Tensor* post_attn_norm        = nullptr;
+    const Tensor* norm                  = nullptr;
+};
+
+using Phase = qwen3_8_flash_next::TextPhase;
+
+enum class GdnStateAction : std::uint8_t {
+    UpdateInPlace,
+    RecordForReplay,
+};
+
+struct PrefillChunkResult {
+    std::uint32_t processed_tokens = 0;
+    bool finalized                 = false;
+    runtime::ExecutionTiming timing;
+};
+
+class VisionPrefillSession;
+
+class TextContext {
+public:
+    TextContext(
+        DeviceContext& ctx, const LoadedModelData& weights, WorkspaceArena& work,
+        qwen3_8_flash_next::PagedKVCacheView kv, LinearAttentionStatePool& state,
+        qwen3_8_flash_next::RoundState& io, Tensor& prefill_hidden, std::uint32_t prefill_chunk,
+        std::uint32_t text_kv_base,
+        qwen3_8_flash_next::PagedKVCacheView mtp_kv = qwen3_8_flash_next::PagedKVCacheView(),
+        const qwen3_8_flash_next::PagedKVCache* batch_text_kv = nullptr,
+        const qwen3_8_flash_next::PagedKVCache* batch_mtp_kv  = nullptr,
+        Tensor* ple_state                                     = nullptr);
+    ~TextContext();
+
+    TextContext(const TextContext&)            = delete;
+    TextContext& operator=(const TextContext&) = delete;
+
+    void set_proposal_head(const Weight* weight, const std::int32_t* ids, int count) noexcept {
+        proposal_head_     = weight;
+        proposal_head_ids_ = ids;
+        proposal_head_n_   = count;
+    }
+
+    void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
+
+    void set_bf16_gemm(ops::Bf16GemmContext* context) noexcept { bf16_gemm_ = context; }
+
+    void set_ple_gather_workers(HostWorkerPool* workers) noexcept { ple_gather_workers_ = workers; }
+
+    void set_prefill_split_frontier(std::int64_t position) noexcept {
+        prefill_split_frontier_ = position;
+    }
+
+    void set_rewrite_checkpoint_hidden_output(Tensor* output) noexcept {
+        rewrite_checkpoint_hidden_output_ = output;
+    }
+
+    void set_rewrite_checkpoint_mtp_hidden_output(Tensor* output) noexcept {
+        rewrite_checkpoint_mtp_hidden_output_ = output;
+    }
+
+    void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
+
+    // Text tokens after a multimodal prompt keep its M-RoPE offset. A multimodal chunk sets
+    // its own, and a text chunk at base 0 resets it.
+    void set_rope_delta(std::int32_t delta) noexcept { rope_delta_ = delta; }
+
+    void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
+    void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+
+    void set_ple_replay_records(Tensor* records) noexcept { ple_replay_records_ = records; }
+
+    void set_ple_embeddings(const Tensor* embeddings) noexcept {
+        active_ple_embeddings_ = embeddings;
+    }
+
+    void set_mtp_prefill_hidden(Tensor* hidden) noexcept { mtp_prefill_hidden_ = hidden; }
+
+    void set_flash_predictor_hidden_output(Tensor* hidden) noexcept {
+        flash_predictor_hidden_output_ = hidden;
+    }
+
+    [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
+
+    [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {
+        return proposal_head_ids_;
+    }
+
+    [[nodiscard]] int proposal_head_n() const noexcept { return proposal_head_n_; }
+
+    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   bool finalize_at_end);
+    [[nodiscard]] PrefillChunkResult
+    prefill_chunk(const qwen3_8_flash_next::PreparedPromptData& input, std::uint32_t begin,
+                  std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
+    void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
+                               const Tensor& rope_positions, const Tensor& kv_table_rows,
+                               const Tensor& linear_state_source_slots,
+                               const Tensor& linear_state_destination_slots,
+                               ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                               Tensor& logits, const Tensor* ple_embeddings = nullptr);
+    void target_verify_batch(const Tensor& ids, const Tensor& cache_positions,
+                             const Tensor& rope_positions, const Tensor& valid_columns,
+                             const Tensor& kv_table_rows, const Tensor& linear_state_source_slots,
+                             ops::CausalAttentionExecutionEnvelope envelope, Tensor& hidden,
+                             Tensor& logits, Tensor& target_tokens);
+    void mtp_forward_decode_batch(const Tensor& ids, const Tensor& hidden,
+                                  const Tensor& cache_positions, const Tensor& rope_positions,
+                                  const Tensor& valid_columns, const Tensor& kv_table_rows,
+                                  ops::CausalAttentionExecutionEnvelope envelope,
+                                  Tensor& mtp_hidden, Tensor* predictor_hidden = nullptr,
+                                  Tensor* selected_qsa_indices     = nullptr,
+                                  const Tensor* reused_qsa_indices = nullptr);
+    void mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor& draft_tokens);
+    void mtp_forward_batch(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                           ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
+                           int logits_column, Tensor* logits, Tensor* draft_token,
+                           const Tensor* explicit_rope_positions = nullptr,
+                           const Tensor* input_embeddings        = nullptr,
+                           Tensor* predictor_hidden              = nullptr);
+    void mtp_forward_ar_step(const Tensor& token, const Tensor& previous_hidden,
+                             const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
+                             Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token,
+                             Tensor* predictor_hidden = nullptr);
+private:
+    void bind();
+
+    [[nodiscard]] bool mtp_enabled() const noexcept {
+        return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
+    }
+
+    [[nodiscard]] const MtpW& mtp_weights() const;
+    void attn_mix(const FullLayerW& weights, Tensor& x, int index, Phase phase);
+    void gdn_mix(const GdnLayerW& weights, Tensor& x, int index, Phase phase);
+    void mlp_tail(const Tensor* post_norm, const MlpW& weights, Tensor& x, Phase phase);
+    void run_layers(Tensor& x, Phase phase);
+    void run_flash_next_layers(Tensor& x, Phase phase);
+
+    void mtp_forward_stem(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
+                          Tensor& x, Tensor& ah);
+    void mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
+                          const Tensor& rope_positions,
+                          ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden);
+    void mtp_forward_core(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                          const Tensor& rope_positions,
+                          ops::CausalAttentionExecutionEnvelope envelope, Tensor& mtp_hidden,
+                          const Tensor* input_embeddings, Tensor* predictor_hidden,
+                          Tensor* selected_qsa_indices     = nullptr,
+                          const Tensor* reused_qsa_indices = nullptr);
+    void mtp_forward_flash_next(const Tensor& ids, const Tensor& hidden, const Tensor& positions,
+                                const Tensor& rope_positions,
+                                ops::CausalAttentionExecutionEnvelope envelope,
+                                Tensor& sample_hidden, const Tensor* input_embeddings,
+                                Tensor& predictor_hidden, Tensor* selected_qsa_indices,
+                                const Tensor* reused_qsa_indices);
+    void mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden, const Tensor* input_embeddings,
+                           const Tensor& positions, const Tensor& rope_positions,
+                           ops::CausalAttentionExecutionEnvelope envelope, bool final_chunk,
+                           Tensor* final_hidden, Tensor* logits, Tensor* draft_token);
+    void proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& proposal_tokens);
+
+    struct MultimodalPrefill {
+        std::span<const int> token_ids;
+        std::span<const std::int32_t> positions;
+        VisionPrefillSession* vision = nullptr;
+        std::uint32_t begin          = 0;
+        std::int32_t rope_delta      = 0;
+    };
+
+    struct TextPrefill {
+        std::span<const int> token_ids;
+        std::uint32_t begin = 0;
+    };
+
+    [[nodiscard]] PrefillChunkResult
+    prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
+                 const MultimodalPrefill* multimodal, bool finalize_at_end);
+    DeviceContext& ctx_;
+    const LoadedModelData& weights_;
+    WorkspaceArena& work_;
+    qwen3_8_flash_next::PagedKVCacheView kv_;
+    qwen3_8_flash_next::PagedKVCacheView mtp_kv_;
+    const qwen3_8_flash_next::PagedKVCache* batch_text_kv_ = nullptr;
+    const qwen3_8_flash_next::PagedKVCache* batch_mtp_kv_  = nullptr;
+    LinearAttentionStatePool& state_;
+    Tensor* ple_state_;
+    Tensor* ple_replay_records_ = nullptr;
+    qwen3_8_flash_next::RoundState& io_;
+    Tensor& prefill_hidden_;
+    Tensor* mtp_prefill_hidden_                   = nullptr;
+    Tensor* flash_predictor_hidden_output_        = nullptr;
+    Tensor* rewrite_checkpoint_mtp_hidden_output_ = nullptr;
+    std::uint32_t prefill_chunk_;
+    std::uint32_t text_kv_base_;
+    const Tensor* active_activation_ids_ = nullptr;
+    const Tensor* active_cache_positions_                                          = nullptr;
+    const Tensor* active_rope_positions_                                           = nullptr;
+    const Tensor* active_kv_table_rows_                                            = nullptr;
+    const Tensor* active_linear_state_source_slots_                                = nullptr;
+    const Tensor* active_linear_state_destination_slots_                           = nullptr;
+    const Tensor* active_valid_columns_                                            = nullptr;
+    const Tensor* active_ple_embeddings_                                           = nullptr;
+    const Tensor* active_backend_kv_table_rows_                                    = nullptr;
+    const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
+    std::int32_t active_sequence_batch_                                            = 0;
+    std::int32_t active_sequence_width_                                            = 0;
+    std::int32_t rope_delta_                                                       = 0;
+    std::int32_t linear_state_source_slot_                                         = 0;
+    std::int32_t linear_state_destination_slot_                                    = 0;
+    GdnStateAction gdn_state_action_          = GdnStateAction::UpdateInPlace;
+    const GdnReplayRecords* replay_records_   = nullptr;
+    std::int64_t prefill_split_frontier_      = -1;
+    Tensor* rewrite_checkpoint_hidden_output_ = nullptr;
+    std::uint32_t mtp_proposal_extent_        = 0;
+
+    const Weight* embed_                        = nullptr;
+    const Tensor* final_norm_                   = nullptr;
+    const Weight* lm_head_                      = nullptr;
+    const Weight* proposal_head_                = nullptr;
+    const std::int32_t* proposal_head_ids_      = nullptr;
+    int proposal_head_n_                        = 0;
+    const ops::SamplingConfig* sampling_config_ = nullptr;
+    ops::Bf16GemmContext* bf16_gemm_            = nullptr;
+    HostWorkerPool* ple_gather_workers_          = nullptr;
+    MtpW mtp_;
+    std::array<FullLayerW, TextConfig::full_attention_layers()> full_{};
+    std::array<GdnLayerW, TextConfig::gdn_layers()> gdn_{};
+    std::array<Weight, TextConfig::gdn_layers()> gdn_in_a_{};
+    std::array<Weight, TextConfig::gdn_layers()> gdn_in_b_{};
+    std::array<Tensor, TextConfig::gdn_layers()> gdn_conv1d_views_{};
+};
+
+} // namespace
+  // ninfer::models::qwen3_8_flash_next::detail::qwen3_8_flash_next_125b_a6b_runtime::schedule

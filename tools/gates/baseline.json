@@ -1,0 +1,93 @@
+{
+  "tag": "v2-baseline",
+  "commit": "944d4a13a0d2209cba25c05cbb47e84e112605db",
+  "recorded": "2026-10-09",
+  "source": "docs/verification/ninfer-windows/LOG.md sections V2 D, E, F, H. Measured on the V2 tree before this commit; the commit is that tree.",
+  "real_tests": {
+    "ninfer_qwen3_8_flash_next_real_test": "pass",
+    "ninfer_qwen3_8_flash_next_graph_real_test": "pass",
+    "ninfer_qwen3_8_flash_next_prefill_graph_mtp_real_test": "pass",
+    "evidence": "LOG V2 checks, real_v2b.txt, after the decode-bucket fix"
+  },
+  "token_dumps": {
+    "captured": false,
+    "reason": "ninfer-serve (pid 41996) holds GPU 1 at about 91 GiB. The real-test binaries were not in build-release (release build links apps only). Dumps wait until that server can stop."
+  },
+  "perplexity_quick": {
+    "value": 3.556443,
+    "mean_nll": 1.268761,
+    "gate_abs": 0.002
+  },
+  "live_probe_turns_12": {
+    "server_ttft_median_ms": 48.0,
+    "client_ttft_median_ms": 71,
+    "gate_ms": 2,
+    "note": "Tmax 64 sweep, LOG V2 D. Client 71 ms is p8 short live turn at Tmax 64."
+  },
+  "p8_short_client_ttft_ms_tmax64": {
+    "live_turn": 71,
+    "live_turn_thinking": 114,
+    "pi_new_chat": 588,
+    "short_during_120k": 331,
+    "cold_120k": 12735,
+    "gate_ms": 2
+  },
+  "warm_turns": {
+    "114k_cold_server_s": 15.56,
+    "258k_cold_server_s": 42.0,
+    "114k_extend_server_ms": [185, 196, 213],
+    "258k_extend_server_ms": [221, 207, 186],
+    "114k_repeat_server_ms": 30.6,
+    "258k_repeat_server_ms": 28.4
+  },
+  "mtp_tok_s": {
+    "drafts_4_8k": 290.9,
+    "drafts_4_64k": 366.8,
+    "auto_8k": 282.8,
+    "auto_64k": 362.0,
+    "gate_ratio": 0.98
+  },
+  "decode_round_gap_p50_us": 374,
+  "decode_round_gap_gate_us": 100,
+  "soak_120_workers_2": {
+    "errors": 0,
+    "requests": 6408,
+    "latch": false,
+    "warm_ttft_median_ms": 526,
+    "decode_median_tok_s": 226,
+    "prefill_median_tok_s": 4700,
+    "rss_gib_start": 150.53,
+    "rss_gib_at_20_min": 151.28,
+    "rss_gib_at_120_min": 151.31,
+    "rss_drift_gib_per_100_min": 0.014,
+    "rss_drift_gate_gib": 0.1,
+    "nvml_gib_end": 91.77
+  },
+  "grammar": {
+    "grammar_live": "6/6",
+    "constrained_equals_unconstrained_tokens": true,
+    "equal_token_count": 21
+  },
+  "load_ready_s": 106,
+  "load_ready_gate_ratio": 1.03,
+  "load_ready_note": "V2 F: serve_ctl restart --build build-release was ready after 106 s. That is process start to first ready, including weight load.",
+  "memory_idle_after_load": {
+    "nvml_gib": 91.62,
+    "rss_gib": 150.53,
+    "note": "First soak sample, model loaded, before the host session tier filled."
+  },
+  "memory_after_long_context": {
+    "nvml_gib": 91.77,
+    "rss_gib": 151.31,
+    "note": "End of the 120-minute two-client soak, not a single 250k turn. Dedicated VRAM stayed flat; RSS growth is the host session tier."
+  },
+  "vram_gate_ratio": 1.01,
+  "build": {
+    "incremental_release_steps": 266,
+    "log": "tmp/ninfer/build_release_v2b.log",
+    "clean_release_s": null,
+    "one_file_rebuild_s": null,
+    "one_file_goal_s": 120,
+    "note": "The V2 release log is an incremental 266-step link, not a timed clean build. Clean and one-file times are recorded when R1 and R10 build."
+  }
+}

@@ -1,0 +1,9 @@
+ninfer.spo
+Copyright 2026 spongioblast
+
+This engine is derived from NInfer (https://github.com/Neroued/ninfer), including
+the Windows build notes checked against the headpiece747 ninfer-5090-windows tree.
+Those projects remain under their own copyrights. This file is the credit; the
+license is Apache-2.0 (see LICENSE).
+
+Third-party components under third_party/ keep their own notices.
