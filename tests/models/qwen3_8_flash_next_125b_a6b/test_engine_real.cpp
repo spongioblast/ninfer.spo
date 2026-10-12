@@ -538,6 +538,49 @@ int exercise_kv_pressure(const char* artifact) {
     return 0;
 }
 
+// More finished chats than the old fixed catalog of eight records. With twelve state images
+// every chat keeps its continuation and resumes its whole history, matching a cold prefill.
+int exercise_many_checkpoints(const char* artifact) {
+    constexpr std::uint32_t kChats = 10;
+    auto options                             = engine_options(artifact);
+    options.enable_vision                    = false;
+    options.max_context                      = 1024;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.context_cache.device_state_slots = kChats;
+    ninfer::Engine engine(options);
+    std::vector<std::vector<ninfer::TokenId>> histories;
+    for (std::uint32_t chat = 0; chat < kChats; ++chat) {
+        auto prompt = canonical_prompt();
+        prompt[5]   = static_cast<ninfer::TokenId>(1000 + 37 * chat);
+        const auto first =
+            engine.generate(engine.prepare_tokens(prompt), greedy_options(4, true));
+        prompt.insert(prompt.end(), first.generated_token_ids.begin(),
+                      first.generated_token_ids.end());
+        prompt.push_back(198);
+        histories.push_back(std::move(prompt));
+    }
+    for (std::uint32_t chat = 0; chat < kChats; ++chat) {
+        const auto& history = histories[chat];
+        const auto expected = static_cast<std::uint32_t>(history.size() - 2);
+        const auto warm = engine.generate(engine.prepare_tokens(history), greedy_options(2, true));
+        if (warm.reused_prompt_tokens != expected) {
+            std::cerr << "Flash-Next chat " << chat << " lost its continuation: reused="
+                      << warm.reused_prompt_tokens << " expected=" << expected << '\n';
+            return 1;
+        }
+        if (chat + 1 == kChats) {
+            const auto cold =
+                engine.generate(engine.prepare_tokens(history), greedy_options(2, false));
+            if (cold.generated_token_ids != warm.generated_token_ids) {
+                std::cerr << "Flash-Next resumed continuation differs from cold prefill\n";
+                return 1;
+            }
+        }
+    }
+    std::cout << "OK Flash-Next " << kChats << " continuations kept and resumed\n";
+    return 0;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -552,6 +595,9 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string(argv[1]) == "--kv-pressure") {
             return exercise_kv_pressure(artifact);
+        }
+        if (argc == 2 && std::string(argv[1]) == "--many-checkpoints") {
+            return exercise_many_checkpoints(artifact);
         }
         for (const auto head : {ninfer::ProposalHead::Full, ninfer::ProposalHead::Optimized}) {
             auto options                      = engine_options(artifact);

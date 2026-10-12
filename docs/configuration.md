@@ -79,7 +79,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--media-cache-mib` | 1024 | Encoded media cache. |
 | `--media-live-mib` | 2048 | Decoded media residency. |
 | `--media-preprocess-threads` | 0 | `0` picks a bounded pool from the host. |
-| `--device-state-slots` | | Extra device state slots beyond the live lanes. |
+| `--device-state-slots` | `--max-concurrency` | Extra device state slots beyond the live lanes. Each cached checkpoint holds one. `scripts/serve.cmd` passes 16 (see [serving](serving.md#flash-next-checkpoint-slots)). |
 | `--host-context-mib` | 8192 plus eight StateImages | Host context budget. |
 | `--response-store-max-records` | 1024 | Stored responses. |
 | `--response-store-max-mib` | 256 | Stored response bytes. |

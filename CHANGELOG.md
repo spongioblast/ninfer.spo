@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Flash-Next sizes its checkpoint catalog and KV address stores from the device state slots instead of a fixed 8 records. With `--device-state-slots` above 6 the catalog used to fill first: captures were skipped and finished continuations dropped, while the resource manager saw free slots and reclaimed nothing, so every later request resumed from one old checkpoint. New real test `--many-checkpoints`.
+- `scripts/serve.cmd` passes `--device-state-slots 16`. With the default two, Pi sessions fell back to old checkpoints after pi-lens rewrites (TTFT up to 3.4 s), and two chats fell back to the system prompt on every request (`docs/serving.md`, "Flash-Next checkpoint slots").
+
 ## base
 
 This tree is ninfer.spo: NInfer's V3 runtime, the Windows layer, and Qwen3.8 Flash-Next and Qwen3.5 on `sm_120a`.

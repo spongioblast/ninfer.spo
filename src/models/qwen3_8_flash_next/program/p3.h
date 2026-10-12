@@ -265,8 +265,6 @@ private:
         SpeculativeStats stats;
     };
 
-    static constexpr std::uint32_t kCatalogSlots = 8;
-
     struct CacheRecord {
         bool occupied = false;
         std::uint64_t generation = 0;
@@ -389,7 +387,9 @@ private:
 
     Lane& lane() noexcept { return lanes_[focus_]; }
     const Lane& lane() const noexcept { return lanes_[focus_]; }
-    std::array<CacheRecord, kCatalogSlots> cache_slots{};
+    // One record per state image: every record freezes one image, so the catalog is never full
+    // while the context cache still sees a free state slot it could reclaim for.
+    std::vector<CacheRecord> cache_slots;
     std::uint64_t cache_clock = 0;
     Park parked;
 };

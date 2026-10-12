@@ -12,11 +12,14 @@ add_test(NAME ninfer_qwen3_8_flash_next_prefill_graph_mtp_real_test
   COMMAND ninfer_qwen3_8_flash_next_real_test --prefill-graph-mtp)
 add_test(NAME ninfer_qwen3_8_flash_next_kv_pressure_real_test
   COMMAND ninfer_qwen3_8_flash_next_real_test --kv-pressure)
+add_test(NAME ninfer_qwen3_8_flash_next_many_checkpoints_real_test
+  COMMAND ninfer_qwen3_8_flash_next_real_test --many-checkpoints)
 set_tests_properties(
   ninfer_qwen3_8_flash_next_real_test
   ninfer_qwen3_8_flash_next_graph_real_test
   ninfer_qwen3_8_flash_next_prefill_graph_mtp_real_test
   ninfer_qwen3_8_flash_next_kv_pressure_real_test
+  ninfer_qwen3_8_flash_next_many_checkpoints_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real")
 ninfer_add_test(ninfer_qwen3_8_flash_next_ple_table_test
   SOURCES models/qwen3_8_flash_next/test_ple_table.cpp LIBRARIES ninfer_model_runtime)

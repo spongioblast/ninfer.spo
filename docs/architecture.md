@@ -12,7 +12,7 @@ Scheduling is a fixed set of resident lanes, chosen at startup (`--max-concurren
 
 ## Context cache
 
-`ResourceManager` in `src/runtime/engine/context_cache/resource_manager.h` decides which checkpoints a request may reuse and which ones reclaim may drop. The model program owns the bytes. A shared-prefix capture exports the lane's KV prefix as an immutable view (full pages shared, a partial tail page copied) and freezes the state slot for the checkpoint. The continuing lane keeps its KV address and works on a copy of the state slot. The next request forks that checkpoint instead of consuming it. When the device state pool is full, capture reports a state-slot shortage and the engine reclaims a victim. A checkpoint the engine still holds is not released out from under it.
+`ResourceManager` in `src/runtime/engine/context_cache/resource_manager.h` decides which checkpoints a request may reuse and which ones reclaim may drop. The model program owns the bytes. A shared-prefix capture exports the lane's KV prefix as an immutable view (full pages shared, a partial tail page copied) and freezes the state slot for the checkpoint. The continuing lane keeps its KV address and works on a copy of the state slot. The next request forks that checkpoint instead of consuming it. When the device state pool is full, capture reports a state-slot shortage and the engine reclaims a victim. A checkpoint the engine still holds is not released out from under it. Flash-Next keeps one catalog record per state image, so the state pool is the only limit the resource manager has to see. A fixed record count below the pool size would drop captures and finished continuations without a shortage to reclaim for.
 
 ## Program layer
 

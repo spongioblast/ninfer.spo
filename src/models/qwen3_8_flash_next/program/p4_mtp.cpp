@@ -22,8 +22,8 @@ void P3Program::setup_mtp(const SequencePlanImpl& plan, DeviceSpan backing) {
     mtp_kv_pages = std::make_unique<program::LogicalKVPageStore>(
         cache->page_pool(), cache->page_pool().capacity_pages());
     mtp_addresses = std::make_unique<program::KVAddressSpaceStore>(
-        *mtp_kv_pages, cache->execution_tables(), std::max(max_concurrency, 1U) + kCatalogSlots,
-        pages);
+        *mtp_kv_pages, cache->execution_tables(),
+        std::max(max_concurrency, 1U) + static_cast<std::uint32_t>(cache_slots.size()), pages);
     replay_records.emplace(backing, *plan.persistent.replay_records);
     if (plan.persistent.mtp_prefill_hidden) {
         mtp_prefill_hidden.emplace(plan.persistent.mtp_prefill_hidden->bind(backing));

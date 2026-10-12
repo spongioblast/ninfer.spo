@@ -947,6 +947,34 @@ request fields override process flags, and `--greedy` finally forces temperature
 For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`.
 Host state and Main/Backend KV share one startup-fixed byte budget; this is context storage, not a
 limit on total process RAM. `--host-context-mib 0` disables Host context backing.
+
+### Flash-Next checkpoint slots
+
+Flash-Next has no Host checkpoint tier. Every cached checkpoint (a finished request's continuation,
+or a captured prompt prefix) freezes one Device StateImage, so `C+H` bounds how many checkpoints the
+server keeps. The default `H=C` leaves two for `C=2`. An agent client then loses most of its history:
+
+- Pi and SPOPI resend the whole conversation each turn. When a turn drops a message the previous
+  request ended with (pi-lens appends its "automated check" message for one request only), the next
+  request must resume from the checkpoint at the end of the request before. With two slots that
+  checkpoint has already been reclaimed, and the request falls back to an older one that an earlier
+  reuse protected.
+- Two chats on one server need a continuation each plus the shared system prompt. With two slots
+  each request falls back to the system prompt.
+
+`scripts/serve.cmd` passes `--device-state-slots 16`. A slot costs about 3,840 tokens of KV under
+`--kv-capacity auto` (about 116 MB in BF16): 16 slots take the pool from 501,312 to 447,552 tokens
+on the RTX PRO 6000 with 4 GiB headroom. Replaying a recorded 24-request Pi session interleaved
+with a 20-request one (`max_tokens` 1, so every request resumes from a checkpoint):
+
+| `--device-state-slots` | Requests below the best possible hit | Prompt tokens recomputed beyond that | Total time | Worst warm request |
+|---|---|---|---|---|
+| 2 (default) | 39 of 44 | 954,190 | 136.1 s | 7.66 s |
+| 8 | 2 of 44 | 10,405 | 20.8 s | 2.13 s |
+| 16 | 0 of 44 | 0 | 18.8 s | 1.25 s |
+
+Checkpoints sit only at prompt frontiers. A request that drops the last message of each of several
+previous requests resumes from the newest prompt that did not contain one, however many slots exist.
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
 available, and the capacity flags may still be specified.
 

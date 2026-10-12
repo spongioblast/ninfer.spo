@@ -19,6 +19,8 @@ Run the Flash-Next real tests on the fp8proj serving artifact. On the plain arti
 
 A test that contains `_real` loads the artifact and talks to the GPU. A skip of the Qwen3.5 real test is expected without that artifact. A failure of a Flash-Next real test is not.
 
+The Flash-Next real tests share one binary, `ninfer_qwen3_8_flash_next_real_test`, and each mode is its own ctest entry: the default run, `--graph-equivalence`, `--prefill-graph-mtp`, `--kv-pressure`, and `--many-checkpoints`. `--many-checkpoints` runs ten chats with ten extra state slots and checks that each resumes its whole history. It guards the checkpoint catalog, which is sized from the device state slots (`docs/serving.md`, "Flash-Next checkpoint slots").
+
 ## Health
 
 `python tools/repo_health/health.py` takes `sizes`, `lang`, `layers`, `docs`, `dupes`, `report`, or `all`.

@@ -35,13 +35,15 @@ P3Program::P3Program(const LoadedModelData& model_in, const SequencePlanImpl& pl
     page_capacity = decoder->text_kv.execution_tables().logical_page_capacity();
     text_kv_pages = std::make_unique<program::LogicalKVPageStore>(
         decoder->text_kv.page_pool(), decoder->text_kv.page_pool().capacity_pages());
-    text_kv_addresses = std::make_unique<program::KVAddressSpaceStore>(
-        *text_kv_pages, decoder->text_kv.execution_tables(),
-        std::max(plan.max_concurrency, 1U) + kCatalogSlots, page_capacity);
     state_images = std::make_unique<qwen3_8_flash_next::StateImageDevicePool>(
         backing, plan.persistent.state_images);
     state_store = std::make_unique<qwen3_8_flash_next::detail::StateImageStore>(
         *state_images, nullptr, static_cast<std::uint32_t>(state_images->slot_count()));
+    cache_slots.resize(static_cast<std::size_t>(state_images->slot_count()));
+    text_kv_addresses = std::make_unique<program::KVAddressSpaceStore>(
+        *text_kv_pages, decoder->text_kv.execution_tables(),
+        std::max(plan.max_concurrency, 1U) + static_cast<std::uint32_t>(cache_slots.size()),
+        page_capacity);
     io           = qwen3_8_flash_next::RoundState(backing, plan.persistent.round);
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     flash_decode_ple.emplace(plan.persistent.flash_decode_ple->bind(backing));
