@@ -62,12 +62,15 @@ The built-in recipes are ordinary Python functions in
 | `gemma4_31b_nvfp4_base` | NVFP4 4/6 MSE projections, FP8 embedding and head | None |
 | `gemma4_31b_nvfp4_qat` | As `nvfp4_base`, quantized from Google's QAT BF16 weights | `qat` |
 | `gemma4_31b_nvfp4_nvidia` | As `nvfp4_base`, MLP words imported from NVIDIA ModelOpt NVFP4 | `quantized` |
+| `gemma4_31b_nvfp4_mixed` | As `nvfp4_base`, but layers 0-1 and the last two, and global-layer attention, in FP8 | None |
+| `gemma4_31b_nvfp4_mlp` | NVFP4 MLP, FP8 attention, FP8 embedding and head | None |
 
 The Gemma 4 recipes pack Q/K/V (Q/K on global layers) and gate/up into one stored matrix each.
 `gemma4_nvfp4_a4` is an override for the NVFP4 Gemma recipes: it permits A4 on every NVFP4 text
 projection and stores the divisor `448*6/amax` for each projection input. It reads
 `--source calibration=FILE`, a Safetensors file with one F32 activation amax per input name, such
 as `text/layers/0/mixer_input`, `attention_output`, `ffn_input` and `mlp/product`.
+`gemma4_nvfp4_a4_mlp` does the same for the NVFP4 MLP projections only and leaves attention at A16.
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;

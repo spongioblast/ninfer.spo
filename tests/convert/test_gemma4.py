@@ -275,6 +275,8 @@ def _packed(artifact, names):
     [
         ("gemma4_31b_fp8", "fp8_e4m3fn_row_bf16"),
         ("gemma4_31b_nvfp4_base", "nvfp4"),
+        # Both layers of the two-layer model are edge layers.
+        ("gemma4_31b_nvfp4_mixed", "fp8_e4m3fn_row_bf16"),
     ],
 )
 def test_quantized_recipes_pack_qkv_and_gate_up(tmp_path, recipe_name, trunk):
@@ -301,6 +303,43 @@ def test_quantized_recipes_pack_qkv_and_gate_up(tmp_path, recipe_name, trunk):
             assert artifact.by_id[_objects(artifact, edge)[0][0]].format == "fp8_e4m3fn_row_bf16"
         norm = artifact.by_id[_objects(artifact, "text/final_norm")[0][0]]
         assert norm.format == "bf16"
+
+
+def test_mlp_recipe_keeps_attention_fp8(tmp_path):
+    from tools.convert.official_recipes import gemma4_31b_nvfp4_mlp
+
+    with _checkpoint(tmp_path / "source", **NVFP4_DIMS) as source:
+        model = build_model(source)
+        recipe = Recipe(model)
+        gemma4_31b_nvfp4_mlp(model, recipe, {"base": source})
+        out = tmp_path / "gemma.ninfer"
+        convert(model, recipe, out, device="cpu", rows_per_chunk=128)
+    with Artifact(out) as artifact:
+        for layer in (0, 1):
+            prefix = f"text/layers/{layer}/"
+            for name in ("attention/query", "attention/output"):
+                stored = artifact.by_id[_objects(artifact, prefix + name)[0][0]]
+                assert stored.format == "fp8_e4m3fn_row_bf16"
+            for name in ("mlp/gate", "mlp/down"):
+                assert artifact.by_id[_objects(artifact, prefix + name)[0][0]].format == "nvfp4"
+
+
+def test_sensitive_projections_are_edges_and_global_attention():
+    from tools.convert.official_recipes import gemma4_sensitive
+
+    types = ["full_attention" if i % 6 == 5 else "sliding_attention" for i in range(60)]
+    config = {"num_hidden_layers": 60, "layer_types": types}
+    picked = {
+        (layer, part)
+        for layer in range(60)
+        for part in ("attention/query", "attention/output", "mlp/gate", "mlp/down")
+        if gemma4_sensitive(config, f"text/layers/{layer}/{part}")
+    }
+    edges = {(layer, part) for layer in (0, 1, 58, 59)
+             for part in ("attention/query", "attention/output", "mlp/gate", "mlp/down")}
+    global_attention = {(layer, part) for layer in range(5, 60, 6)
+                        for part in ("attention/query", "attention/output")}
+    assert picked == edges | global_attention
 
 
 def test_nvidia_recipe_imports_shared_gate_up(tmp_path):
@@ -362,6 +401,26 @@ def test_a4_override_stores_calibrated_divisors(tmp_path):
             stored = artifact.read_object(binding["object"])
             assert stored == struct.pack("<f", 448.0 * 6.0 / amax[input_name])
         assert ("text/layers/1/attention/key", "text/layers/1/mixer_input") in uses
+
+
+def test_a4_mlp_override_leaves_attention_a16(tmp_path):
+    from tools.convert.official_recipes import gemma4_31b_nvfp4_base, gemma4_nvfp4_a4_mlp
+
+    amax = {f"text/layers/{layer}/{role}": 4.0 for layer in (0, 1) for role in ("ffn_input", "mlp/product")}
+    with _checkpoint(tmp_path / "source", **NVFP4_DIMS) as source:
+        model = build_model(source)
+        with _calibration(tmp_path / "amax.safetensors", amax) as calibration:
+            recipe = Recipe(model)
+            sources = {"base": source, "calibration": calibration}
+            gemma4_31b_nvfp4_base(model, recipe, sources)
+            gemma4_nvfp4_a4_mlp(model, recipe, sources)
+            out = tmp_path / "gemma.ninfer"
+            convert(model, recipe, out, device="cpu", rows_per_chunk=128)
+    with Artifact(out) as artifact:
+        for use in artifact.directory.uses:
+            a4 = "/mlp/" in use["parameter"]
+            assert use["activation_policy"] == ("AllowA4" if a4 else "A16Only")
+            assert bool(use.get("auxiliaries")) == a4
 
 
 def test_a4_override_requires_every_input(tmp_path):

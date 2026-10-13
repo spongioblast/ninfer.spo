@@ -193,18 +193,35 @@ def gemma4_31b_bf16(model, recipe, sources):
         recipe.assign(name, format=parameter.direct_format, method=cast_direct)
 
 
-def _gemma4_quantized(model, recipe, trunk, *, values=None, mlp=None):
+def gemma4_sensitive(config, name):
+    """True for projections of the first two and last two layers and for global attention."""
+    layer = int(name.split("/")[2])
+    last = config["num_hidden_layers"] - 1
+    if layer in (0, 1, last - 1, last):
+        return True
+    return config["layer_types"][layer] == "full_attention" and "/attention/" in name
+
+
+def gemma4_attention(config, name):
+    """True for every attention projection."""
+    return "/attention/" in name
+
+
+def _gemma4_quantized(model, recipe, trunk, *, values=None, mlp=None, fp8=None):
     """FP8 embedding and head; every text-layer projection gets `trunk(name)`.
 
     `values` replaces the base checkpoint for every parameter. `mlp` imports the MLP's
-    encoded NVFP4 words from that checkpoint instead of quantizing them.
+    encoded NVFP4 words from that checkpoint instead of quantizing them. `fp8(config, name)`
+    selects projections that stay FP8 instead of `trunk`.
     """
     for name, parameter in model.parameters.items():
         source = None if values is None else model.source(name, values)
         if name in ("text/token_embedding", "text/output_head"):
             recipe.assign(name, format=FP8, method=fp8_row_maxabs, source=source)
         elif name.startswith("text/layers/") and parameter.projection:
-            if mlp is not None and "/mlp/" in name:
+            if fp8 is not None and fp8(model.config, name):
+                recipe.assign(name, format=FP8, method=fp8_row_maxabs, source=source)
+            elif mlp is not None and "/mlp/" in name:
                 recipe.assign(
                     name,
                     format="nvfp4",
@@ -235,6 +252,16 @@ def gemma4_31b_nvfp4_qat(model, recipe, sources):
     _gemma4_quantized(model, recipe, ("nvfp4", nvfp4_mse46), values=sources["qat"])
 
 
+def gemma4_31b_nvfp4_mixed(model, recipe, sources):
+    _require_gemma4(model, "gemma4_31b_nvfp4_mixed")
+    _gemma4_quantized(model, recipe, ("nvfp4", nvfp4_mse46), fp8=gemma4_sensitive)
+
+
+def gemma4_31b_nvfp4_mlp(model, recipe, sources):
+    _require_gemma4(model, "gemma4_31b_nvfp4_mlp")
+    _gemma4_quantized(model, recipe, ("nvfp4", nvfp4_mse46), fp8=gemma4_attention)
+
+
 def gemma4_31b_nvfp4_nvidia(model, recipe, sources):
     _require_gemma4(model, "gemma4_31b_nvfp4_nvidia")
     _gemma4_quantized(
@@ -242,16 +269,13 @@ def gemma4_31b_nvfp4_nvidia(model, recipe, sources):
     )
 
 
-def gemma4_nvfp4_a4(model, recipe, sources):
-    """Override: allow A4 on every NVFP4 text projection with a calibrated divisor.
-
-    `--source calibration=FILE` is a safetensors file with one F32 activation amax per
-    input name (for example ``text/layers/0/mixer_input``); the divisor is 448*6/amax.
-    """
-    _require_gemma4(model, "gemma4_nvfp4_a4")
+def _gemma4_a4(model, recipe, sources, recipe_name, mlp_only):
+    _require_gemma4(model, recipe_name)
     calibration = sources["calibration"]
     for name, parameter in model.parameters.items():
         if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if mlp_only and "/mlp/" not in name:
             continue
         if not all(s.format == "nvfp4" for s in recipe.selections[name]):
             continue
@@ -270,6 +294,20 @@ def gemma4_nvfp4_a4(model, recipe, sources):
             )
 
 
+def gemma4_nvfp4_a4(model, recipe, sources):
+    """Override: allow A4 on every NVFP4 text projection with a calibrated divisor.
+
+    `--source calibration=FILE` is a safetensors file with one F32 activation amax per
+    input name (for example ``text/layers/0/mixer_input``); the divisor is 448*6/amax.
+    """
+    _gemma4_a4(model, recipe, sources, "gemma4_nvfp4_a4", mlp_only=False)
+
+
+def gemma4_nvfp4_a4_mlp(model, recipe, sources):
+    """Override: like `gemma4_nvfp4_a4`, but only the MLP projections; attention stays A16."""
+    _gemma4_a4(model, recipe, sources, "gemma4_nvfp4_a4_mlp", mlp_only=True)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -281,5 +319,8 @@ RECIPES = {
     "gemma4_31b_nvfp4_base": gemma4_31b_nvfp4_base,
     "gemma4_31b_nvfp4_qat": gemma4_31b_nvfp4_qat,
     "gemma4_31b_nvfp4_nvidia": gemma4_31b_nvfp4_nvidia,
+    "gemma4_31b_nvfp4_mixed": gemma4_31b_nvfp4_mixed,
+    "gemma4_31b_nvfp4_mlp": gemma4_31b_nvfp4_mlp,
     "gemma4_nvfp4_a4": gemma4_nvfp4_a4,
+    "gemma4_nvfp4_a4_mlp": gemma4_nvfp4_a4_mlp,
 }
