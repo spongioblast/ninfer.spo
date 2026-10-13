@@ -1,6 +1,7 @@
 #include "models/gemma4/program/program.h"
 
 #include "core/arena.h"
+#include "core/decode_graph.h"
 #include "models/gemma4/execution/text_forward.h"
 #include "models/gemma4/program/top_tokens.h"
 #include "ninfer/ops/linear.h"
@@ -62,6 +63,12 @@ struct Program::Impl {
     DeviceBuffer table_buf;
     DeviceBuffer config_buf;
     DeviceBuffer counts_buf;
+    // One-token decode step as a CUDA graph. step_buf holds the token id, its position and the
+    // logical position it predicts; step_host stages those three and receives the sampled token.
+    DeviceBuffer step_buf;
+    PinnedHostBuffer step_host{4 * sizeof(std::int32_t)};
+    DecodeGraphDefinition decode_definition;
+    DecodeGraphExecutable decode_graph;
     std::vector<DeviceBuffer> k_store;
     std::vector<DeviceBuffer> v_store;
     std::vector<Tensor> k_pages;
@@ -112,6 +119,7 @@ struct Program::Impl {
         hidden_buf = DeviceBuffer(static_cast<std::size_t>(hidden) * chunk * 2);
         config_buf = DeviceBuffer(sizeof(ops::SamplingConfig));
         counts_buf = DeviceBuffer(static_cast<std::size_t>(vocab) * 4);
+        step_buf   = DeviceBuffer(3 * sizeof(std::int32_t));
         std::vector<std::int32_t> table(static_cast<std::size_t>(pages));
         for (int page = 0; page < pages; ++page) { table[static_cast<std::size_t>(page)] = page; }
         table_buf = DeviceBuffer(table.size() * 4);
@@ -233,6 +241,49 @@ struct Program::Impl {
         check(cudaMemcpyAsync(&token, out.data, 4, cudaMemcpyDeviceToHost, stream), "token copy");
         check(cudaStreamSynchronize(stream), "sample sync");
         return token;
+    }
+
+    // Layers, logits and sampling for one token, reading only device buffers whose addresses
+    // stay fixed, so it can be captured once and replayed for every decode step.
+    void decode_body() {
+        workspace.reset();
+        auto* step = static_cast<std::int32_t*>(step_buf.p);
+        Tensor id_tensor(step, DType::I32, {1});
+        Tensor position(step + 1, DType::I32, {1});
+        Tensor logical(step + 2, DType::I32, {1});
+        Tensor column(hidden_buf.p, DType::BF16, {hidden, 1});
+        gemma4_layers(id_tensor, column, model->token_embedding, model->layers, caches, position,
+                      gemm, workspace, stream);
+        Tensor logits = workspace.alloc(DType::BF16, {vocab, 1});
+        Tensor out    = workspace.alloc(DType::I32, {1});
+        gemma4_logits(column, logits, model->final_norm, model->output_head, model->softcap,
+                      model->rms_eps, gemm, workspace, stream);
+        ops::sample(logits, out, vocab, static_cast<const ops::SamplingConfig*>(config_buf.p),
+                    logical, ops::kSamplePurposeDecode, workspace, stream);
+        auto* host = static_cast<std::int32_t*>(step_host.data());
+        check(cudaMemcpyAsync(host + 3, out.data, 4, cudaMemcpyDeviceToHost, stream), "token copy");
+    }
+
+    // Feeds `id` at position `fed` and returns the token sampled for position fed + 1.
+    [[nodiscard]] TokenId decode_step(TokenId id) {
+        if (fed >= capacity || fed > resident.size()) {
+            throw std::logic_error("gemma4 decode is outside the KV capacity");
+        }
+        resident.resize(fed);
+        auto* host = static_cast<std::int32_t*>(step_host.data());
+        host[0]    = id;
+        host[1]    = static_cast<std::int32_t>(fed);
+        host[2]    = static_cast<std::int32_t>(fed + 1);
+        check(cudaMemcpyAsync(step_buf.p, host, step_buf.bytes, cudaMemcpyHostToDevice, stream),
+              "decode step upload");
+        if (!decode_graph.ready()) {
+            decode_definition.capture(stream, [this] { decode_body(); });
+            decode_graph.instantiate(decode_definition);
+        }
+        decode_graph.launch(stream);
+        check(cudaStreamSynchronize(stream), "decode sync");
+        resident.push_back(id);
+        return host[3];
     }
 
     // Log-probabilities of targets[0..count) under hidden columns [start, start + count).
@@ -538,12 +589,10 @@ PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
     if (impl_->fed >= impl_->capacity) {
         throw std::logic_error("gemma4 decode ran past the KV capacity");
     }
-    const auto start = std::chrono::steady_clock::now();
-    const TokenId id = impl_->next_id;
-    impl_->run_layers(&id, impl_->fed, 1);
+    const auto start   = std::chrono::steady_clock::now();
+    const TokenId next = impl_->decode_step(impl_->next_id);
     ++impl_->fed;
-    impl_->has_next    = false;
-    const TokenId next = impl_->sample_column(0, impl_->fed, ops::kSamplePurposeDecode);
+    impl_->has_next = false;
     return impl_->stage(next, timed(start));
 }
 
