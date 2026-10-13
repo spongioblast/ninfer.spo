@@ -44,9 +44,9 @@ std::vector<T> read_raw(const fs::path& path) {
 
 float f16_to_f32(std::uint16_t bits) {
     const std::uint32_t sign = (bits & 0x8000U) << 16;
-    std::uint32_t exponent = (bits >> 10) & 0x1fU;
-    std::uint32_t mantissa = bits & 0x3ffU;
-    std::uint32_t out = 0;
+    std::uint32_t exponent   = (bits >> 10) & 0x1fU;
+    std::uint32_t mantissa   = bits & 0x3ffU;
+    std::uint32_t out        = 0;
     if (exponent == 0) {
         if (mantissa != 0) {
             exponent = 127 - 15 + 1;
@@ -88,7 +88,7 @@ struct Cache {
         std::vector<std::int32_t> ids(static_cast<std::size_t>(pages));
         for (int i = 0; i < pages; ++i) { ids[static_cast<std::size_t>(i)] = i; }
         table_buf.copy_from_host(ids.data(), table_buf.bytes);
-        table = ninfer::Tensor(table_buf.p, ninfer::DType::I32, {pages});
+        table                   = ninfer::Tensor(table_buf.p, ninfer::DType::I32, {pages});
         const std::size_t count = loaded.layers.size();
         k_store.reserve(count);
         v_store.reserve(count);
@@ -115,16 +115,9 @@ struct Runner {
     cudaStream_t stream;
     ninfer::ops::Bf16GemmContext gemm;
     ninfer::DeviceArena workspace;
-    ninfer::DeviceBuffer ones;
-    ninfer::Tensor v_ones;
 
     Runner(g4::LoadedText& model, cudaStream_t s)
-        : loaded(model), stream(s), gemm(s), workspace(1024u * 1024u * 1024u), ones(1024),
-          v_ones(nullptr, ninfer::DType::BF16, {512}) {
-        std::vector<std::uint16_t> bits(512, 0x3f80);
-        ones.copy_from_host(bits.data(), ones.bytes);
-        v_ones = ninfer::Tensor(ones.p, ninfer::DType::BF16, {512});
-    }
+        : loaded(model), stream(s), gemm(s), workspace(1024u * 1024u * 1024u) {}
 
     // Runs `ids` at positions first.. and returns float logits [count][vocab].
     std::vector<float> forward(Cache& cache, const std::vector<int>& ids, int first) {
@@ -141,7 +134,8 @@ struct Runner {
         ninfer::Tensor pos_tensor(pos_buf.p, ninfer::DType::I32, {count});
         ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::BF16, {loaded.hidden, count});
         ninfer::Tensor logits(logit_buf.p, ninfer::DType::BF16, {loaded.vocab, count});
-        g4::gemma4_layers(id_tensor, hidden, loaded.token_embedding, loaded.layers, cache.layers, pos_tensor, v_ones, gemm, workspace, stream);
+        g4::gemma4_layers(id_tensor, hidden, loaded.token_embedding, loaded.layers, cache.layers,
+                          pos_tensor, gemm, workspace, stream);
         g4::gemma4_logits(hidden, logits, loaded.final_norm, loaded.output_head, loaded.softcap,
                           loaded.rms_eps, gemm, workspace, stream);
         if (cudaStreamSynchronize(stream) != cudaSuccess) {
@@ -150,7 +144,9 @@ struct Runner {
         std::vector<std::uint16_t> bits(static_cast<std::size_t>(loaded.vocab) * count);
         logit_buf.copy_to_host(bits.data(), bits.size() * 2);
         std::vector<float> out(bits.size());
-        for (std::size_t i = 0; i < bits.size(); ++i) { out[i] = ninfer::test::bf16_to_f32(bits[i]); }
+        for (std::size_t i = 0; i < bits.size(); ++i) {
+            out[i] = ninfer::test::bf16_to_f32(bits[i]);
+        }
         return out;
     }
 };
@@ -176,11 +172,12 @@ bool bisect(Runner& runner, const fs::path& dir, const std::string& name,
             const std::vector<int>& ids) {
     const fs::path path = dir / (name + ".hidden");
     if (!fs::exists(path)) { return true; }
-    const auto reference = read_raw<float>(path);
+    const auto reference      = read_raw<float>(path);
     const fs::path other_path = dir / (name + ".hidden_bf16");
-    const auto hf_bf16 = fs::exists(other_path) ? read_raw<float>(other_path) : std::vector<float>{};
-    auto& loaded = runner.loaded;
-    const int tokens = static_cast<int>(ids.size());
+    const auto hf_bf16 =
+        fs::exists(other_path) ? read_raw<float>(other_path) : std::vector<float>{};
+    auto& loaded            = runner.loaded;
+    const int tokens        = static_cast<int>(ids.size());
     const std::size_t plane = static_cast<std::size_t>(loaded.hidden) * tokens;
     if (reference.size() != plane * (loaded.layers.size() + 1)) {
         throw std::runtime_error(name + ": hidden dump size does not match");
@@ -200,7 +197,7 @@ bool bisect(Runner& runner, const fs::path& dir, const std::string& name,
     ninfer::Tensor normed(normed_buf.p, ninfer::DType::BF16, {loaded.hidden, tokens});
     std::vector<std::uint16_t> bits(plane);
     std::vector<float> ours(plane);
-    bool ok = true;
+    bool ok         = true;
     double previous = 0.0;
     auto report = [&](std::size_t index, const char* label, const ninfer::DeviceBuffer& buffer) {
         if (cudaStreamSynchronize(runner.stream) != cudaSuccess) {
@@ -227,20 +224,20 @@ bool bisect(Runner& runner, const fs::path& dir, const std::string& name,
         const std::span<const g4::Gemma4LayerWeights> one(&loaded.layers[layer], 1);
         const std::span<const g4::Gemma4CacheLayer> one_cache(&cache.layers[layer], 1);
         if (layer == 0) {
-            g4::gemma4_layers(id_tensor, hidden, loaded.token_embedding, {}, {}, pos_tensor, runner.v_ones, runner.gemm, runner.workspace,
-                              runner.stream);
+            g4::gemma4_layers(id_tensor, hidden, loaded.token_embedding, {}, {}, pos_tensor,
+                              runner.gemm, runner.workspace, runner.stream);
             report(0, "embed", hidden_buf);
         }
         auto scope = runner.workspace.scope();
         g4::gemma4_layer(hidden, one[0], pos_tensor, *one_cache[0].k_pages, *one_cache[0].v_pages,
-                         *one_cache[0].block_table, runner.v_ones, runner.gemm, runner.workspace,
-                         runner.stream);
+                         *one_cache[0].block_table, runner.gemm, runner.workspace, runner.stream);
         if (layer + 1 < loaded.layers.size()) { report(layer + 1, "layer", hidden_buf); }
     }
     {
         auto scope = runner.workspace.scope();
-        ninfer::ops::rmsnorm(hidden, ninfer::Tensor(const_cast<void*>(loaded.final_norm),
-                                                    ninfer::DType::BF16, {loaded.hidden}),
+        ninfer::ops::rmsnorm(hidden,
+                             ninfer::Tensor(const_cast<void*>(loaded.final_norm),
+                                            ninfer::DType::BF16, {loaded.hidden}),
                              loaded.rms_eps, false, normed, runner.stream);
         report(loaded.layers.size(), "final", normed_buf);
     }
@@ -263,8 +260,8 @@ std::vector<float> read_logits(const fs::path& path, std::size_t elements) {
 
 struct Agreement {
     double cosine_mean = 0.0;
-    double cosine_min = 1.0;
-    double top1 = 0.0;
+    double cosine_min  = 1.0;
+    double top1        = 0.0;
 };
 
 Agreement agree(const std::vector<float>& reference, const std::vector<float>& other, int tokens,
@@ -274,9 +271,9 @@ Agreement agree(const std::vector<float>& reference, const std::vector<float>& o
     for (int t = 0; t < tokens; ++t) {
         const float* r = reference.data() + static_cast<std::size_t>(t) * vocab;
         const float* o = other.data() + static_cast<std::size_t>(t) * vocab;
-        double dot = 0.0;
-        double r_sq = 0.0;
-        double o_sq = 0.0;
+        double dot     = 0.0;
+        double r_sq    = 0.0;
+        double o_sq    = 0.0;
         for (std::size_t v = 0; v < vocab; ++v) {
             dot += static_cast<double>(r[v]) * o[v];
             r_sq += static_cast<double>(r[v]) * r[v];
@@ -302,20 +299,20 @@ std::size_t common_prefix(const std::vector<std::int32_t>& a, const std::vector<
 // files (<name>.logits_bf16, .greedy_bf16, .hidden_bf16) are present, NInfer must be at least
 // as close to the reference as HF bf16 is; otherwise the absolute plan thresholds apply.
 int run_prompt(Runner& runner, const fs::path& dir, const std::string& name) {
-    const auto ids = read_raw<std::int32_t>(dir / (name + ".ids"));
-    const auto ref_greedy = read_raw<std::int32_t>(dir / (name + ".greedy"));
+    const auto ids          = read_raw<std::int32_t>(dir / (name + ".ids"));
+    const auto ref_greedy   = read_raw<std::int32_t>(dir / (name + ".greedy"));
     const std::size_t vocab = static_cast<std::size_t>(runner.loaded.vocab);
-    const int tokens = static_cast<int>(ids.size());
-    const auto reference = read_logits(dir / (name + ".logits"), vocab * ids.size());
-    const int pages = (tokens + static_cast<int>(ref_greedy.size()) + kPage) / kPage + 1;
+    const int tokens        = static_cast<int>(ids.size());
+    const auto reference    = read_logits(dir / (name + ".logits"), vocab * ids.size());
+    const int pages         = (tokens + static_cast<int>(ref_greedy.size()) + kPage) / kPage + 1;
     Cache cache(runner.loaded, pages);
     const std::vector<int> prompt(ids.begin(), ids.end());
     const bool layers_ok = bisect(runner, dir, name, prompt);
-    const auto ours = runner.forward(cache, prompt, 0);
+    const auto ours      = runner.forward(cache, prompt, 0);
     const Agreement mine = agree(reference, ours, tokens, vocab);
 
     std::uint64_t hash = 1469598103934665603ULL;
-    auto mix = [&](const void* data, std::size_t bytes) {
+    auto mix           = [&](const void* data, std::size_t bytes) {
         const auto* p = static_cast<const unsigned char*>(data);
         for (std::size_t i = 0; i < bytes; ++i) { hash = (hash ^ p[i]) * 1099511628211ULL; }
     };
@@ -326,7 +323,7 @@ int run_prompt(Runner& runner, const fs::path& dir, const std::string& name) {
     std::vector<float> last(ours.end() - static_cast<std::ptrdiff_t>(vocab), ours.end());
     while (true) {
         const int token = argmax(last);
-        float second = -INFINITY;
+        float second    = -INFINITY;
         for (std::size_t v = 0; v < vocab; ++v) {
             if (static_cast<int>(v) != token) { second = std::max(second, last[v]); }
         }
@@ -340,26 +337,26 @@ int run_prompt(Runner& runner, const fs::path& dir, const std::string& name) {
     const bool greedy_equal = generated.size() == ref_greedy.size() && diverge == generated.size();
 
     std::cout << name << " tokens " << tokens << " ninfer cosine mean " << mine.cosine_mean
-              << " min " << mine.cosine_min << " top1 " << mine.top1 << " greedy " << diverge
-              << '/' << ref_greedy.size() << " hash " << std::hex << hash << std::dec << '\n';
+              << " min " << mine.cosine_min << " top1 " << mine.top1 << " greedy " << diverge << '/'
+              << ref_greedy.size() << " hash " << std::hex << hash << std::dec << '\n';
     if (!greedy_equal && diverge < generated.size()) {
         std::cout << "  greedy diverges at " << diverge << ": ours " << generated[diverge]
                   << " reference " << ref_greedy[diverge] << ", our top-2 margin "
                   << margins[diverge] << '\n';
     }
 
-    bool ok = layers_ok;
+    bool ok                    = layers_ok;
     const fs::path bf16_logits = dir / (name + ".logits_bf16");
     if (fs::exists(bf16_logits)) {
-        const Agreement base = agree(reference, read_logits(bf16_logits, vocab * ids.size()),
-                                     tokens, vocab);
+        const Agreement base =
+            agree(reference, read_logits(bf16_logits, vocab * ids.size()), tokens, vocab);
         std::cout << "  hf_bf16 cosine mean " << base.cosine_mean << " min " << base.cosine_min
                   << " top1 " << base.top1 << '\n';
         ok = ok && mine.cosine_mean >= base.cosine_mean - 2.0e-4 && mine.top1 >= base.top1 - 0.02;
     } else {
         ok = ok && mine.cosine_mean >= 0.999 && mine.top1 >= 0.98;
     }
-    std::size_t allowed = generated.size();
+    std::size_t allowed        = generated.size();
     const fs::path bf16_greedy = dir / (name + ".greedy_bf16");
     if (fs::exists(bf16_greedy)) {
         const std::size_t base = common_prefix(read_raw<std::int32_t>(bf16_greedy), ref_greedy);
@@ -367,7 +364,7 @@ int run_prompt(Runner& runner, const fs::path& dir, const std::string& name) {
         allowed = std::min(allowed, base);
     }
     allowed = std::min<std::size_t>(allowed, 32);
-    ok = ok && (greedy_equal || diverge >= allowed);
+    ok      = ok && (greedy_equal || diverge >= allowed);
     return ok ? 0 : 1;
 }
 
@@ -385,7 +382,7 @@ int main() {
         std::ifstream index_file(dir / "index.json");
         const auto index = nlohmann::json::parse(index_file);
         ninfer::DeviceContext device;
-        auto loaded = g4::load_text(artifact, device);
+        auto loaded         = g4::load_text(artifact, device);
         cudaStream_t stream = nullptr;
         if (cudaStreamCreate(&stream) != cudaSuccess) { return 1; }
         int failures = 0;

@@ -18,8 +18,8 @@
 #include <vector>
 
 int main() {
-    const char* artifact = std::getenv("NINFER_GEMMA4_WEIGHTS");
-    const char* hf_dir = std::getenv("NINFER_GEMMA4_HF");
+    const char* artifact             = std::getenv("NINFER_GEMMA4_WEIGHTS");
+    const char* hf_dir               = std::getenv("NINFER_GEMMA4_HF");
     const std::string tokenizer_path = hf_dir ? std::string(hf_dir) + "/tokenizer.json" : "";
     if (artifact == nullptr || !std::ifstream(artifact).good() ||
         !std::ifstream(tokenizer_path).good()) {
@@ -36,13 +36,10 @@ int main() {
             return 1;
         }
         ninfer::DeviceContext device;
-        auto loaded = ninfer::models::gemma4::load_text(artifact, device);
+        auto loaded      = ninfer::models::gemma4::load_text(artifact, device);
         const int tokens = static_cast<int>(ids_host.size());
         const int hidden = loaded.hidden;
-        const int vocab = loaded.vocab;
-        std::vector<std::uint16_t> ones_bits(512, 0x3f80);
-        ninfer::DeviceBuffer ones(ones_bits.size() * 2);
-        ones.copy_from_host(ones_bits.data(), ones.bytes);
+        const int vocab  = loaded.vocab;
         ninfer::DeviceBuffer id_buf(static_cast<std::size_t>(tokens) * 4);
         id_buf.copy_from_host(ids_host.data(), id_buf.bytes);
         std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
@@ -74,12 +71,12 @@ int main() {
         ninfer::Tensor block(table_buf.p, ninfer::DType::I32, {1});
         for (std::size_t i = 0; i < loaded.layers.size(); ++i) {
             const auto& layer = loaded.layers[i];
-            k_pages.emplace_back(k_store[i].p, ninfer::DType::BF16,
-                                 std::initializer_list<std::int32_t>{layer.head_dim, 64,
-                                                                     layer.kv_heads, 1});
-            v_pages.emplace_back(v_store[i].p, ninfer::DType::BF16,
-                                 std::initializer_list<std::int32_t>{layer.head_dim, 64,
-                                                                     layer.kv_heads, 1});
+            k_pages.emplace_back(
+                k_store[i].p, ninfer::DType::BF16,
+                std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads, 1});
+            v_pages.emplace_back(
+                v_store[i].p, ninfer::DType::BF16,
+                std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads, 1});
             caches.push_back({&k_pages[i], &v_pages[i], &block});
         }
 
@@ -89,15 +86,14 @@ int main() {
         ninfer::Tensor hidden_tensor(hidden_buf.p, ninfer::DType::BF16, {hidden, tokens});
         ninfer::Tensor logits(logit_buf.p, ninfer::DType::BF16, {vocab, tokens});
         ninfer::Tensor pos(pos_buf.p, ninfer::DType::I32, {tokens});
-        ninfer::Tensor v_ones(ones.p, ninfer::DType::BF16, {512});
         cudaStream_t stream = nullptr;
         if (cudaStreamCreate(&stream) != cudaSuccess) { return 1; }
         ninfer::ops::Bf16GemmContext gemm(stream);
         ninfer::DeviceArena workspace(512u * 1024u * 1024u);
-        ninfer::models::gemma4::gemma4_prefill(
-            ids, hidden_tensor, logits, loaded.token_embedding, loaded.final_norm,
-            loaded.output_head, loaded.softcap, loaded.rms_eps, loaded.layers, caches, pos, v_ones,
-            gemm, workspace, stream);
+        ninfer::models::gemma4::gemma4_prefill(ids, hidden_tensor, logits, loaded.token_embedding,
+                                               loaded.final_norm, loaded.output_head,
+                                               loaded.softcap, loaded.rms_eps, loaded.layers,
+                                               caches, pos, gemm, workspace, stream);
         auto argmax_column = [&](ninfer::DeviceBuffer& buffer, int column) {
             if (cudaStreamSynchronize(stream) != cudaSuccess) {
                 throw std::runtime_error("gemma4 france: sync failed");
@@ -105,15 +101,16 @@ int main() {
             std::vector<std::uint16_t> column_bits(static_cast<std::size_t>(vocab));
             buffer.copy_to_host(column_bits.data(), column_bits.size() * 2,
                                 static_cast<std::size_t>(column) * vocab * 2);
-            int chosen = 0;
+            int chosen         = 0;
             float chosen_value = -1.0e30f;
-            float head[3] = {};
+            float head[3]      = {};
             for (int i = 0; i < vocab; ++i) {
-                const float value = ninfer::test::bf16_to_f32(column_bits[static_cast<std::size_t>(i)]);
+                const float value =
+                    ninfer::test::bf16_to_f32(column_bits[static_cast<std::size_t>(i)]);
                 if (i < 3) { head[i] = value; }
                 if (value > chosen_value) {
                     chosen_value = value;
-                    chosen = i;
+                    chosen       = i;
                 }
             }
             return std::tuple{chosen, chosen_value, head[0], head[1], head[2]};
@@ -122,7 +119,7 @@ int main() {
         std::cout << "logits " << l0 << ' ' << l1 << ' ' << l2 << " argmax " << best << " value "
                   << best_value << '\n';
         const float hf[3] = {-6.375f, 2.546875f, -11.75f};
-        int failures = 0;
+        int failures      = 0;
         if (std::fabs(l0 - hf[0]) > 0.5f || std::fabs(l1 - hf[1]) > 0.5f ||
             std::fabs(l2 - hf[2]) > 0.5f || best != 7001) {
             ++failures;
@@ -144,8 +141,8 @@ int main() {
             step_pos.copy_from_host(&position, 4);
             ninfer::models::gemma4::gemma4_prefill(
                 step_ids, step_hidden_tensor, step_logit_tensor, loaded.token_embedding,
-                loaded.final_norm, loaded.output_head, loaded.softcap, loaded.rms_eps, loaded.layers,
-                caches, step_position, v_ones, gemm, workspace, stream);
+                loaded.final_norm, loaded.output_head, loaded.softcap, loaded.rms_eps,
+                loaded.layers, caches, step_position, gemm, workspace, stream);
             const auto [next, next_value, a, b, c] = argmax_column(step_logits, 0);
             (void)a;
             (void)b;

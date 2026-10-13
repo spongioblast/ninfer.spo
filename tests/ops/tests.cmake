@@ -2,6 +2,7 @@ set(ninfer_op_tests
   add_bias
   gelu
   gemma4_attention
+  gemma4_qkv_prep
   geglu
   logit_softcap
   residual_scale

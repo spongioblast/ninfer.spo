@@ -21,9 +21,10 @@ constexpr std::int32_t kScoreTile = 128;
 
 runtime::ExecutionTiming timed(std::chrono::steady_clock::time_point start) {
     runtime::ExecutionTiming timing;
-    timing.device_wait_ns = static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
-            .count());
+    timing.device_wait_ns =
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - start)
+                                       .count());
     return timing;
 }
 
@@ -38,8 +39,7 @@ void check(cudaError_t status, const char* what) {
 std::size_t layer_bytes(const LoadedText& model, std::uint32_t chunk) {
     std::size_t widest = 0;
     for (const Gemma4LayerWeights& layer : model.layers) {
-        widest = std::max(widest,
-                          gemma4_layer_workspace_bytes(layer, static_cast<int>(chunk)));
+        widest = std::max(widest, gemma4_layer_workspace_bytes(layer, static_cast<int>(chunk)));
     }
     return widest;
 }
@@ -47,16 +47,15 @@ std::size_t layer_bytes(const LoadedText& model, std::uint32_t chunk) {
 } // namespace
 
 struct Program::Impl {
-    LoadedText* model = nullptr;
+    LoadedText* model   = nullptr;
     cudaStream_t stream = nullptr;
     ops::Bf16GemmContext gemm;
-    int pages = 0;
-    int vocab = 0;
-    int hidden = 0;
+    int pages              = 0;
+    int vocab              = 0;
+    int hidden             = 0;
     std::uint32_t capacity = 0;
-    std::uint32_t chunk = 0;
+    std::uint32_t chunk    = 0;
     DeviceArena workspace;
-    DeviceBuffer ones_buf;
     DeviceBuffer id_buf;
     DeviceBuffer pos_buf;
     DeviceBuffer hidden_buf;
@@ -68,7 +67,6 @@ struct Program::Impl {
     std::vector<Tensor> k_pages;
     std::vector<Tensor> v_pages;
     Tensor block;
-    Tensor ones;
     std::vector<Gemma4CacheLayer> caches;
 
     bool binding = false;
@@ -79,12 +77,12 @@ struct Program::Impl {
     std::vector<TokenId> resident;
     std::vector<std::uint16_t> top_logits;
 
-    bool occupied = false;
-    std::uint64_t epoch = 1;
-    std::uint32_t fed = 0;
-    bool has_next = false;
-    TokenId next_id = 0;
-    bool prefilled = false;
+    bool occupied         = false;
+    std::uint64_t epoch   = 1;
+    std::uint32_t fed     = 0;
+    bool has_next         = false;
+    TokenId next_id       = 0;
+    bool prefilled        = false;
     TokenId pending_token = 0;
     std::vector<TokenId> pending_tokens;
     std::uint64_t transaction = 1;
@@ -108,13 +106,9 @@ struct Program::Impl {
         if (vocab <= 0 || hidden <= 0 || loaded.layers.empty() || capacity == 0) {
             throw std::invalid_argument("gemma4 program: model is empty");
         }
-        pages = static_cast<int>((capacity + 63U) / 64U);
-        std::vector<std::uint16_t> one_bits(512, 0x3f80);
-        ones_buf = DeviceBuffer(one_bits.size() * 2);
-        ones_buf.copy_from_host(one_bits.data(), ones_buf.bytes);
-        ones = Tensor(ones_buf.p, DType::BF16, {512});
-        id_buf = DeviceBuffer(static_cast<std::size_t>(chunk) * 4);
-        pos_buf = DeviceBuffer(static_cast<std::size_t>(chunk) * 4);
+        pages      = static_cast<int>((capacity + 63U) / 64U);
+        id_buf     = DeviceBuffer(static_cast<std::size_t>(chunk) * 4);
+        pos_buf    = DeviceBuffer(static_cast<std::size_t>(chunk) * 4);
         hidden_buf = DeviceBuffer(static_cast<std::size_t>(hidden) * chunk * 2);
         config_buf = DeviceBuffer(sizeof(ops::SamplingConfig));
         counts_buf = DeviceBuffer(static_cast<std::size_t>(vocab) * 4);
@@ -139,12 +133,12 @@ struct Program::Impl {
         }
         for (std::size_t index = 0; index < loaded.layers.size(); ++index) {
             const Gemma4LayerWeights& layer = loaded.layers[index];
-            k_pages.emplace_back(k_store[index].p, DType::BF16,
-                                 std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads,
-                                                                     pages});
-            v_pages.emplace_back(v_store[index].p, DType::BF16,
-                                 std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads,
-                                                                     pages});
+            k_pages.emplace_back(
+                k_store[index].p, DType::BF16,
+                std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads, pages});
+            v_pages.emplace_back(
+                v_store[index].p, DType::BF16,
+                std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads, pages});
         }
         for (std::size_t index = 0; index < loaded.layers.size(); ++index) {
             caches.push_back({&k_pages[index], &v_pages[index], &block});
@@ -158,9 +152,9 @@ struct Program::Impl {
     }
 
     void clear_lane() {
-        occupied = false;
-        fed = 0;
-        has_next = false;
+        occupied  = false;
+        fed       = 0;
+        has_next  = false;
         prefilled = false;
         pending_tokens.clear();
     }
@@ -185,7 +179,7 @@ struct Program::Impl {
         Tensor hidden_tensor(hidden_buf.p, DType::BF16, {hidden, width});
         workspace.reset();
         gemma4_layers(id_tensor, hidden_tensor, model->token_embedding, model->layers, caches,
-                      position_tensor, ones, gemm, workspace, stream);
+                      position_tensor, gemm, workspace, stream);
         resident.insert(resident.end(), ids, ids + count);
     }
 
@@ -194,7 +188,7 @@ struct Program::Impl {
     [[nodiscard]] std::uint32_t reusable_tokens(const detail::RequestPlan& request) const {
         if (!request.allow_prefix_reuse || request.tokens.size() < 2) { return 0; }
         const std::size_t limit = std::min(resident.size(), request.tokens.size() - 1);
-        std::size_t length = 0;
+        std::size_t length      = 0;
         while (length < limit && resident[length] == request.tokens[length]) { ++length; }
         return static_cast<std::uint32_t>(length);
     }
@@ -225,8 +219,8 @@ struct Program::Impl {
     [[nodiscard]] TokenId sample_column(std::int32_t column, std::uint32_t position,
                                         std::int32_t purpose) {
         workspace.reset();
-        Tensor logits = workspace.alloc(DType::BF16, {vocab, 1});
-        Tensor out = workspace.alloc(DType::I32, {1});
+        Tensor logits  = workspace.alloc(DType::BF16, {vocab, 1});
+        Tensor out     = workspace.alloc(DType::I32, {1});
         Tensor logical = workspace.alloc(DType::I32, {1});
         gemma4_logits(hidden_columns(column, 1), logits, model->final_norm, model->output_head,
                       model->softcap, model->rms_eps, gemm, workspace, stream);
@@ -247,9 +241,9 @@ struct Program::Impl {
         for (std::int32_t done = 0; done < count; done += kScoreTile) {
             const std::int32_t columns = std::min(kScoreTile, count - done);
             workspace.reset();
-            Tensor logits = workspace.alloc(DType::BF16, {vocab, columns});
+            Tensor logits     = workspace.alloc(DType::BF16, {vocab, columns});
             Tensor target_ids = workspace.alloc(DType::I32, {columns});
-            Tensor logprobs = workspace.alloc(DType::FP32, {columns});
+            Tensor logprobs   = workspace.alloc(DType::FP32, {columns});
             gemma4_logits(hidden_columns(start + done, columns), logits, model->final_norm,
                           model->output_head, model->softcap, model->rms_eps, gemm, workspace,
                           stream);
@@ -276,19 +270,20 @@ struct Program::Impl {
     }
 
     PendingBatch stage(TokenId token, runtime::ExecutionTiming timing) {
-        pending_token = token;
+        pending_token  = token;
         pending_tokens = {token};
         pending_timing = timing;
         ++transaction;
-        return program::HandleAccess::make_pending(
-            this, transaction, std::span<const SequenceHandle>(&handle, 1), 1, pending_tokens, {},
-            1, timing);
+        return program::HandleAccess::make_pending(this, transaction,
+                                                   std::span<const SequenceHandle>(&handle, 1), 1,
+                                                   pending_tokens, {}, 1, timing);
     }
 };
 
 Program::Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
                  cudaStream_t stream)
     : impl_(std::make_unique<Impl>(model, capacity, prefill_chunk, stream)) {}
+
 Program::~Program() = default;
 
 std::size_t Program::kv_bytes_per_token(const LoadedText& model) {
@@ -312,18 +307,18 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
     if (prompt.tokens().size() > impl_->capacity) {
         throw std::invalid_argument("gemma4 prompt does not fit the KV capacity");
     }
-    auto plan = std::make_shared<detail::RequestPlan>();
-    plan->tokens = prompt.tokens();
-    plan->sampling = options.sampling;
-    plan->allow_prefix_reuse = options.allow_prefix_reuse;
-    plan->summary.prompt_tokens = static_cast<std::uint32_t>(plan->tokens.size());
+    auto plan                             = std::make_shared<detail::RequestPlan>();
+    plan->tokens                          = prompt.tokens();
+    plan->sampling                        = options.sampling;
+    plan->allow_prefix_reuse              = options.allow_prefix_reuse;
+    plan->summary.prompt_tokens           = static_cast<std::uint32_t>(plan->tokens.size());
     plan->summary.requested_output_tokens = options.requested_output_tokens;
     plan->summary.effective_output_tokens = options.requested_output_tokens;
-    plan->summary.effective_limit_reason = FinishReason::OutputLimit;
-    const std::uint32_t room = impl_->capacity - plan->summary.prompt_tokens + 1U;
+    plan->summary.effective_limit_reason  = FinishReason::OutputLimit;
+    const std::uint32_t room              = impl_->capacity - plan->summary.prompt_tokens + 1U;
     if (plan->summary.effective_output_tokens > room) {
         plan->summary.effective_output_tokens = room;
-        plan->summary.effective_limit_reason = FinishReason::ContextCapacity;
+        plan->summary.effective_limit_reason  = FinishReason::ContextCapacity;
     }
     plan->summary.publish_continuation = false;
     return RequestBasePlan(std::move(plan));
@@ -334,7 +329,7 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
     if (impl_->occupied || impl_->binding) {
         throw std::logic_error("gemma4 causal scoring needs an idle program");
     }
-    const auto& tokens = prompt.tokens();
+    const auto& tokens      = prompt.tokens();
     const std::size_t count = tokens.size();
     if (count < 2 || count > impl_->capacity) {
         throw std::invalid_argument("causal score token count must be in [2,capacity]");
@@ -368,7 +363,8 @@ std::optional<SourceCandidate> Program::inspect_source(const RequestBasePlan& ba
                                                        std::span<const CheckpointHandle>) const {
     if (checkpoint) { return std::nullopt; }
     SourceCandidate source;
-    source.reused_tokens = impl_->occupied || impl_->binding ? 0 : impl_->reusable_tokens(*base.impl_);
+    source.reused_tokens =
+        impl_->occupied || impl_->binding ? 0 : impl_->reusable_tokens(*base.impl_);
     source.remaining_work = runtime::make_prefill_work(
         source.reused_tokens, base.summary().prompt_tokens - source.reused_tokens, 0, 0,
         impl_->chunk);
@@ -377,26 +373,39 @@ std::optional<SourceCandidate> Program::inspect_source(const RequestBasePlan& ba
 
 PrefixShortlistKey Program::checkpoint_key(CheckpointHandle, std::uint32_t) const { return {}; }
 
-runtime::ContextResourceUsage Program::checkpoint_footprint(std::span<const CheckpointHandle>) const {
+runtime::ContextResourceUsage
+Program::checkpoint_footprint(std::span<const CheckpointHandle>) const {
     return {};
 }
+
 CheckpointSummary Program::checkpoint_summary(CheckpointHandle) const { return {}; }
+
 CheckpointMetadata Program::checkpoint_metadata(CheckpointHandle) const { return {}; }
+
 bool Program::checkpoint_matches(CheckpointHandle, const RequestBasePlan&) const { return false; }
+
 std::uint32_t Program::checkpoint_recovery_frontier(CheckpointHandle, const RequestBasePlan&,
-                                                   std::uint32_t target) const {
+                                                    std::uint32_t target) const {
     return target;
 }
+
 std::uint64_t Program::checkpoint_recovery_loss(std::span<const CheckpointHandle>,
-                                               std::span<const CheckpointHandle>) const {
+                                                std::span<const CheckpointHandle>) const {
     return 0;
 }
+
 bool Program::valid_checkpoint(CheckpointHandle) const noexcept { return false; }
+
 bool Program::release_checkpoint(CheckpointHandle) noexcept { return false; }
+
 bool Program::revoke_snapshot(ResumeState&) noexcept { return false; }
+
 runtime::ContextResourceUsage Program::snapshot_resources(const ResumeState&) const { return {}; }
+
 std::size_t Program::host_bytes_released(std::span<const CheckpointHandle>) const { return 0; }
+
 std::optional<std::size_t> Program::pause_host_bytes(SequenceHandle) const { return std::nullopt; }
+
 std::size_t Program::release_redundant_host(std::span<const CheckpointHandle>,
                                             std::optional<SequenceHandle>) {
     return 0;
@@ -410,6 +419,7 @@ runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUni
 }
 
 bool Program::reclaim_capture_reservation(runtime::ContextResourceUsage) { return false; }
+
 void Program::release_units(std::span<const SequenceHandle>) noexcept {}
 
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
@@ -421,19 +431,22 @@ BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::
     if (lane.value != 0 || impl_->binding || impl_->occupied) {
         return {.reserved = false, .source_valid = true, .capacity_possible = true};
     }
-    impl_->plan = base.impl_;
-    impl_->binding = true;
+    impl_->plan        = base.impl_;
+    impl_->binding     = true;
     impl_->bind_reused = source.reused_tokens;
-    impl_->begin = {.prompt_tokens = base.summary().prompt_tokens,
-                    .reused_prompt_tokens = source.reused_tokens,
-                    .prefix_reuse_path = source.reused_tokens ? PrefixReusePath::Checkpoint
-                                                              : PrefixReusePath::Root};
+    impl_->begin       = {.prompt_tokens        = base.summary().prompt_tokens,
+                          .reused_prompt_tokens = source.reused_tokens,
+                          .prefix_reuse_path =
+                        source.reused_tokens ? PrefixReusePath::Checkpoint : PrefixReusePath::Root};
     return {.reserved = true};
 }
 
 bool Program::start_capture(SequenceHandle) { return false; }
+
 bool Program::capture_is_input(SequenceHandle) const { return false; }
+
 std::optional<CapturePreparation> Program::prepare_capture(SequenceHandle) { return std::nullopt; }
+
 void Program::skip_capture(SequenceHandle) {}
 
 ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle>,
@@ -441,12 +454,15 @@ ContextReclaimPlan Program::plan_reclaim(std::span<const CheckpointHandle>,
                                          runtime::ContextResourceUsage) const {
     return {};
 }
+
 std::vector<ContextRelease> Program::plan_releases(std::span<const CheckpointHandle>,
                                                    std::span<const CheckpointHandle>,
                                                    runtime::ContextResourceUsage) const {
     return {};
 }
+
 bool Program::start_demote(const ContextDemotion&) { return false; }
+
 bool Program::start_pause(SequenceHandle, bool, runtime::ExecutionTiming*) { return false; }
 
 ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation) {
@@ -461,20 +477,23 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
         return progress;
     }
     impl_->upload_sampling(impl_->plan->sampling);
-    impl_->occupied = true;
-    impl_->fed = impl_->bind_reused;
-    impl_->has_next = false;
+    impl_->occupied  = true;
+    impl_->fed       = impl_->bind_reused;
+    impl_->has_next  = false;
     impl_->prefilled = false;
     impl_->pending_tokens.clear();
-    impl_->handle = program::HandleAccess::make_sequence(impl_.get(), runtime::LaneId{0}, impl_->epoch);
-    impl_->binding = false;
+    impl_->handle =
+        program::HandleAccess::make_sequence(impl_.get(), runtime::LaneId{0}, impl_->epoch);
+    impl_->binding     = false;
     progress.published = true;
-    progress.sequence = impl_->handle;
+    progress.sequence  = impl_->handle;
     return progress;
 }
 
 bool Program::has_context_transaction() const noexcept { return impl_->binding; }
+
 bool Program::context_blocks(SequenceHandle) const noexcept { return false; }
+
 bool Program::recovery_pending(SequenceHandle) const noexcept { return false; }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*,
@@ -482,14 +501,14 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     if (!impl_->owns(sequence) || impl_->prefilled) {
         throw std::logic_error("gemma4 prefill sequence is not waiting");
     }
-    const auto start = std::chrono::steady_clock::now();
-    const auto& tokens = impl_->plan->tokens;
-    const auto total = static_cast<std::uint32_t>(tokens.size());
+    const auto start          = std::chrono::steady_clock::now();
+    const auto& tokens        = impl_->plan->tokens;
+    const auto total          = static_cast<std::uint32_t>(tokens.size());
     const std::uint32_t width = std::min(impl_->chunk, total - impl_->fed);
     impl_->run_layers(tokens.data() + impl_->fed, impl_->fed, width);
     impl_->fed += width;
     PrefillProgress progress;
-    progress.summary = impl_->begin;
+    progress.summary                 = impl_->begin;
     progress.processed_prompt_tokens = width;
     if (impl_->fed < total) {
         check(cudaStreamSynchronize(impl_->stream), "prefill sync");
@@ -498,9 +517,9 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     }
     const TokenId next = impl_->sample_column(static_cast<std::int32_t>(width) - 1, impl_->fed,
                                               ops::kSamplePurposePrefill);
-    impl_->prefilled = true;
-    progress.complete = true;
-    progress.timing = timed(start);
+    impl_->prefilled   = true;
+    progress.complete  = true;
+    progress.timing    = timed(start);
     progress.pending.emplace(impl_->stage(next, progress.timing));
     return progress;
 }
@@ -510,8 +529,8 @@ ReplayProgress Program::advance_replay(SequenceHandle, runtime::ExecutionTiming*
 }
 
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
-                             std::span<const runtime::RoundBudget> budgets, runtime::ExecutionTiming*,
-                             runtime::TokenMaskProvider*) {
+                             std::span<const runtime::RoundBudget> budgets,
+                             runtime::ExecutionTiming*, runtime::TokenMaskProvider*) {
     if (sequences.size() != 1 || budgets.size() != 1 || !impl_->owns(sequences[0]) ||
         !impl_->has_next) {
         throw std::logic_error("gemma4 decode has no accepted token to feed");
@@ -523,27 +542,29 @@ PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
     const TokenId id = impl_->next_id;
     impl_->run_layers(&id, impl_->fed, 1);
     ++impl_->fed;
-    impl_->has_next = false;
+    impl_->has_next    = false;
     const TokenId next = impl_->sample_column(0, impl_->fed, ops::kSamplePurposeDecode);
     return impl_->stage(next, timed(start));
 }
 
-runtime::ExecutionTiming Program::append_forced_tokens(std::span<const SequenceHandle>,
-                                                       std::span<const TokenId>, std::uint32_t,
-                                                       std::span<const std::optional<std::uint32_t>>,
-                                                       runtime::ExecutionTiming*) {
+runtime::ExecutionTiming
+Program::append_forced_tokens(std::span<const SequenceHandle>, std::span<const TokenId>,
+                              std::uint32_t, std::span<const std::optional<std::uint32_t>>,
+                              runtime::ExecutionTiming*) {
     throw std::logic_error("gemma4 has no forced target-control tokens");
 }
 
-CommitResult Program::commit(PendingBatch&& pending, std::span<const runtime::CommitDecision> decisions,
+CommitResult Program::commit(PendingBatch&& pending,
+                             std::span<const runtime::CommitDecision> decisions,
                              runtime::CommitObservation, runtime::ExecutionTiming*) {
     if (program::HandleAccess::owner(pending) != impl_.get() ||
-        program::HandleAccess::transaction(pending) != impl_->transaction || decisions.size() != 1) {
+        program::HandleAccess::transaction(pending) != impl_->transaction ||
+        decisions.size() != 1) {
         throw std::logic_error("gemma4 commit does not match the pending batch");
     }
     const runtime::CommitDecision& decision = decisions[0];
     if (!decision.failed && !decision.cancelled && decision.accepted_tokens == 1) {
-        impl_->next_id = impl_->pending_token;
+        impl_->next_id  = impl_->pending_token;
         impl_->has_next = true;
     } else if (decision.accepted_tokens != 0) {
         throw std::logic_error("gemma4 commit accepted an unexpected token count");
@@ -551,12 +572,13 @@ CommitResult Program::commit(PendingBatch&& pending, std::span<const runtime::Co
     impl_->pending_tokens.clear();
     program::HandleAccess::consume(pending);
     CommitResult result;
-    result.row_count = 1;
-    result.timing = impl_->pending_timing;
-    result.rows[0].disposition = decision.failed      ? runtime::CommitDisposition::FailedReleased
-                                 : decision.cancelled ? runtime::CommitDisposition::CancelledReleased
-                                 : decision.terminal  ? runtime::CommitDisposition::Finishable
-                                                      : runtime::CommitDisposition::Active;
+    result.row_count           = 1;
+    result.timing              = impl_->pending_timing;
+    result.rows[0].disposition = decision.failed ? runtime::CommitDisposition::FailedReleased
+                                 : decision.cancelled
+                                     ? runtime::CommitDisposition::CancelledReleased
+                                 : decision.terminal ? runtime::CommitDisposition::Finishable
+                                                     : runtime::CommitDisposition::Active;
     return result;
 }
 
@@ -602,9 +624,9 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept {
 
 MemorySummary Program::memory_summary() const noexcept {
     MemorySummary summary;
-    summary.max_context = impl_->capacity;
-    summary.kv_capacity = impl_->capacity;
-    summary.kv_cache = KvCacheStorage::BFloat16;
+    summary.max_context              = impl_->capacity;
+    summary.kv_capacity              = impl_->capacity;
+    summary.kv_cache                 = KvCacheStorage::BFloat16;
     summary.workspace.capacity_bytes = impl_->workspace.capacity();
     return summary;
 }

@@ -15,10 +15,10 @@ using namespace ninfer::test;
 namespace {
 
 constexpr int kHidden = 256;
-constexpr int kDim = 256;
-constexpr int kHeads = 2;
-constexpr int kKv = 1;
-constexpr int kInter = 256;
+constexpr int kDim    = 256;
+constexpr int kHeads  = 2;
+constexpr int kKv     = 1;
+constexpr int kInter  = 256;
 constexpr int kTokens = 2;
 
 std::vector<float> rand_bf16(std::size_t count, std::uint32_t seed, float lo, float hi) {
@@ -36,7 +36,7 @@ int main() {
         return 77;
     }
     const auto x0 = rand_bf16(static_cast<std::size_t>(kHidden) * kTokens, 3u, -0.4f, 0.4f);
-    auto bits = [](const std::vector<float>& values) {
+    auto bits     = [](const std::vector<float>& values) {
         std::vector<std::uint16_t> out(values.size());
         for (std::size_t i = 0; i < values.size(); ++i) { out[i] = f32_to_bf16(values[i]); }
         return out;
@@ -49,20 +49,14 @@ int main() {
     GuardedDeviceBuffer dpos(positions.size() * 4), dtable(4);
     dpos.copy_from_host(positions.data(), dpos.bytes());
     dtable.copy_from_host(&table, 4);
-    const std::size_t page =
-        static_cast<std::size_t>(kDim) * 64 * kKv;
+    const std::size_t page = static_cast<std::size_t>(kDim) * 64 * kKv;
     GuardedDeviceBuffer dk(page * 2), dv(page * 2);
     dk.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dk.bytes());
     dv.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dv.bytes());
-    std::vector<float> ones(kDim, 1.0f);
-    round_to_bf16(ones);
-    const auto one_bits = bits(ones);
-    GuardedDeviceBuffer dones(one_bits.size() * 2);
-    dones.copy_from_host(one_bits.data(), dones.bytes());
 
     auto upload = [&](std::uint32_t seed, std::size_t count, float lo, float hi) {
         auto values = rand_bf16(count, seed, lo, hi);
-        auto raw = bits(values);
+        auto raw    = bits(values);
         auto buffer = std::make_shared<GuardedDeviceBuffer>(raw.size() * 2);
         buffer->copy_from_host(raw.data(), buffer->bytes());
         return buffer;
@@ -83,26 +77,26 @@ int main() {
     using models::gemma4::bf16_matrix;
     constexpr int kQkv = (kHeads + 2 * kKv) * kDim;
     models::gemma4::Gemma4LayerWeights weights;
-    weights.input_norm = take_vec(10, kHidden);
-    weights.qkv = bf16_matrix(take(11, kQkv, kHidden), kQkv, kHidden);
-    weights.q_norm = take_vec(14, kDim);
-    weights.k_norm = take_vec(15, kDim);
-    weights.o_proj = bf16_matrix(take(16, kHidden, kHeads * kDim), kHidden, kHeads * kDim);
+    weights.input_norm     = take_vec(10, kHidden);
+    weights.qkv            = bf16_matrix(take(11, kQkv, kHidden), kQkv, kHidden);
+    weights.q_norm         = take_vec(14, kDim);
+    weights.k_norm         = take_vec(15, kDim);
+    weights.o_proj         = bf16_matrix(take(16, kHidden, kHeads * kDim), kHidden, kHeads * kDim);
     weights.post_attn_norm = take_vec(17, kHidden);
-    weights.pre_ff_norm = take_vec(18, kHidden);
-    weights.gate_up = bf16_matrix(take(19, 2 * kInter, kHidden), 2 * kInter, kHidden);
-    weights.down = bf16_matrix(take(21, kHidden, kInter), kHidden, kInter);
-    weights.post_ff_norm = take_vec(22, kHidden);
-    weights.layer_scalar = 0.5f;
-    weights.hidden = kHidden;
-    weights.intermediate = kInter;
-    weights.head_dim = kDim;
-    weights.q_heads = kHeads;
-    weights.kv_heads = kKv;
-    weights.window = 1024;
-    weights.rotary_dim = kDim;
-    weights.rope_theta = 10000.0f;
-    weights.global_layer = false;
+    weights.pre_ff_norm    = take_vec(18, kHidden);
+    weights.gate_up        = bf16_matrix(take(19, 2 * kInter, kHidden), 2 * kInter, kHidden);
+    weights.down           = bf16_matrix(take(21, kHidden, kInter), kHidden, kInter);
+    weights.post_ff_norm   = take_vec(22, kHidden);
+    weights.layer_scalar   = 0.5f;
+    weights.hidden         = kHidden;
+    weights.intermediate   = kInter;
+    weights.head_dim       = kDim;
+    weights.q_heads        = kHeads;
+    weights.kv_heads       = kKv;
+    weights.window         = 1024;
+    weights.rotary_dim     = kDim;
+    weights.rope_theta     = 10000.0f;
+    weights.global_layer   = false;
 
     cudaStream_t stream = nullptr;
     if (cudaStreamCreate(&stream) != cudaSuccess) {
@@ -116,16 +110,14 @@ int main() {
     Tensor block(dtable.data(), DType::I32, {1});
     Tensor k_pages(dk.data(), DType::BF16, {kDim, 64, kKv, 1});
     Tensor v_pages(dv.data(), DType::BF16, {kDim, 64, kKv, 1});
-    Tensor v_ones(dones.data(), DType::BF16, {kDim});
-    models::gemma4::gemma4_layer(x, weights, pos, k_pages, v_pages, block, v_ones, gemm, workspace,
-                                 stream);
+    models::gemma4::gemma4_layer(x, weights, pos, k_pages, v_pages, block, gemm, workspace, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         std::cerr << "FAIL sync\n";
         return 1;
     }
     const auto got = from_device_bf16(dx.data(), x0.size());
     int non_finite = 0;
-    double energy = 0.0;
+    double energy  = 0.0;
     for (float value : got) {
         if (!std::isfinite(value)) { ++non_finite; }
         energy += static_cast<double>(value) * value;
@@ -136,8 +128,8 @@ int main() {
         return 1;
     }
 
-    // One token per call reads q/k/v and gate/up as views of the fused output; two tokens per
-    // call copy them out. Both must give the same layer output.
+    // One token per call reads gate/up as views of the fused output; two tokens per call copy
+    // them out. Both must give the same layer output.
     dx.copy_from_host(x_bits.data(), dx.bytes());
     dk.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dk.bytes());
     dv.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dv.bytes());
@@ -146,15 +138,15 @@ int main() {
         Tensor column(static_cast<std::uint16_t*>(dx.data()) + token * kHidden, DType::BF16,
                       {kHidden, 1});
         Tensor one_pos(static_cast<std::int32_t*>(dpos.data()) + token, DType::I32, {1});
-        models::gemma4::gemma4_layer(column, weights, one_pos, k_pages, v_pages, block, v_ones,
-                                     gemm, workspace, stream);
+        models::gemma4::gemma4_layer(column, weights, one_pos, k_pages, v_pages, block, gemm,
+                                     workspace, stream);
     }
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         std::cerr << "FAIL sync stepwise\n";
         cudaStreamDestroy(stream);
         return 1;
     }
-    const auto stepwise = from_device_bf16(dx.data(), x0.size());
+    const auto stepwise  = from_device_bf16(dx.data(), x0.size());
     int split_mismatches = 0;
     for (std::size_t i = 0; i < got.size(); ++i) {
         if (std::fabs(stepwise[i] - got[i]) > 1.0e-2f + 1.0e-2f * std::fabs(got[i])) {
@@ -177,26 +169,25 @@ int main() {
         owned.push_back(buffer);
         return buffer->data();
     };
-    weights.qkv = bf16_matrix(zeros(static_cast<std::size_t>(kQkv) * kHidden), kQkv, kHidden);
-    weights.o_proj = bf16_matrix(zeros(static_cast<std::size_t>(kHidden) * kHeads * kDim),
-                                 kHidden, kHeads * kDim);
-    weights.gate_up = bf16_matrix(zeros(static_cast<std::size_t>(2 * kInter) * kHidden),
-                                  2 * kInter, kHidden);
+    weights.qkv    = bf16_matrix(zeros(static_cast<std::size_t>(kQkv) * kHidden), kQkv, kHidden);
+    weights.o_proj = bf16_matrix(zeros(static_cast<std::size_t>(kHidden) * kHeads * kDim), kHidden,
+                                 kHeads * kDim);
+    weights.gate_up =
+        bf16_matrix(zeros(static_cast<std::size_t>(2 * kInter) * kHidden), 2 * kInter, kHidden);
     weights.down = bf16_matrix(zeros(static_cast<std::size_t>(kHidden) * kInter), kHidden, kInter);
     weights.layer_scalar = 0.5f;
     dx.copy_from_host(x_bits.data(), dx.bytes());
     dk.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dk.bytes());
     dv.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dv.bytes());
     workspace.reset();
-    models::gemma4::gemma4_layer(x, weights, pos, k_pages, v_pages, block, v_ones, gemm, workspace,
-                                 stream);
+    models::gemma4::gemma4_layer(x, weights, pos, k_pages, v_pages, block, gemm, workspace, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         std::cerr << "FAIL sync zero\n";
         cudaStreamDestroy(stream);
         return 1;
     }
     const auto scaled = from_device_bf16(dx.data(), x0.size());
-    int mismatches = 0;
+    int mismatches    = 0;
     for (std::size_t i = 0; i < x0.size(); ++i) {
         const float expect = x0[i] * 0.5f;
         if (std::fabs(scaled[i] - expect) > 2.0e-3f &&

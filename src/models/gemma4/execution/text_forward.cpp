@@ -2,13 +2,12 @@
 
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gemma4_attention.h"
-#include "ninfer/ops/gemma4_kv_append.h"
+#include "ninfer/ops/gemma4_qkv_prep.h"
 #include "ninfer/ops/geglu.h"
 #include "ninfer/ops/logit_softcap.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/residual_scale.h"
 #include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -87,9 +86,8 @@ std::size_t gemma4_layer_workspace_bytes(const Gemma4LayerWeights& weights, int 
     const auto k     = static_cast<std::size_t>(weights.kv_heads) * weights.head_dim;
     const auto h     = static_cast<std::size_t>(weights.hidden);
     const auto inter = static_cast<std::size_t>(weights.intermediate);
-    // qkv, q, qn, attn; k and v inside qkv plus k, kn, v, vn; hidden_n, projected, normed;
-    // gate_up, gate, up, activated.
-    const std::size_t elements = 4 * q + 6 * k + 3 * h + 5 * inter;
+    // qkv (with k and v), qn, attn; hidden_n, projected, normed; gate_up, gate, up, activated.
+    const std::size_t elements = 3 * q + 2 * k + 3 * h + 5 * inter;
     const std::size_t scratch =
         std::max({projection_bytes(weights.qkv, weights.qkv_policy, tokens),
                   projection_bytes(weights.o_proj, weights.o_policy, tokens),
@@ -107,8 +105,7 @@ std::size_t gemma4_logits_workspace_bytes(const Weight& output_head, int tokens)
 
 void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& positions,
                   Tensor& k_pages, Tensor& v_pages, const Tensor& block_table,
-                  const Tensor& v_norm_ones, ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
-                  cudaStream_t stream) {
+                  ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
     const int tokens = x.ne[1];
     const int hidden = weights.hidden;
     const int dim    = weights.head_dim;
@@ -127,8 +124,6 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
     auto hidden_n  = workspace.alloc(DType::BF16, {hidden, tokens});
     auto qkv       = workspace.alloc(DType::BF16, {qkv_rows, tokens});
     auto qn        = workspace.alloc(DType::BF16, {q_rows, tokens});
-    auto kn        = workspace.alloc(DType::BF16, {k_rows, tokens});
-    auto vn        = workspace.alloc(DType::BF16, {k_rows, tokens});
     auto attn      = workspace.alloc(DType::BF16, {q_rows, tokens});
     auto projected = workspace.alloc(DType::BF16, {hidden, tokens});
     auto normed    = workspace.alloc(DType::BF16, {hidden, tokens});
@@ -136,27 +131,10 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
     ops::rmsnorm(x, norm_weight(weights.input_norm, hidden), weights.rms_eps, false, hidden_n,
                  stream);
     project(hidden_n, weights.qkv, weights.qkv_policy, qkv, gemm, workspace, stream);
-    const Tensor q     = fused_rows(qkv, 0, q_rows, workspace, stream);
-    const Tensor k_raw = fused_rows(qkv, q_rows, k_rows, workspace, stream);
-    Tensor q_heads(q.data, DType::BF16, {dim, weights.q_heads, tokens});
     Tensor qn_heads(qn.data, DType::BF16, {dim, weights.q_heads, tokens});
-    Tensor k_heads(k_raw.data, DType::BF16, {dim, weights.kv_heads, tokens});
-    Tensor kn_heads(kn.data, DType::BF16, {dim, weights.kv_heads, tokens});
-    ops::rmsnorm(q_heads, norm_weight(weights.q_norm, dim), weights.rms_eps, false, qn_heads,
-                 stream);
-    ops::rmsnorm(k_heads, norm_weight(weights.k_norm, dim), weights.rms_eps, false, kn_heads,
-                 stream);
-    Tensor vn_heads(vn.data, DType::BF16, {dim, weights.kv_heads, tokens});
-    Tensor ones(v_norm_ones.data, DType::BF16, {weights.head_dim});
-    if (weights.global_layer) {
-        ops::rmsnorm(k_heads, ones, weights.rms_eps, false, vn_heads, stream);
-    } else {
-        const Tensor v = fused_rows(qkv, q_rows + k_rows, k_rows, workspace, stream);
-        Tensor v_heads(v.data, DType::BF16, {dim, weights.kv_heads, tokens});
-        ops::rmsnorm(v_heads, ones, weights.rms_eps, false, vn_heads, stream);
-    }
-    ops::rope(positions, weights.rotary_dim, weights.rope_theta, qn_heads, kn_heads, stream);
-    ops::gemma4_kv_append(kn_heads, vn_heads, positions, k_pages, v_pages, block_table, stream);
+    ops::gemma4_qkv_prep(qkv, norm_weight(weights.q_norm, dim), norm_weight(weights.k_norm, dim),
+                         positions, weights.rotary_dim, weights.rope_theta, weights.rms_eps,
+                         weights.global_layer, qn_heads, k_pages, v_pages, block_table, stream);
     Tensor attn_heads(attn.data, DType::BF16, {dim, weights.q_heads, tokens});
     ops::gemma4_attention(qn_heads, k_pages, v_pages, block_table, positions, weights.window, 1.0f,
                           attn_heads, workspace, stream);
@@ -183,8 +161,7 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
-                   const Tensor& v_norm_ones, ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
-                   cudaStream_t stream) {
+                   ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
     if (layers.size() != caches.size()) {
         throw std::invalid_argument("gemma4_layers: one cache per layer");
     }
@@ -192,8 +169,7 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedd
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
         auto scope = workspace.scope();
         gemma4_layer(hidden, layers[layer], positions, *caches[layer].k_pages,
-                     *caches[layer].v_pages, *caches[layer].block_table, v_norm_ones, gemm,
-                     workspace, stream);
+                     *caches[layer].v_pages, *caches[layer].block_table, gemm, workspace, stream);
     }
 }
 
@@ -218,10 +194,8 @@ void gemma4_prefill(const Tensor& ids, Tensor& hidden, Tensor& logits,
                     const Weight& output_head, float softcap, float rms_eps,
                     std::span<const Gemma4LayerWeights> layers,
                     std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
-                    const Tensor& v_norm_ones, ops::Bf16GemmContext& gemm,
-                    WorkspaceArena& workspace, cudaStream_t stream) {
-    gemma4_layers(ids, hidden, token_embedding, layers, caches, positions, v_norm_ones, gemm,
-                  workspace, stream);
+                    ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+    gemma4_layers(ids, hidden, token_embedding, layers, caches, positions, gemm, workspace, stream);
     gemma4_logits(hidden, logits, final_norm, output_head, softcap, rms_eps, gemm, workspace,
                   stream);
 }
