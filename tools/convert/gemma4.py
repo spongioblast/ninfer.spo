@@ -16,6 +16,7 @@ import torch
 
 from .model import Model, Parameter
 from .resources import load_resources
+from .sources.compressed_tensors import matrix_source
 from .sources.logical import LogicalSource
 from .sources.safetensors import SafetensorsSource, tensor_source
 
@@ -205,17 +206,49 @@ def _permute_vector(source: LogicalSource, perm: torch.Tensor) -> LogicalSource:
     return LogicalSource(source.shape, f"prope_vec({source.label})", read)
 
 
-class _Builder:
-    def __init__(self, model: Model):
-        self.model = model
+_SAME_SHAPE_KEYS = (
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "vocab_size",
+)
 
-    def add(self, name, source, *, inputs=(), direct="bf16"):
+
+class _Builder:
+    def __init__(self, model: Model, base: SafetensorsSource):
+        self.model = model
+        self.base = base
+
+    def _validate(self, selected: SafetensorsSource, name: str) -> None:
+        if selected is self.base:
+            return
+        theirs = text_config(selected.config)
+        for key in _SAME_SHAPE_KEYS:
+            if theirs[key] != self.model.config[key]:
+                raise ValueError(f"{name}: source {selected.path} differs in {key}")
+
+    def add(self, name, source_name, shape, *, transform=None, inputs=(), direct="bf16"):
+        """Register a parameter whose source can be reopened in another checkpoint.
+
+        A transform needs value access, so transformed parameters import values only.
+        """
+
+        def factory(selected, format=None):
+            self._validate(selected, name)
+            if len(shape) == 2 and transform is None:
+                return matrix_source(selected, source_name, shape, format)
+            if format is not None:
+                raise ValueError(f"{name}: encoded import needs an untransformed matrix")
+            source = tensor_source(selected, source_name, shape)
+            return source if transform is None else transform(source)
+
         self.model.add(
             Parameter(
                 name,
-                source.shape,
-                source,
-                None,
+                tuple(shape),
+                factory(self.base),
+                factory,
                 tuple(inputs),
                 direct,
                 residency=name.split("/", 1)[0],
@@ -264,22 +297,26 @@ def build_model(
     model = Model(
         records, resources=resources, token_count=count, special_token_ids=special
     )
-    builder = _Builder(model)
+    builder = _Builder(model, base)
     hidden = config["hidden_size"]
     vocab = config["vocab_size"]
     heads = config["num_attention_heads"]
     intermediate = config["intermediate_size"]
     prefix = "model.language_model."
-    embed = tensor_source(base, prefix + "embed_tokens.weight", (vocab, hidden))
+    normalizer = config["embed_normalizer"]
     builder.add(
         "text/token_embedding",
-        _scale_bf16(embed, config["embed_normalizer"]),
+        prefix + "embed_tokens.weight",
+        (vocab, hidden),
+        transform=lambda source: _scale_bf16(source, normalizer),
     )
-    builder.add("text/output_head", embed, inputs=("text/final_hidden",))
     builder.add(
-        "text/final_norm",
-        tensor_source(base, prefix + "norm.weight", (hidden,)),
+        "text/output_head",
+        prefix + "embed_tokens.weight",
+        (vocab, hidden),
+        inputs=("text/final_hidden",),
     )
+    builder.add("text/final_norm", prefix + "norm.weight", (hidden,))
     perm = prope_perm(config["global_head_dim"], config["partial_rotary_factor"])
     for index, kind in enumerate(config["layer_types"]):
         global_layer = kind == "full_attention"
@@ -292,52 +329,61 @@ def build_model(
         stem = f"text/layers/{index}/"
         src = prefix + f"layers.{index}."
         q_rows, k_rows = heads * dim, kv * dim
-        for role, rows, source_name in (
-            ("query", q_rows, "q_proj"),
-            ("key", k_rows, "k_proj"),
+        for role, rows, groups, source_name in (
+            ("query", q_rows, heads, "q_proj"),
+            ("key", k_rows, kv, "k_proj"),
         ):
-            matrix = tensor_source(
-                base, src + f"self_attn.{source_name}.weight", (rows, hidden)
-            )
-            if global_layer:
-                matrix = _permute_rows(matrix, heads if role == "query" else kv, perm)
-            builder.add(stem + "attention/" + role, matrix, inputs=(stem + "mixer_input",))
-        if not global_layer:
             builder.add(
-                stem + "attention/value",
-                tensor_source(
-                    base, src + "self_attn.v_proj.weight", (k_rows, hidden)
+                stem + "attention/" + role,
+                src + f"self_attn.{source_name}.weight",
+                (rows, hidden),
+                transform=(
+                    (lambda source, groups=groups: _permute_rows(source, groups, perm))
+                    if global_layer
+                    else None
                 ),
                 inputs=(stem + "mixer_input",),
             )
-        for role, source_name in (("query_norm", "q_norm"), ("key_norm", "k_norm")):
-            vector = tensor_source(
-                base, src + f"self_attn.{source_name}.weight", (dim,)
+        if not global_layer:
+            builder.add(
+                stem + "attention/value",
+                src + "self_attn.v_proj.weight",
+                (k_rows, hidden),
+                inputs=(stem + "mixer_input",),
             )
-            if global_layer:
-                vector = _permute_vector(vector, perm)
-            builder.add(stem + "attention/" + role, vector)
-        output = tensor_source(
-            base, src + "self_attn.o_proj.weight", (hidden, q_rows)
-        )
-        if global_layer:
-            output = _permute_cols(output, heads, perm)
+        for role, source_name in (("query_norm", "q_norm"), ("key_norm", "k_norm")):
+            builder.add(
+                stem + "attention/" + role,
+                src + f"self_attn.{source_name}.weight",
+                (dim,),
+                transform=(
+                    (lambda source: _permute_vector(source, perm))
+                    if global_layer
+                    else None
+                ),
+            )
         builder.add(
             stem + "attention/output",
-            output,
+            src + "self_attn.o_proj.weight",
+            (hidden, q_rows),
+            transform=(
+                (lambda source: _permute_cols(source, heads, perm))
+                if global_layer
+                else None
+            ),
             inputs=(stem + "attention_output",),
         )
         for role in ("gate", "up"):
             builder.add(
                 stem + "mlp/" + role,
-                tensor_source(
-                    base, src + f"mlp.{role}_proj.weight", (intermediate, hidden)
-                ),
+                src + f"mlp.{role}_proj.weight",
+                (intermediate, hidden),
                 inputs=(stem + "ffn_input",),
             )
         builder.add(
             stem + "mlp/down",
-            tensor_source(base, src + "mlp.down_proj.weight", (hidden, intermediate)),
+            src + "mlp.down_proj.weight",
+            (hidden, intermediate),
             inputs=(stem + "mlp/product",),
         )
         for role, source_name in (
@@ -346,14 +392,9 @@ def build_model(
             ("pre_feedforward_norm", "pre_feedforward_layernorm"),
             ("post_feedforward_norm", "post_feedforward_layernorm"),
         ):
-            builder.add(
-                stem + role,
-                tensor_source(base, src + source_name + ".weight", (hidden,)),
-            )
+            builder.add(stem + role, src + source_name + ".weight", (hidden,))
         builder.add(
-            stem + "layer_scalar",
-            tensor_source(base, src + "layer_scalar", (1,)),
-            direct="fp32",
+            stem + "layer_scalar", src + "layer_scalar", (1,), direct="fp32"
         )
         qkv = [stem + "attention/query", stem + "attention/key"]
         if not global_layer:

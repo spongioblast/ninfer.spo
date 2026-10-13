@@ -28,12 +28,32 @@ def _divisor_word(store: SafetensorsSource, name: str) -> bytes:
     return raw
 
 
+def _reciprocal_word(store: SafetensorsSource, name: str) -> bytes:
+    """ModelOpt stores multipliers (value = code * scale * multiplier); NInfer divides."""
+    multiplier = struct.unpack("<f", _divisor_word(store, name))[0]
+    raw = struct.pack("<f", 1.0 / multiplier)
+    if not valid_positive_fp32_word(struct.unpack("<I", raw)[0]):
+        raise ValueError(f"{name}: reciprocal is not a finite positive FP32 divisor")
+    return raw
+
+
 def compressed_matrix_source(
-    store: SafetensorsSource, prefix: str, shape: tuple[int, int], format: str
+    store: SafetensorsSource,
+    prefix: str,
+    shape: tuple[int, int],
+    format: str,
+    *,
+    modelopt: bool = False,
 ) -> LogicalSource:
-    """Interpret the current compressed-tensors NVFP4 or per-row FP8 representation."""
+    """Interpret the compressed-tensors NVFP4 or per-row FP8 representation.
+
+    ``modelopt`` reads NVIDIA ModelOpt NVFP4 instead: codes in ``weight``, E4M3 block scales
+    in ``weight_scale``, and the multipliers ``weight_scale_2`` and ``input_scale``.
+    """
     if format not in ("nvfp4", "fp8_e4m3fn_row_bf16"):
         raise ValueError(f"unsupported encoded source format {format}")
+    if modelopt and format != "nvfp4":
+        raise ValueError(f"{prefix}: ModelOpt sources are NVFP4")
     n, k = shape
     if format == "nvfp4" and k % 16:
         raise ValueError(f"{prefix}: NVFP4 source K must be divisible by 16")
@@ -48,11 +68,22 @@ def compressed_matrix_source(
     def divisor(suffix: str) -> bytes:
         return _divisor_word(store, f"{prefix}.{suffix}")
 
+    def weight_divisor() -> bytes:
+        if modelopt:
+            return _reciprocal_word(store, f"{prefix}.weight_scale_2")
+        return divisor("weight_global_scale")
+
+    def input_divisor() -> bytes:
+        if modelopt:
+            return _reciprocal_word(store, f"{prefix}.input_scale")
+        return divisor("input_global_scale")
+
     def encoded(begin: int, end: int) -> EncodedRows:
         if not 0 <= begin < end <= n:
             raise ValueError(f"{prefix}: invalid encoded rows [{begin},{end})")
         if format == "nvfp4":
-            packed, scale = f"{prefix}.weight_packed", f"{prefix}.weight_scale"
+            packed = f"{prefix}.weight" if modelopt else f"{prefix}.weight_packed"
+            scale = f"{prefix}.weight_scale"
             signature(packed, (n, k // 2), "U8")
             signature(scale, (n, k // 16), "F8_E4M3")
             codes = store.read_flat(packed, begin * (k // 2), end * (k // 2)).reshape(
@@ -65,7 +96,7 @@ def compressed_matrix_source(
             )
             if bool((scales > 0x7E).any()):
                 raise ValueError(f"{scale}: expected nonnegative finite E4M3FN scales")
-            return EncodedRows(format, codes, scales, divisor("weight_global_scale"))
+            return EncodedRows(format, codes, scales, weight_divisor())
         weight, scale = f"{prefix}.weight", f"{prefix}.weight_scale"
         signature(weight, shape, "F8_E4M3")
         info = store.describe(scale)
@@ -128,8 +159,8 @@ def compressed_matrix_source(
         f"{store.path}:{prefix} ({format})",
         read,
         encoded,
-        (lambda: divisor("weight_global_scale")) if format == "nvfp4" else None,
-        (lambda: divisor("input_global_scale")) if format == "nvfp4" else None,
+        weight_divisor if format == "nvfp4" else None,
+        input_divisor if format == "nvfp4" else None,
     )
 
 
@@ -147,14 +178,17 @@ def matrix_source(
         nonlocal resolved
         if resolved is None:
             actual = format
-            if actual is None and store.has(prefix + ".weight_packed"):
+            modelopt = store.has(prefix + ".weight_scale_2")
+            if actual is None and (modelopt or store.has(prefix + ".weight_packed")):
                 actual = "nvfp4"
             if actual is None and store.describe(name).dtype == "F8_E4M3":
                 actual = "fp8_e4m3fn_row_bf16"
             resolved = (
                 tensor_source(store, name, shape)
                 if actual is None
-                else compressed_matrix_source(store, prefix, shape, actual)
+                else compressed_matrix_source(
+                    store, prefix, shape, actual, modelopt=modelopt
+                )
             )
         return resolved
 
