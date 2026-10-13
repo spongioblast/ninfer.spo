@@ -40,6 +40,15 @@ void launch_rmsnorm(const Tensor& x, const Tensor& weight, const Tensor* z, Tens
                     reinterpret_cast<__nv_bfloat162*>(out_bf16), d, rows, eps);
             return;
         }
+        if (aligned2 && d == 5376) {
+            // Gemma 4 hidden. The generic kernel took 10.7 us per one-token row. Its summation
+            // order is kept: a prose parity prompt amplifies a reordered sum at one token from
+            // 2.5% to 66% hidden error within two layers, although each layer stays exact.
+            rmsnorm_generic_order_kernel<Epilogue, 21>
+                <<<static_cast<unsigned>(rows), 256, 0, stream>>>(x_bf16, w_bf16, out_bf16, rows,
+                                                                  eps);
+            return;
+        }
     }
     if constexpr (Epilogue == RmsEpilogue::Offset) {
         if (aligned2 && d == 256) {
