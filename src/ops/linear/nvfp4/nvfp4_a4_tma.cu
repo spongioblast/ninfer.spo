@@ -35,6 +35,22 @@ void launch_nvfp4_a4_tma_linear(Nvfp4GeometryId problem, const Nvfp4A4Operands& 
     case Nvfp4GeometryId::N5120K17408:
         launch<17408>(p, output, stream);
         return;
+    case Nvfp4GeometryId::N16384K5376:
+    case Nvfp4GeometryId::N18432K5376:
+        launch<5376>(p, output, stream);
+        return;
+    case Nvfp4GeometryId::N43008K5376:
+        launch<5376, CU_TENSOR_MAP_L2_PROMOTION_L2_128B>(p, output, stream);
+        return;
+    case Nvfp4GeometryId::N5376K8192:
+        launch<8192>(p, output, stream);
+        return;
+    case Nvfp4GeometryId::N5376K16384:
+        launch<16384>(p, output, stream);
+        return;
+    case Nvfp4GeometryId::N5376K21504:
+        launch<21504>(p, output, stream);
+        return;
     }
     throw std::invalid_argument("NVFP4 TMA linear: unsupported geometry");
 }

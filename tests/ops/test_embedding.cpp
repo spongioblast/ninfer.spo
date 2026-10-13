@@ -448,11 +448,13 @@ struct Fp8Row {
 
 class Fp8Table {
 public:
-    Fp8Table()
-        : code_plane_bytes_(static_cast<std::size_t>(kVocab) * kFp8D),
+    explicit Fp8Table(std::int32_t vocab = kVocab, std::int32_t d = kFp8D)
+        : vocab_(vocab), d_(d), code_plane_bytes_(static_cast<std::size_t>(vocab) * d),
           scale_offset_(align_up(code_plane_bytes_, 256)),
-          payload_(scale_offset_ + static_cast<std::size_t>(kVocab) * 2) {
-        for (const std::int32_t row : dflash2_fixture_ids()) {
+          payload_(scale_offset_ + static_cast<std::size_t>(vocab) * 2) {
+        auto rows = dflash2_fixture_ids();
+        rows.push_back(vocab - 1);
+        for (const std::int32_t row : rows) {
             if (find(row) == nullptr) add_row(row);
         }
     }
@@ -469,31 +471,31 @@ public:
         result.qhigh            = nullptr;
         result.scales           = base + scale_offset_;
         result.high_plane_bytes = 0;
-        result.group_size       = kFp8D;
-        result.group            = kFp8D;
+        result.group_size       = static_cast<std::uint32_t>(d_);
+        result.group            = d_;
         result.ndim             = 2;
-        result.shape[0]         = kVocab;
-        result.shape[1]         = kFp8D;
-        result.padded_shape[0]  = kVocab;
-        result.padded_shape[1]  = kFp8D;
-        result.n                = kVocab;
-        result.k                = kFp8D;
-        result.scale_ne[0]      = kVocab;
+        result.shape[0]         = vocab_;
+        result.shape[1]         = d_;
+        result.padded_shape[0]  = vocab_;
+        result.padded_shape[1]  = d_;
+        result.n                = vocab_;
+        result.k                = d_;
+        result.scale_ne[0]      = vocab_;
         result.scale_nb[0]      = 2;
-        result.scale_nb[1]      = static_cast<std::int64_t>(kVocab) * 2;
+        result.scale_nb[1]      = static_cast<std::int64_t>(vocab_) * 2;
         result.scale_nb[2]      = result.scale_nb[1];
         result.scale_nb[3]      = result.scale_nb[1];
         return result;
     }
 
     std::vector<double> oracle(const std::vector<std::int32_t>& ids) const {
-        std::vector<double> result(static_cast<std::size_t>(kFp8D) * ids.size());
+        std::vector<double> result(static_cast<std::size_t>(d_) * ids.size());
         for (std::size_t t = 0; t < ids.size(); ++t) {
             const Fp8Row* row = find(ids[t]);
             if (row == nullptr) throw std::out_of_range("FP8 oracle row was not materialized");
             const double scale = static_cast<double>(bf16_to_f32(row->scale));
-            for (std::int32_t d = 0; d < kFp8D; ++d) {
-                result[t * static_cast<std::size_t>(kFp8D) + d] =
+            for (std::int32_t d = 0; d < d_; ++d) {
+                result[t * static_cast<std::size_t>(d_) + d] =
                     decode_e4m3fn(row->codes[static_cast<std::size_t>(d)]) * scale;
             }
         }
@@ -504,7 +506,7 @@ public:
         int failures = payload_.verify_guards(label);
         for (const Fp8Row& row : rows_) {
             std::vector<std::uint8_t> got(row.codes.size());
-            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * kFp8D);
+            payload_.copy_to_host(got.data(), got.size(), static_cast<std::size_t>(row.id) * d_);
             failures += verify_exact(label, got, row.codes);
             std::uint8_t scale_bytes[2]{};
             payload_.copy_to_host(scale_bytes, sizeof(scale_bytes),
@@ -527,20 +529,20 @@ private:
     }
 
     void add_row(std::int32_t id) {
-        Fp8Row row{id, std::vector<std::uint8_t>(kFp8D),
+        Fp8Row row{id, std::vector<std::uint8_t>(static_cast<std::size_t>(d_)),
                    id == 0    ? std::uint16_t{0}
                    : id == 1  ? std::uint16_t{1}
                    : id == 42 ? std::uint16_t{0x0080}
                    : id == kDFlash2MaskToken
                        ? f32_to_bf16(1.15625f)
                        : f32_to_bf16(0.0017f + 0.00031f * static_cast<float>(id % 13))};
-        for (std::int32_t d = 0; d < kFp8D; ++d) {
+        for (std::int32_t d = 0; d < d_; ++d) {
             auto code = static_cast<std::uint8_t>(d + id * 37);
             if ((code & 0x7fu) == 0x7fu) --code;
             row.codes[d] = id == 0 ? 0 : code;
         }
         payload_.copy_from_host(row.codes.data(), row.codes.size(),
-                                static_cast<std::size_t>(id) * kFp8D);
+                                static_cast<std::size_t>(id) * d_);
         const std::uint8_t scale_bytes[]{static_cast<std::uint8_t>(row.scale),
                                          static_cast<std::uint8_t>(row.scale >> 8)};
         payload_.copy_from_host(scale_bytes, sizeof(scale_bytes),
@@ -548,6 +550,8 @@ private:
         rows_.push_back(std::move(row));
     }
 
+    std::int32_t vocab_;
+    std::int32_t d_;
     std::size_t code_plane_bytes_;
     std::size_t scale_offset_;
     GuardedDeviceBuffer payload_;
@@ -657,6 +661,15 @@ int test_fp8() {
         std::cerr << "embedding FP8 accepted malformed row-scale metadata\n";
         ++failures;
     } catch (const std::invalid_argument&) {}
+
+    Fp8Table gemma(262144, 5376);
+    for (int t : {1, 7, 128, 176, 177, 1024}) {
+        const std::string label = "embedding FP8 [262144,5376] T=" + std::to_string(t);
+        failures += run_quantized_case(label.c_str(), gemma, dflash2_ids(t), 5376);
+        failures += run_quantized_case(label.c_str(), gemma, dflash2_ids(t), 5376, true);
+    }
+    const std::vector<std::int32_t> last = {262143, 0, 262143};
+    failures += run_quantized_case("embedding FP8 [262144,5376] last row", gemma, last, 5376);
     return failures;
 }
 

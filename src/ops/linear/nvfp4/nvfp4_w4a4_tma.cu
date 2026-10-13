@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -118,7 +119,15 @@ void launch_nvfp4_w4a4_tma_linear(Nvfp4GeometryId problem, const std::uint8_t* a
         launch_linear<Nvfp4N5120K17408>(activation_codes, activation_scales, weight_codes,
                                         weight_scales, output, tokens, alpha, stream);
         return;
+    case Nvfp4GeometryId::N16384K5376:
+    case Nvfp4GeometryId::N18432K5376:
+    case Nvfp4GeometryId::N43008K5376:
+    case Nvfp4GeometryId::N5376K8192:
+    case Nvfp4GeometryId::N5376K16384:
+    case Nvfp4GeometryId::N5376K21504:
+        break;
     }
+    throw std::invalid_argument("NVFP4 W4A4 TMA linear: unsupported geometry");
 }
 
 void launch_nvfp4_w4a4_tma_attention(const std::uint8_t* activation_codes,
@@ -170,6 +179,12 @@ void launch_nvfp4_w4a4_tma_linear_add(Nvfp4GeometryId problem, const std::uint8_
     case Nvfp4GeometryId::N14336K5120:
     case Nvfp4GeometryId::N16384K5120:
     case Nvfp4GeometryId::N34816K5120:
+    case Nvfp4GeometryId::N16384K5376:
+    case Nvfp4GeometryId::N18432K5376:
+    case Nvfp4GeometryId::N43008K5376:
+    case Nvfp4GeometryId::N5376K8192:
+    case Nvfp4GeometryId::N5376K16384:
+    case Nvfp4GeometryId::N5376K21504:
         return;
     }
 }

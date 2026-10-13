@@ -31,10 +31,21 @@ using Nvfp4N16384K5120 = Nvfp4Geometry<16384, 5120>;
 using Nvfp4N34816K5120 = Nvfp4Geometry<34816, 5120>;
 using Nvfp4N5120K6144  = Nvfp4Geometry<5120, 6144>;
 using Nvfp4N5120K17408 = Nvfp4Geometry<5120, 17408>;
+// Gemma 4 31B: sliding qkv, global qk, gate+up, sliding and global o_proj, down.
+using Nvfp4N16384K5376 = Nvfp4Geometry<16384, 5376>;
+using Nvfp4N18432K5376 = Nvfp4Geometry<18432, 5376>;
+using Nvfp4N43008K5376 = Nvfp4Geometry<43008, 5376>;
+using Nvfp4N5376K8192  = Nvfp4Geometry<5376, 8192>;
+using Nvfp4N5376K16384 = Nvfp4Geometry<5376, 16384>;
+using Nvfp4N5376K21504 = Nvfp4Geometry<5376, 21504>;
 
 using Nvfp4Activation5120Geometry  = Nvfp4ActivationGeometry<5120>;
 using Nvfp4Activation6144Geometry  = Nvfp4ActivationGeometry<6144>;
 using Nvfp4Activation17408Geometry = Nvfp4ActivationGeometry<17408>;
+using Nvfp4Activation5376Geometry  = Nvfp4ActivationGeometry<5376>;
+using Nvfp4Activation8192Geometry  = Nvfp4ActivationGeometry<8192>;
+using Nvfp4Activation16384Geometry = Nvfp4ActivationGeometry<16384>;
+using Nvfp4Activation21504Geometry = Nvfp4ActivationGeometry<21504>;
 
 enum class Nvfp4GeometryId : std::uint8_t {
     N14336K5120,
@@ -42,7 +53,18 @@ enum class Nvfp4GeometryId : std::uint8_t {
     N34816K5120,
     N5120K6144,
     N5120K17408,
+    N16384K5376,
+    N18432K5376,
+    N43008K5376,
+    N5376K8192,
+    N5376K16384,
+    N5376K21504,
 };
+
+template <class Geometry>
+constexpr bool nvfp4_geometry_is(std::int32_t output_rows, std::int32_t input_rows) {
+    return output_rows == Geometry::kOutputRows && input_rows == Geometry::kInputRows;
+}
 
 inline Nvfp4GeometryId resolve_nvfp4_geometry(std::int32_t output_rows, std::int32_t input_rows) {
     if (output_rows == Nvfp4N14336K5120::kOutputRows &&
@@ -64,6 +86,18 @@ inline Nvfp4GeometryId resolve_nvfp4_geometry(std::int32_t output_rows, std::int
         input_rows == Nvfp4N5120K17408::kInputRows) {
         return Nvfp4GeometryId::N5120K17408;
     }
+    if (nvfp4_geometry_is<Nvfp4N16384K5376>(output_rows, input_rows))
+        return Nvfp4GeometryId::N16384K5376;
+    if (nvfp4_geometry_is<Nvfp4N18432K5376>(output_rows, input_rows))
+        return Nvfp4GeometryId::N18432K5376;
+    if (nvfp4_geometry_is<Nvfp4N43008K5376>(output_rows, input_rows))
+        return Nvfp4GeometryId::N43008K5376;
+    if (nvfp4_geometry_is<Nvfp4N5376K8192>(output_rows, input_rows))
+        return Nvfp4GeometryId::N5376K8192;
+    if (nvfp4_geometry_is<Nvfp4N5376K16384>(output_rows, input_rows))
+        return Nvfp4GeometryId::N5376K16384;
+    if (nvfp4_geometry_is<Nvfp4N5376K21504>(output_rows, input_rows))
+        return Nvfp4GeometryId::N5376K21504;
     throw std::invalid_argument("unsupported NVFP4 problem");
 }
 
