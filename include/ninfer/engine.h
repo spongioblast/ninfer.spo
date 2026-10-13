@@ -80,6 +80,10 @@ public:
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
+    // Same, and fills `top` with the `top->k` most likely tokens at each of those positions.
+    // Families without top-k scoring throw std::invalid_argument.
+    [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
+                                                  std::uint32_t first_target, TopTokenScores* top);
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;

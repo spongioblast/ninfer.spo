@@ -11,7 +11,9 @@ Program& operator=(Program&&)      = delete;
 
 [[nodiscard]] RequestBasePlan plan_request(PreparedPrompt&& prompt,
                                            const runtime::ResolvedExecutionOptions& options);
-[[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt, std::uint32_t first_target);
+// A non-null `top` (with top->k set) also receives the top-k tokens at every scored position.
+[[nodiscard]] std::vector<float> causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                              TopTokenScores* top = nullptr);
 [[nodiscard]] std::optional<SourceCandidate>
 inspect_source(const RequestBasePlan& base, std::optional<CheckpointHandle> checkpoint,
                bool consume_source                              = false,

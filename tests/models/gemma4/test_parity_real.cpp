@@ -141,8 +141,7 @@ struct Runner {
         ninfer::Tensor pos_tensor(pos_buf.p, ninfer::DType::I32, {count});
         ninfer::Tensor hidden(hidden_buf.p, ninfer::DType::BF16, {loaded.hidden, count});
         ninfer::Tensor logits(logit_buf.p, ninfer::DType::BF16, {loaded.vocab, count});
-        g4::gemma4_layers(id_tensor, hidden, loaded.token_embedding, loaded.vocab, loaded.layers,
-                          cache.layers, pos_tensor, v_ones, gemm, workspace, stream);
+        g4::gemma4_layers(id_tensor, hidden, loaded.token_embedding, loaded.layers, cache.layers, pos_tensor, v_ones, gemm, workspace, stream);
         g4::gemma4_logits(hidden, logits, loaded.final_norm, loaded.output_head, loaded.softcap,
                           loaded.rms_eps, gemm, workspace, stream);
         if (cudaStreamSynchronize(stream) != cudaSuccess) {
@@ -228,8 +227,7 @@ bool bisect(Runner& runner, const fs::path& dir, const std::string& name,
         const std::span<const g4::Gemma4LayerWeights> one(&loaded.layers[layer], 1);
         const std::span<const g4::Gemma4CacheLayer> one_cache(&cache.layers[layer], 1);
         if (layer == 0) {
-            g4::gemma4_layers(id_tensor, hidden, loaded.token_embedding, loaded.vocab, {},
-                              {}, pos_tensor, runner.v_ones, runner.gemm, runner.workspace,
+            g4::gemma4_layers(id_tensor, hidden, loaded.token_embedding, {}, {}, pos_tensor, runner.v_ones, runner.gemm, runner.workspace,
                               runner.stream);
             report(0, "embed", hidden_buf);
         }

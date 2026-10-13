@@ -2,7 +2,15 @@
 
 from __future__ import annotations
 
-from .methods import cast_direct, fp8_row_maxabs, grouped_absmax, import_encoded
+from math import isfinite, prod
+
+from .methods import (
+    cast_direct,
+    fp8_row_maxabs,
+    grouped_absmax,
+    import_encoded,
+    nvfp4_mse46,
+)
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -174,11 +182,92 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
-def gemma4_31b_bf16(model, recipe, sources):
+def _require_gemma4(model, recipe_name):
     if model.config.get("model_type") != "gemma4_text":
-        raise ValueError("gemma4_31b_bf16 requires Gemma 4 text mathematics")
+        raise ValueError(f"{recipe_name} requires Gemma 4 text mathematics")
+
+
+def gemma4_31b_bf16(model, recipe, sources):
+    _require_gemma4(model, "gemma4_31b_bf16")
     for name, parameter in model.parameters.items():
         recipe.assign(name, format=parameter.direct_format, method=cast_direct)
+
+
+def _gemma4_quantized(model, recipe, trunk, *, values=None, mlp=None):
+    """FP8 embedding and head; every text-layer projection gets `trunk(name)`.
+
+    `values` replaces the base checkpoint for every parameter. `mlp` imports the MLP's
+    encoded NVFP4 words from that checkpoint instead of quantizing them.
+    """
+    for name, parameter in model.parameters.items():
+        source = None if values is None else model.source(name, values)
+        if name in ("text/token_embedding", "text/output_head"):
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, source=source)
+        elif name.startswith("text/layers/") and parameter.projection:
+            if mlp is not None and "/mlp/" in name:
+                recipe.assign(
+                    name,
+                    format="nvfp4",
+                    method=import_encoded,
+                    source=model.source(name, mlp, "nvfp4"),
+                )
+            else:
+                format, method = trunk
+                recipe.assign(name, format=format, method=method, source=source)
+        else:
+            recipe.assign(
+                name, format=parameter.direct_format, method=cast_direct, source=source
+            )
+
+
+def gemma4_31b_fp8(model, recipe, sources):
+    _require_gemma4(model, "gemma4_31b_fp8")
+    _gemma4_quantized(model, recipe, (FP8, fp8_row_maxabs))
+
+
+def gemma4_31b_nvfp4_base(model, recipe, sources):
+    _require_gemma4(model, "gemma4_31b_nvfp4_base")
+    _gemma4_quantized(model, recipe, ("nvfp4", nvfp4_mse46))
+
+
+def gemma4_31b_nvfp4_qat(model, recipe, sources):
+    _require_gemma4(model, "gemma4_31b_nvfp4_qat")
+    _gemma4_quantized(model, recipe, ("nvfp4", nvfp4_mse46), values=sources["qat"])
+
+
+def gemma4_31b_nvfp4_nvidia(model, recipe, sources):
+    _require_gemma4(model, "gemma4_31b_nvfp4_nvidia")
+    _gemma4_quantized(
+        model, recipe, ("nvfp4", nvfp4_mse46), mlp=sources["quantized"]
+    )
+
+
+def gemma4_nvfp4_a4(model, recipe, sources):
+    """Override: allow A4 on every NVFP4 text projection with a calibrated divisor.
+
+    `--source calibration=FILE` is a safetensors file with one F32 activation amax per
+    input name (for example ``text/layers/0/mixer_input``); the divisor is 448*6/amax.
+    """
+    _require_gemma4(model, "gemma4_nvfp4_a4")
+    calibration = sources["calibration"]
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if not all(s.format == "nvfp4" for s in recipe.selections[name]):
+            continue
+        for input_name in parameter.inputs:
+            info = calibration.describe(input_name)
+            if info.dtype != "F32" or prod(info.shape) != 1:
+                raise ValueError(f"{input_name}: expected an F32 scalar amax")
+            amax = float(calibration.read_flat(input_name)[0])
+            if not isfinite(amax) or amax <= 0:
+                raise ValueError(f"{input_name}: amax must be finite and positive")
+            recipe.use(
+                name,
+                input_name,
+                activation_policy="AllowA4",
+                auxiliaries={"activation_input_divisor": 448.0 * 6.0 / amax},
+            )
 
 
 RECIPES = {
@@ -188,4 +277,9 @@ RECIPES = {
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
     "gemma4_31b_bf16": gemma4_31b_bf16,
+    "gemma4_31b_fp8": gemma4_31b_fp8,
+    "gemma4_31b_nvfp4_base": gemma4_31b_nvfp4_base,
+    "gemma4_31b_nvfp4_qat": gemma4_31b_nvfp4_qat,
+    "gemma4_31b_nvfp4_nvidia": gemma4_31b_nvfp4_nvidia,
+    "gemma4_nvfp4_a4": gemma4_nvfp4_a4,
 }

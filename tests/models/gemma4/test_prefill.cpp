@@ -22,7 +22,8 @@ int main() {
     constexpr int kKv = 1;
     constexpr int kDim = 256;
     constexpr int kInter = 256;
-    const std::size_t zero_count = static_cast<std::size_t>(kHeads) * kDim * kHidden;
+    // Large enough for the widest zero matrix, the fused qkv.
+    const std::size_t zero_count = static_cast<std::size_t>(kHeads + 2 * kKv) * kDim * kHidden;
     std::vector<std::uint16_t> zeros(zero_count, 0);
     std::vector<float> ones_f(kHidden, 1.0f);
     round_to_bf16(ones_f);
@@ -52,19 +53,17 @@ int main() {
     dk.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dk.bytes());
     dv.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dv.bytes());
 
+    using models::gemma4::bf16_matrix;
     models::gemma4::Gemma4LayerWeights layer;
     layer.input_norm = done.data();
-    layer.q_proj = dzero.data();
-    layer.k_proj = dzero.data();
-    layer.v_proj = dzero.data();
+    layer.qkv = bf16_matrix(dzero.data(), (kHeads + 2 * kKv) * kDim, kHidden);
     layer.q_norm = done.data();
     layer.k_norm = done.data();
-    layer.o_proj = dzero.data();
+    layer.o_proj = bf16_matrix(dzero.data(), kHidden, kHeads * kDim);
     layer.post_attn_norm = done.data();
     layer.pre_ff_norm = done.data();
-    layer.gate_proj = dzero.data();
-    layer.up_proj = dzero.data();
-    layer.down_proj = dzero.data();
+    layer.gate_up = bf16_matrix(dzero.data(), 2 * kInter, kHidden);
+    layer.down = bf16_matrix(dzero.data(), kHidden, kInter);
     layer.post_ff_norm = done.data();
     layer.layer_scalar = 0.5f;
     layer.hidden = kHidden;
@@ -92,9 +91,9 @@ int main() {
     models::gemma4::Gemma4CacheLayer cache{&k_pages, &v_pages, &block};
     const models::gemma4::Gemma4LayerWeights layers[] = {layer};
     const models::gemma4::Gemma4CacheLayer caches[] = {cache};
-    models::gemma4::gemma4_prefill(ids, hidden, logits, dembed.data(), kVocab, done.data(),
-                                   dhead.data(), 30.0f, 1.0e-6f, layers, caches, pos, v_ones, gemm,
-                                   workspace, stream);
+    models::gemma4::gemma4_prefill(ids, hidden, logits, bf16_matrix(dembed.data(), kVocab, kHidden),
+                                   done.data(), bf16_matrix(dhead.data(), kVocab, kHidden), 30.0f,
+                                   1.0e-6f, layers, caches, pos, v_ones, gemm, workspace, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         cudaStreamDestroy(stream);
         std::cerr << "FAIL sync\n";

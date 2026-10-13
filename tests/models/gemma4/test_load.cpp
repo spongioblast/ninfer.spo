@@ -15,11 +15,19 @@ int main(int argc, char** argv) {
     try {
         ninfer::DeviceContext device;
         const auto loaded = ninfer::models::gemma4::load_text(path, device);
-        if (loaded.layers.empty() || loaded.token_embedding == nullptr ||
-            loaded.output_head == nullptr || loaded.final_norm == nullptr ||
-            loaded.layers[0].v_proj == nullptr || !loaded.layers.back().global_layer ||
-            loaded.layers.back().v_proj != nullptr) {
+        if (loaded.layers.empty() || loaded.token_embedding.qdata == nullptr ||
+            loaded.output_head.qdata == nullptr || loaded.final_norm == nullptr ||
+            !loaded.layers.back().global_layer) {
             std::cerr << "FAIL pointers\n";
+            return 1;
+        }
+        // Sliding qkv carries query, key and value rows; global qkv has no value rows.
+        const auto& first = loaded.layers.front();
+        const auto& last  = loaded.layers.back();
+        if (first.qkv.n != (first.q_heads + 2 * first.kv_heads) * first.head_dim ||
+            last.qkv.n != (last.q_heads + last.kv_heads) * last.head_dim ||
+            first.gate_up.n != 2 * first.intermediate || first.qkv.k != loaded.hidden) {
+            std::cerr << "FAIL fused rows qkv " << first.qkv.n << ' ' << last.qkv.n << '\n';
             return 1;
         }
         if (loaded.layers.size() == 2) {

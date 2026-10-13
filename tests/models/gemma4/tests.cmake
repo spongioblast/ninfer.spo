@@ -45,3 +45,7 @@ target_compile_definitions(ninfer_gemma4_frontend_fixtures_test PRIVATE
 ninfer_add_op_test(ninfer_gemma4_tool_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tool_parser.cpp"
   LIBRARIES ninfer_model_runtime)
+
+ninfer_add_op_test(ninfer_gemma4_top_tokens_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_top_tokens.cpp"
+  LIBRARIES ninfer_model_runtime)

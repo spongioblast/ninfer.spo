@@ -80,19 +80,18 @@ int main() {
         return buffer->data();
     };
 
+    using models::gemma4::bf16_matrix;
+    constexpr int kQkv = (kHeads + 2 * kKv) * kDim;
     models::gemma4::Gemma4LayerWeights weights;
     weights.input_norm = take_vec(10, kHidden);
-    weights.q_proj = take(11, kHeads * kDim, kHidden);
-    weights.k_proj = take(12, kKv * kDim, kHidden);
-    weights.v_proj = take(13, kKv * kDim, kHidden);
+    weights.qkv = bf16_matrix(take(11, kQkv, kHidden), kQkv, kHidden);
     weights.q_norm = take_vec(14, kDim);
     weights.k_norm = take_vec(15, kDim);
-    weights.o_proj = take(16, kHidden, kHeads * kDim);
+    weights.o_proj = bf16_matrix(take(16, kHidden, kHeads * kDim), kHidden, kHeads * kDim);
     weights.post_attn_norm = take_vec(17, kHidden);
     weights.pre_ff_norm = take_vec(18, kHidden);
-    weights.gate_proj = take(19, kInter, kHidden);
-    weights.up_proj = take(20, kInter, kHidden);
-    weights.down_proj = take(21, kHidden, kInter);
+    weights.gate_up = bf16_matrix(take(19, 2 * kInter, kHidden), 2 * kInter, kHidden);
+    weights.down = bf16_matrix(take(21, kHidden, kInter), kHidden, kInter);
     weights.post_ff_norm = take_vec(22, kHidden);
     weights.layer_scalar = 0.5f;
     weights.hidden = kHidden;
@@ -137,25 +136,53 @@ int main() {
         return 1;
     }
 
-    std::vector<std::uint16_t> zero_bits(static_cast<std::size_t>(kHeads * kDim) * kHidden, 0);
-    auto zq = std::make_shared<GuardedDeviceBuffer>(zero_bits.size() * 2);
-    auto zk = std::make_shared<GuardedDeviceBuffer>(static_cast<std::size_t>(kKv * kDim) * kHidden * 2);
-    auto zv = std::make_shared<GuardedDeviceBuffer>(zk->bytes());
-    auto zo = std::make_shared<GuardedDeviceBuffer>(static_cast<std::size_t>(kHidden) * kHeads * kDim * 2);
-    auto zg = std::make_shared<GuardedDeviceBuffer>(static_cast<std::size_t>(kInter) * kHidden * 2);
-    auto zu = std::make_shared<GuardedDeviceBuffer>(zg->bytes());
-    auto zd = std::make_shared<GuardedDeviceBuffer>(static_cast<std::size_t>(kHidden) * kInter * 2);
-    for (auto* buffer : {zq.get(), zk.get(), zv.get(), zo.get(), zg.get(), zu.get(), zd.get()}) {
-        std::vector<std::uint16_t> raw(buffer->bytes() / 2, 0);
-        buffer->copy_from_host(raw.data(), buffer->bytes());
+    // One token per call reads q/k/v and gate/up as views of the fused output; two tokens per
+    // call copy them out. Both must give the same layer output.
+    dx.copy_from_host(x_bits.data(), dx.bytes());
+    dk.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dk.bytes());
+    dv.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dv.bytes());
+    for (int token = 0; token < kTokens; ++token) {
+        workspace.reset();
+        Tensor column(static_cast<std::uint16_t*>(dx.data()) + token * kHidden, DType::BF16,
+                      {kHidden, 1});
+        Tensor one_pos(static_cast<std::int32_t*>(dpos.data()) + token, DType::I32, {1});
+        models::gemma4::gemma4_layer(column, weights, one_pos, k_pages, v_pages, block, v_ones,
+                                     gemm, workspace, stream);
     }
-    weights.q_proj = zq->data();
-    weights.k_proj = zk->data();
-    weights.v_proj = zv->data();
-    weights.o_proj = zo->data();
-    weights.gate_proj = zg->data();
-    weights.up_proj = zu->data();
-    weights.down_proj = zd->data();
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        std::cerr << "FAIL sync stepwise\n";
+        cudaStreamDestroy(stream);
+        return 1;
+    }
+    const auto stepwise = from_device_bf16(dx.data(), x0.size());
+    int split_mismatches = 0;
+    for (std::size_t i = 0; i < got.size(); ++i) {
+        if (std::fabs(stepwise[i] - got[i]) > 1.0e-2f + 1.0e-2f * std::fabs(got[i])) {
+            if (split_mismatches < 4) {
+                std::cerr << "stepwise [" << i << "] " << stepwise[i] << " vs " << got[i] << '\n';
+            }
+            ++split_mismatches;
+        }
+    }
+    if (split_mismatches != 0) {
+        std::cerr << "FAIL gemma4 fused split T=1 vs T=2 " << split_mismatches << '\n';
+        cudaStreamDestroy(stream);
+        return 1;
+    }
+
+    auto zeros = [&](std::size_t elements) {
+        auto buffer = std::make_shared<GuardedDeviceBuffer>(elements * 2);
+        std::vector<std::uint16_t> raw(elements, 0);
+        buffer->copy_from_host(raw.data(), buffer->bytes());
+        owned.push_back(buffer);
+        return buffer->data();
+    };
+    weights.qkv = bf16_matrix(zeros(static_cast<std::size_t>(kQkv) * kHidden), kQkv, kHidden);
+    weights.o_proj = bf16_matrix(zeros(static_cast<std::size_t>(kHidden) * kHeads * kDim),
+                                 kHidden, kHeads * kDim);
+    weights.gate_up = bf16_matrix(zeros(static_cast<std::size_t>(2 * kInter) * kHidden),
+                                  2 * kInter, kHidden);
+    weights.down = bf16_matrix(zeros(static_cast<std::size_t>(kHidden) * kInter), kHidden, kInter);
     weights.layer_scalar = 0.5f;
     dx.copy_from_host(x_bits.data(), dx.bytes());
     dk.copy_from_host(std::vector<std::uint16_t>(page, 0).data(), dk.bytes());

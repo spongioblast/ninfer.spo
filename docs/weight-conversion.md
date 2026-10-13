@@ -57,6 +57,17 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_35b_a3b` | Q4 experts, Q5/Q6 expert down, Q8 shared/projection weights | None |
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
+| `gemma4_31b_bf16` | Gemma 4 31B text, every parameter in its direct format | None |
+| `gemma4_31b_fp8` | FP8 row projections, FP8 embedding and head | None |
+| `gemma4_31b_nvfp4_base` | NVFP4 4/6 MSE projections, FP8 embedding and head | None |
+| `gemma4_31b_nvfp4_qat` | As `nvfp4_base`, quantized from Google's QAT BF16 weights | `qat` |
+| `gemma4_31b_nvfp4_nvidia` | As `nvfp4_base`, MLP words imported from NVIDIA ModelOpt NVFP4 | `quantized` |
+
+The Gemma 4 recipes pack Q/K/V (Q/K on global layers) and gate/up into one stored matrix each.
+`gemma4_nvfp4_a4` is an override for the NVFP4 Gemma recipes: it permits A4 on every NVFP4 text
+projection and stores the divisor `448*6/amax` for each projection input. It reads
+`--source calibration=FILE`, a Safetensors file with one F32 activation amax per input name, such
+as `text/layers/0/mixer_input`, `attention_output`, `ffn_input` and `mlp/product`.
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;

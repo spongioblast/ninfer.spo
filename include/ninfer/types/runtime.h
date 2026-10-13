@@ -45,6 +45,14 @@ struct GenerationResult {
     std::string capture_record;
 };
 
+// The `k` most likely tokens at each scored position, most likely first, as ids and natural-log
+// probabilities in row-major [position][k] order.
+struct TopTokenScores {
+    std::uint32_t k = 0;
+    std::vector<TokenId> ids;
+    std::vector<float> logprobs;
+};
+
 struct ArenaMemorySummary {
     std::size_t capacity_bytes  = 0;
     std::size_t used_bytes      = 0;

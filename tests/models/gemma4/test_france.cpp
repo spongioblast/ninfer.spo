@@ -95,7 +95,7 @@ int main() {
         ninfer::ops::Bf16GemmContext gemm(stream);
         ninfer::DeviceArena workspace(512u * 1024u * 1024u);
         ninfer::models::gemma4::gemma4_prefill(
-            ids, hidden_tensor, logits, loaded.token_embedding, vocab, loaded.final_norm,
+            ids, hidden_tensor, logits, loaded.token_embedding, loaded.final_norm,
             loaded.output_head, loaded.softcap, loaded.rms_eps, loaded.layers, caches, pos, v_ones,
             gemm, workspace, stream);
         auto argmax_column = [&](ninfer::DeviceBuffer& buffer, int column) {
@@ -143,7 +143,7 @@ int main() {
             step_id.copy_from_host(&token, 4);
             step_pos.copy_from_host(&position, 4);
             ninfer::models::gemma4::gemma4_prefill(
-                step_ids, step_hidden_tensor, step_logit_tensor, loaded.token_embedding, vocab,
+                step_ids, step_hidden_tensor, step_logit_tensor, loaded.token_embedding,
                 loaded.final_norm, loaded.output_head, loaded.softcap, loaded.rms_eps, loaded.layers,
                 caches, step_position, v_ones, gemm, workspace, stream);
             const auto [next, next_value, a, b, c] = argmax_column(step_logits, 0);

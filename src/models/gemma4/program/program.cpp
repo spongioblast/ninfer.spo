@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "models/gemma4/execution/text_forward.h"
+#include "models/gemma4/program/top_tokens.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/target_logprobs.h"
@@ -33,15 +34,12 @@ void check(cudaError_t status, const char* what) {
     }
 }
 
-// Bytes one prefill token needs in gemma4_layer's workspace, for the widest layer.
-std::size_t layer_bytes_per_token(const LoadedText& model) {
+// Workspace bytes of the widest layer for a `chunk`-token prefill.
+std::size_t layer_bytes(const LoadedText& model, std::uint32_t chunk) {
     std::size_t widest = 0;
     for (const Gemma4LayerWeights& layer : model.layers) {
-        const std::size_t q = static_cast<std::size_t>(layer.q_heads) * layer.head_dim;
-        const std::size_t k = static_cast<std::size_t>(layer.kv_heads) * layer.head_dim;
-        const std::size_t elements = 3U * static_cast<std::size_t>(layer.hidden) + 3U * q + 4U * k +
-                                     3U * static_cast<std::size_t>(layer.intermediate);
-        widest = std::max(widest, elements * 2U);
+        widest = std::max(widest,
+                          gemma4_layer_workspace_bytes(layer, static_cast<int>(chunk)));
     }
     return widest;
 }
@@ -79,6 +77,7 @@ struct Program::Impl {
     std::uint32_t bind_reused = 0;
     // Tokens whose K/V sit at positions [0, size) of the cache; kept across requests for reuse.
     std::vector<TokenId> resident;
+    std::vector<std::uint16_t> top_logits;
 
     bool occupied = false;
     std::uint64_t epoch = 1;
@@ -93,9 +92,9 @@ struct Program::Impl {
     SequenceHandle handle;
 
     static std::size_t workspace_bytes(const LoadedText& loaded, std::uint32_t chunk) {
-        const std::size_t layers = layer_bytes_per_token(loaded) * chunk;
+        const std::size_t layers = layer_bytes(loaded, chunk);
         const std::size_t logits = static_cast<std::size_t>(loaded.vocab) * kScoreTile * 2U +
-                                   static_cast<std::size_t>(loaded.hidden) * kScoreTile * 2U;
+                                   gemma4_logits_workspace_bytes(loaded.output_head, kScoreTile);
         const std::size_t sampling = ops::sampling_workspace_capacity_bytes(loaded.vocab, 1, 1);
         return std::max(layers, logits + sampling) + (64U << 20U);
     }
@@ -185,8 +184,8 @@ struct Program::Impl {
         Tensor position_tensor(pos_buf.p, DType::I32, {width});
         Tensor hidden_tensor(hidden_buf.p, DType::BF16, {hidden, width});
         workspace.reset();
-        gemma4_layers(id_tensor, hidden_tensor, model->token_embedding, vocab, model->layers,
-                      caches, position_tensor, ones, gemm, workspace, stream);
+        gemma4_layers(id_tensor, hidden_tensor, model->token_embedding, model->layers, caches,
+                      position_tensor, ones, gemm, workspace, stream);
         resident.insert(resident.end(), ids, ids + count);
     }
 
@@ -244,7 +243,7 @@ struct Program::Impl {
 
     // Log-probabilities of targets[0..count) under hidden columns [start, start + count).
     void score_columns(std::int32_t start, std::int32_t count, const TokenId* targets,
-                       std::vector<float>& out) {
+                       std::vector<float>& out, TopTokenScores* top) {
         for (std::int32_t done = 0; done < count; done += kScoreTile) {
             const std::int32_t columns = std::min(kScoreTile, count - done);
             workspace.reset();
@@ -265,7 +264,14 @@ struct Program::Impl {
                                   static_cast<std::size_t>(columns) * 4, cudaMemcpyDeviceToHost,
                                   stream),
                   "logprob copy");
+            if (top != nullptr) {
+                top_logits.resize(static_cast<std::size_t>(vocab) * columns);
+                check(cudaMemcpyAsync(top_logits.data(), logits.data, top_logits.size() * 2,
+                                      cudaMemcpyDeviceToHost, stream),
+                      "top logits copy");
+            }
             check(cudaStreamSynchronize(stream), "score sync");
+            if (top != nullptr) { append_top_tokens(top_logits, vocab, columns, *top); }
         }
     }
 
@@ -323,7 +329,8 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
     return RequestBasePlan(std::move(plan));
 }
 
-std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
+std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                         TopTokenScores* top) {
     if (impl_->occupied || impl_->binding) {
         throw std::logic_error("gemma4 causal scoring needs an idle program");
     }
@@ -345,7 +352,7 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
         if (first < cursor + width) {
             impl_->score_columns(static_cast<std::int32_t>(first - cursor),
                                  static_cast<std::int32_t>(cursor + width - first),
-                                 tokens.data() + first + 1, output);
+                                 tokens.data() + first + 1, output, top);
         }
         cursor += width;
     }

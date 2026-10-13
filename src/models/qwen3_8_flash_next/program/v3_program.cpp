@@ -272,8 +272,10 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
     return detail::ProgramAccess::make_plan(std::move(plan));
 }
 
-std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
+std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target,
+                                         TopTokenScores* top) {
     if (!prompt) { throw std::invalid_argument("prepared prompt is empty"); }
+    if (top != nullptr) { throw std::invalid_argument("Flash-Next has no top-k scoring"); }
     return impl_->core.causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
 }
 

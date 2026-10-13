@@ -25,9 +25,9 @@ struct LoadedText {
 
     std::unique_ptr<artifact::MaterializedArtifact> artifact;
     std::vector<Gemma4LayerWeights> layers;
-    const void* token_embedding = nullptr;
+    Weight token_embedding;
     const void* final_norm      = nullptr;
-    const void* output_head     = nullptr;
+    Weight output_head;
     int vocab                   = 0;
     int hidden                  = 0;
     float softcap               = 30.0f;

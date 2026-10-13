@@ -46,6 +46,8 @@ struct Options {
     std::optional<std::filesystem::path> corpus;
     std::optional<std::filesystem::path> text;
     std::optional<std::filesystem::path> output;
+    std::optional<std::filesystem::path> dump_topk;
+    std::vector<ninfer::TokenId> prefix;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
     int device                          = 0;
@@ -59,6 +61,7 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N] [--device N]\n"
            "       [--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--output <directory>]\n"
+           "       [--dump-topk <file>] [--prefix-ids <id,id,...>]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -120,6 +123,19 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (option == "--output") {
             out.output = std::filesystem::path(value("--output"));
+        } else if (option == "--dump-topk") {
+            out.dump_topk = std::filesystem::path(value("--dump-topk"));
+        } else if (option == "--prefix-ids") {
+            std::string_view list = value("--prefix-ids");
+            out.prefix.clear();
+            while (!list.empty()) {
+                const auto comma = list.find(',');
+                const auto id = parse_integer<ninfer::TokenId>(list.substr(0, comma), "prefix id");
+                if (id < 0) { usage_error("--prefix-ids takes token ids"); }
+                out.prefix.push_back(id);
+                list = comma == std::string_view::npos ? std::string_view{} : list.substr(comma + 1);
+            }
+            if (out.prefix.empty()) { usage_error("--prefix-ids requires at least one id"); }
         } else if (option == "--log-level") {
             out.log_level = ninfer::product::parse_log_level(value("--log-level"));
         } else {
@@ -213,6 +229,30 @@ struct EvaluationStream {
     std::vector<WindowPlan> windows;
 };
 
+// --dump-topk file: "NTOPK001", u32 k, u32 0, then per scored position in corpus order
+// (streams, then windows, then targets) k i32 ids and k f32 natural-log probabilities.
+constexpr std::uint32_t kDumpTopK = 64;
+
+std::ofstream open_topk_dump(const std::filesystem::path& path) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) { throw std::runtime_error("cannot create top-k dump: " + path.string()); }
+    const std::uint32_t header[2] = {kDumpTopK, 0};
+    out.write("NTOPK001", 8);
+    out.write(reinterpret_cast<const char*>(header), sizeof(header));
+    return out;
+}
+
+void write_topk(std::ofstream& out, const ninfer::TopTokenScores& top) {
+    const std::size_t positions = top.ids.size() / top.k;
+    for (std::size_t p = 0; p < positions; ++p) {
+        out.write(reinterpret_cast<const char*>(top.ids.data() + p * top.k),
+                  static_cast<std::streamsize>(top.k * sizeof(ninfer::TokenId)));
+        out.write(reinterpret_cast<const char*>(top.logprobs.data() + p * top.k),
+                  static_cast<std::streamsize>(top.k * sizeof(float)));
+    }
+    if (!out) { throw std::runtime_error("cannot write top-k dump"); }
+}
+
 int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         ninfer::product::StartupLogRenderer& startup_log,
         const std::shared_ptr<ninfer::product::TerminalProgress>& progress) {
@@ -221,7 +261,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.artifact_path    = options.artifact;
     engine_options.purpose          = ninfer::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
-    engine_options.max_context      = options.context;
+    engine_options.max_context = options.context + static_cast<std::uint32_t>(options.prefix.size());
     engine_options.kv_cache         = options.kv;
     engine_options.startup_observer = startup_log.observer();
     ninfer::Engine engine(std::move(engine_options));
@@ -261,7 +301,10 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                  ninfer::product::format_pretty_duration(preflight_seconds));
 
     const std::filesystem::path output_directory = prepare_output_directory(options, load, corpus);
-    const Clock::time_point scoring_started      = Clock::now();
+    std::optional<std::ofstream> topk_dump;
+    if (options.dump_topk) { topk_dump.emplace(open_topk_dump(*options.dump_topk)); }
+    ninfer::TopTokenScores top{.k = kDumpTopK};
+    const Clock::time_point scoring_started = Clock::now();
     logger->info("scoring | {} streams | {} tokens | {} windows",
                  ninfer::product::format_pretty_count(streams.size()),
                  ninfer::product::format_pretty_count(total_scored_tokens),
@@ -289,13 +332,17 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
         json window_reports = json::array();
         for (std::size_t window_index = 0; window_index < stream.windows.size(); ++window_index) {
             const WindowPlan& window = stream.windows[window_index];
-            std::vector<ninfer::TokenId> input(
-                stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_begin),
-                stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
+            std::vector<ninfer::TokenId> input = options.prefix;
+            input.insert(input.end(),
+                         stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_begin),
+                         stream.tokens.begin() + static_cast<std::ptrdiff_t>(window.input_end));
+            const auto first_target =
+                static_cast<std::uint32_t>(window.first_target + options.prefix.size());
             const Clock::time_point window_started = Clock::now();
             std::vector<float> logprobs;
             try {
-                logprobs = engine.score_tokens(std::move(input), window.first_target);
+                logprobs = engine.score_tokens(std::move(input), first_target,
+                                               topk_dump ? &top : nullptr);
             } catch (const std::exception& error) {
                 throw std::runtime_error("scoring " + stream.source.id + " window " +
                                          std::to_string(window_index) + " failed: " + error.what());
@@ -305,6 +352,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
                 throw std::runtime_error("scoring returned an invalid target count for " +
                                          stream.source.id);
             }
+            if (topk_dump) { write_topk(*topk_dump, top); }
             ScoreAggregate window_score;
             window_score.add(logprobs);
             stream_score.add(window_score);
@@ -393,6 +441,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"device", options.device},
           {"context_tokens", options.context},
           {"stride_tokens", options.stride},
+          {"prefix_ids", options.prefix},
           {"prefill_chunk_tokens", 1024},
           {"score_tile_tokens", 1024},
           {"kv_dtype", kv_name(options.kv)}}},

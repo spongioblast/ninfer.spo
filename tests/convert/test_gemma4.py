@@ -16,21 +16,25 @@ from tools.convert.recipe import Recipe
 from tools.convert.sources.safetensors import SafetensorsSource
 
 
-def _config():
+# NVFP4's block_scale_k16_m128x4 layout needs every packed parent at N % 128 and K % 64.
+NVFP4_DIMS = {"hidden": 128, "inter": 64, "dim": 128}
+
+
+def _config(hidden=16, inter=32, dim=8):
     return {
         "architectures": ["Gemma4ForConditionalGeneration"],
         "model_type": "gemma4",
         "text_config": {
-            "hidden_size": 16,
+            "hidden_size": hidden,
             "vocab_size": 8,
             "num_hidden_layers": 2,
             "max_position_embeddings": 128,
-            "intermediate_size": 32,
+            "intermediate_size": inter,
             "num_attention_heads": 2,
             "num_key_value_heads": 2,
             "num_global_key_value_heads": 1,
-            "head_dim": 8,
-            "global_head_dim": 8,
+            "head_dim": dim,
+            "global_head_dim": dim,
             "layer_types": ["sliding_attention", "full_attention"],
             "sliding_window": 32,
             "hidden_activation": "gelu_pytorch_tanh",
@@ -49,11 +53,10 @@ def _config():
     }
 
 
-def _checkpoint(path):
+def _checkpoint(path, hidden=16, inter=32, dim=8):
     path.mkdir()
-    (path / "config.json").write_text(json.dumps(_config()))
-    hidden, vocab, inter = 16, 8, 32
-    q, k = 16, 16
+    (path / "config.json").write_text(json.dumps(_config(hidden, inter, dim)))
+    vocab = 8
     tensors = {
         "model.language_model.embed_tokens.weight": torch.arange(vocab * hidden)
         .reshape(vocab, hidden)
@@ -62,7 +65,6 @@ def _checkpoint(path):
     }
     for index, global_layer in ((0, False), (1, True)):
         src = f"model.language_model.layers.{index}."
-        dim = 8
         kv = 1 if global_layer else 2
         q_rows, k_rows = 2 * dim, kv * dim
         tensors[src + "self_attn.q_proj.weight"] = torch.arange(q_rows * hidden).reshape(
@@ -150,26 +152,42 @@ def test_mapping_scales_embedding_and_permutes_global_rope(tmp_path):
         assert model.parameters["text/layers/0/layer_scalar"].direct_format == "fp32"
 
 
-def _modelopt_checkpoint(path, base_path):
-    """Copy the base with layer 0 MLP stored as NVIDIA ModelOpt NVFP4."""
+def _modelopt_checkpoint(
+    path, base_path, layers=(0,), shared_gate_up=False, hidden=16, inter=32, dim=8
+):
+    """Copy the base with the MLP of `layers` stored as NVIDIA ModelOpt NVFP4.
+
+    `shared_gate_up` gives gate and up one weight divisor, as in NVIDIA's checkpoint.
+    """
     path.mkdir()
-    config = _config()
+    config = _config(hidden, inter, dim)
     config["quantization_config"] = {"quant_method": "modelopt", "quant_algo": "NVFP4"}
     (path / "config.json").write_text(json.dumps(config))
     tensors = load_file(base_path / "model.safetensors")
     generator = torch.Generator().manual_seed(7)
     expected = {}
-    for role, shape in (("gate", (32, 16)), ("up", (32, 16)), ("down", (16, 32))):
-        values = torch.randn(shape, generator=generator)
-        divisor = nvfp4_divisor(float(values.abs().max()))
-        rows = quantize_nvfp4_rows(values, divisor, device="cpu")
-        src = f"model.language_model.layers.0.mlp.{role}_proj."
-        del tensors[src + "weight"]
-        tensors[src + "weight"] = rows.codes
-        tensors[src + "weight_scale"] = rows.scales.view(torch.float8_e4m3fn)
-        tensors[src + "weight_scale_2"] = torch.tensor([1.0 / divisor], dtype=torch.float32)
-        tensors[src + "input_scale"] = torch.tensor([0.5], dtype=torch.float32)
-        expected[role] = (values, rows)
+    for layer in layers:
+        values = {
+            role: torch.randn(shape, generator=generator)
+            for role, shape in (
+                ("gate", (inter, hidden)),
+                ("up", (inter, hidden)),
+                ("down", (hidden, inter)),
+            )
+        }
+        joint = max(float(values[role].abs().max()) for role in ("gate", "up"))
+        for role, role_values in values.items():
+            amax = joint if shared_gate_up and role != "down" else float(role_values.abs().max())
+            divisor = nvfp4_divisor(amax)
+            rows = quantize_nvfp4_rows(role_values, divisor, device="cpu")
+            src = f"model.language_model.layers.{layer}.mlp.{role}_proj."
+            del tensors[src + "weight"]
+            tensors[src + "weight"] = rows.codes
+            tensors[src + "weight_scale"] = rows.scales.view(torch.float8_e4m3fn)
+            tensors[src + "weight_scale_2"] = torch.tensor([1.0 / divisor], dtype=torch.float32)
+            tensors[src + "input_scale"] = torch.tensor([0.5], dtype=torch.float32)
+            if layer == layers[0]:
+                expected[role] = (role_values, rows)
     save_file(tensors, path / "model.safetensors")
     return SafetensorsSource(path), expected
 
@@ -227,3 +245,134 @@ def test_bf16_recipe_rereads_scaled_embedding(tmp_path):
             torch.arange(8 * 16).reshape(8, 16).to(torch.bfloat16) * scale
         )
         assert torch.equal(stored, expect)
+
+
+def _objects(artifact, name):
+    binding = artifact.directory.bindings[name]
+    if "object" in binding:
+        return [(binding["object"], None)]
+    return [(part["object"], tuple(part["range"])) for part in binding["parts"]]
+
+
+def _packed(artifact, names):
+    """Assert `names` fill one stored object in order and return that object."""
+    parts = [_objects(artifact, name) for name in names]
+    assert all(len(part) == 1 for part in parts)
+    objects = {part[0][0] for part in parts}
+    assert len(objects) == 1
+    cursor = 0
+    for part in parts:
+        begin, end = part[0][1]
+        assert begin == cursor
+        cursor = end
+    obj = artifact.by_id[objects.pop()]
+    assert cursor == obj.shape[0] * obj.shape[1]
+    return obj
+
+
+@pytest.mark.parametrize(
+    "recipe_name,trunk",
+    [
+        ("gemma4_31b_fp8", "fp8_e4m3fn_row_bf16"),
+        ("gemma4_31b_nvfp4_base", "nvfp4"),
+    ],
+)
+def test_quantized_recipes_pack_qkv_and_gate_up(tmp_path, recipe_name, trunk):
+    from tools.convert.official_recipes import RECIPES
+
+    with _checkpoint(tmp_path / "source", **NVFP4_DIMS) as source:
+        model = build_model(source)
+        recipe = Recipe(model)
+        RECIPES[recipe_name](model, recipe, {"base": source})
+        out = tmp_path / "gemma.ninfer"
+        convert(model, recipe, out, device="cpu", rows_per_chunk=128)
+    with Artifact(out) as artifact:
+        sliding = "text/layers/0/"
+        qkv = _packed(artifact, [sliding + "attention/" + r for r in ("query", "key", "value")])
+        assert qkv.format == trunk and tuple(qkv.shape) == (768, 128)
+        global_qk = _packed(artifact, ["text/layers/1/attention/query", "text/layers/1/attention/key"])
+        assert global_qk.format == trunk and tuple(global_qk.shape) == (384, 128)
+        for layer in (0, 1):
+            gate_up = _packed(artifact, [f"text/layers/{layer}/mlp/gate", f"text/layers/{layer}/mlp/up"])
+            assert gate_up.format == trunk and tuple(gate_up.shape) == (128, 128)
+            down = artifact.by_id[_objects(artifact, f"text/layers/{layer}/mlp/down")[0][0]]
+            assert down.format == trunk
+        for edge in ("text/token_embedding", "text/output_head"):
+            assert artifact.by_id[_objects(artifact, edge)[0][0]].format == "fp8_e4m3fn_row_bf16"
+        norm = artifact.by_id[_objects(artifact, "text/final_norm")[0][0]]
+        assert norm.format == "bf16"
+
+
+def test_nvidia_recipe_imports_shared_gate_up(tmp_path):
+    from tools.convert.official_recipes import gemma4_31b_nvfp4_nvidia
+
+    with _checkpoint(tmp_path / "source", **NVFP4_DIMS) as source:
+        model = build_model(source)
+        nvidia, expected = _modelopt_checkpoint(
+            tmp_path / "nvidia",
+            tmp_path / "source",
+            layers=(0, 1),
+            shared_gate_up=True,
+            **NVFP4_DIMS,
+        )
+        with nvidia:
+            recipe = Recipe(model)
+            gemma4_31b_nvfp4_nvidia(model, recipe, {"base": source, "quantized": nvidia})
+            out = tmp_path / "gemma.ninfer"
+            convert(model, recipe, out, device="cpu", rows_per_chunk=128)
+    with Artifact(out) as artifact:
+        gate_up = _packed(artifact, ["text/layers/0/mlp/gate", "text/layers/0/mlp/up"])
+        assert gate_up.format == "nvfp4"
+        qkv = _packed(artifact, ["text/layers/0/attention/" + r for r in ("query", "key", "value")])
+        assert qkv.format == "nvfp4"
+        manifest = json.loads((tmp_path / "gemma.ninfer.conversion.json").read_text())
+        methods = {job["object"]: job["method"] for job in manifest["methods"]}
+        assert methods[gate_up.id] == "import_encoded"
+        assert methods[qkv.id] == "nvfp4_mse46"
+
+
+def _calibration(path, amax):
+    save_file({name: torch.tensor([value], dtype=torch.float32) for name, value in amax.items()}, path)
+    return SafetensorsSource(path)
+
+
+def test_a4_override_stores_calibrated_divisors(tmp_path):
+    from tools.convert.official_recipes import gemma4_31b_nvfp4_base, gemma4_nvfp4_a4
+
+    roles = ("mixer_input", "attention_output", "ffn_input", "mlp/product")
+    amax = {f"text/layers/{layer}/{role}": 2.0 + layer + i for layer in (0, 1) for i, role in enumerate(roles)}
+    with _checkpoint(tmp_path / "source", **NVFP4_DIMS) as source:
+        model = build_model(source)
+        with _calibration(tmp_path / "amax.safetensors", amax) as calibration:
+            recipe = Recipe(model)
+            sources = {"base": source, "calibration": calibration}
+            gemma4_31b_nvfp4_base(model, recipe, sources)
+            gemma4_nvfp4_a4(model, recipe, sources)
+            out = tmp_path / "gemma.ninfer"
+            convert(model, recipe, out, device="cpu", rows_per_chunk=128)
+    with Artifact(out) as artifact:
+        uses = {(use["parameter"], use["input"]): use for use in artifact.directory.uses}
+        for (name, input_name), use in uses.items():
+            if not name.startswith("text/layers/"):
+                assert use["activation_policy"] == "A16Only"
+                assert not use.get("auxiliaries")
+                continue
+            assert use["activation_policy"] == "AllowA4"
+            [binding] = use["auxiliaries"].values()
+            stored = artifact.read_object(binding["object"])
+            assert stored == struct.pack("<f", 448.0 * 6.0 / amax[input_name])
+        assert ("text/layers/1/attention/key", "text/layers/1/mixer_input") in uses
+
+
+def test_a4_override_requires_every_input(tmp_path):
+    from tools.convert.official_recipes import gemma4_31b_nvfp4_base, gemma4_nvfp4_a4
+
+    with _checkpoint(tmp_path / "source", **NVFP4_DIMS) as source:
+        model = build_model(source)
+        partial = {"text/layers/0/mixer_input": 1.0}
+        with _calibration(tmp_path / "amax.safetensors", partial) as calibration:
+            recipe = Recipe(model)
+            sources = {"base": source, "calibration": calibration}
+            gemma4_31b_nvfp4_base(model, recipe, sources)
+            with pytest.raises(ValueError, match="attention_output"):
+                gemma4_nvfp4_a4(model, recipe, sources)
