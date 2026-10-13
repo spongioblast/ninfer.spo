@@ -27,9 +27,9 @@ std::size_t kv_index(int head_dim, int kv_heads, int pages, int head, int positi
 // Queries sit at the last `tokens` of `kv_len` cached positions.
 int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tokens, int kv_len,
              int window) {
-    const int pages = (kv_len + kPage - 1) / kPage;
-    const int first_query = kv_len - tokens;
-    const std::size_t q_count = static_cast<std::size_t>(head_dim) * q_heads * tokens;
+    const int pages            = (kv_len + kPage - 1) / kPage;
+    const int first_query      = kv_len - tokens;
+    const std::size_t q_count  = static_cast<std::size_t>(head_dim) * q_heads * tokens;
     const std::size_t kv_count = static_cast<std::size_t>(head_dim) * kPage * kv_heads * pages;
     std::vector<float> q(q_count), k(kv_count, 0.0f), v(kv_count, 0.0f);
     fill_uniform(q, 70u, -1.0f, 1.0f);
@@ -55,9 +55,10 @@ int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tok
     std::vector<double> expected(q_count, 0.0);
     const auto score = [&](int token, int qh, int key) {
         const int kvh = qh / group;
-        double dot = 0.0;
+        double dot    = 0.0;
         for (int dim = 0; dim < head_dim; ++dim) {
-            dot += static_cast<double>(q[(static_cast<std::size_t>(token) * q_heads + qh) * head_dim + dim]) *
+            dot += static_cast<double>(
+                       q[(static_cast<std::size_t>(token) * q_heads + qh) * head_dim + dim]) *
                    k_logical[(static_cast<std::size_t>(key) * kv_heads + kvh) * head_dim + dim];
         }
         return dot;
@@ -65,17 +66,23 @@ int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tok
     for (int token = 0; token < tokens; ++token) {
         const int position = first_query + token;
         for (int qh = 0; qh < q_heads; ++qh) {
-            const int kvh   = qh / group;
-            const int first = window == 0 ? 0 : std::max(0, position - window + 1);
+            const int kvh    = qh / group;
+            const int first  = window == 0 ? 0 : std::max(0, position - window + 1);
             double max_score = -1.0e300;
-            for (int key = first; key <= position; ++key) { max_score = std::max(max_score, score(token, qh, key)); }
+            for (int key = first; key <= position; ++key) {
+                max_score = std::max(max_score, score(token, qh, key));
+            }
             double sum = 0.0;
-            for (int key = first; key <= position; ++key) { sum += std::exp(score(token, qh, key) - max_score); }
+            for (int key = first; key <= position; ++key) {
+                sum += std::exp(score(token, qh, key) - max_score);
+            }
             for (int key = first; key <= position; ++key) {
                 const double weight = std::exp(score(token, qh, key) - max_score) / sum;
                 for (int dim = 0; dim < head_dim; ++dim) {
                     expected[(static_cast<std::size_t>(token) * q_heads + qh) * head_dim + dim] +=
-                        weight * v_logical[(static_cast<std::size_t>(key) * kv_heads + kvh) * head_dim + dim];
+                        weight *
+                        v_logical[(static_cast<std::size_t>(key) * kv_heads + kvh) * head_dim +
+                                  dim];
                 }
             }
         }
@@ -92,7 +99,9 @@ int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tok
     GuardedDeviceBuffer dq(q_bits.size() * 2), dk(k_bits.size() * 2), dv(v_bits.size() * 2),
         dout(q_bits.size() * 2);
     std::vector<std::int32_t> table(static_cast<std::size_t>(pages));
-    for (int page = 0; page < pages; ++page) { table[static_cast<std::size_t>(page)] = pages - 1 - page; }
+    for (int page = 0; page < pages; ++page) {
+        table[static_cast<std::size_t>(page)] = pages - 1 - page;
+    }
     std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
     for (int i = 0; i < tokens; ++i) { positions[static_cast<std::size_t>(i)] = first_query + i; }
     GuardedDeviceBuffer dtable(table.size() * sizeof(std::int32_t)),
@@ -108,11 +117,24 @@ int run_case(const char* label, int head_dim, int q_heads, int kv_heads, int tok
     Tensor table_tensor(dtable.data(), DType::I32, {pages});
     Tensor pos_tensor(dpos.data(), DType::I32, {tokens});
     Tensor out_tensor(dout.data(), DType::BF16, {head_dim, q_heads, tokens});
+    const std::size_t capacity =
+        ops::gemma4_attention_workspace_capacity_bytes(head_dim, q_heads, kv_heads, tokens);
+    WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     ops::gemma4_attention(q_tensor, k_tensor, v_tensor, table_tensor, pos_tensor, window, 1.0f,
-                          out_tensor, nullptr);
+                          out_tensor, workspace, nullptr);
     cuda_synchronize();
-    int failures = verify_pointwise(label, from_device_bf16(dout.data(), q_count), expected,
-                                    kCriterion);
+    std::vector<std::uint16_t> first_bits(q_count), second_bits(q_count);
+    dout.copy_to_host(first_bits.data(), dout.bytes());
+    int failures =
+        verify_pointwise(label, from_device_bf16(dout.data(), q_count), expected, kCriterion);
+    ops::gemma4_attention(q_tensor, k_tensor, v_tensor, table_tensor, pos_tensor, window, 1.0f,
+                          out_tensor, workspace, nullptr);
+    cuda_synchronize();
+    dout.copy_to_host(second_bits.data(), dout.bytes());
+    if (second_bits != first_bits) {
+        std::cerr << label << ": a second run changed the output\n";
+        ++failures;
+    }
     failures += dq.verify_guards("q");
     failures += dout.verify_guards("out");
     return failures;
@@ -133,6 +155,11 @@ int main() {
     failures += run_case("sliding decode", 256, 32, 16, 1, 300, 100);
     failures += run_case("global decode", 512, 32, 4, 1, 333, 0);
     failures += run_case("global chunk", 512, 32, 4, 20, 200, 0);
+    failures += run_case("sliding decode past window", 256, 32, 16, 1, 1500, 1024);
+    failures += run_case("global decode long", 512, 32, 4, 1, 4096, 0);
+    failures += run_case("global decode short", 512, 32, 4, 1, 3, 0);
+    failures += run_case("global verify tokens", 512, 32, 4, 5, 2000, 0);
+    failures += run_case("sliding verify tokens", 256, 32, 16, 6, 1100, 1024);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_attention\n";
     return failures ? 1 : 0;
 }

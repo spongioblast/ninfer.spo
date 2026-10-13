@@ -18,7 +18,7 @@
 namespace ninfer::models::gemma4 {
 namespace {
 
-constexpr std::size_t kAllocations = 16;
+constexpr std::size_t kAllocations = 18;
 constexpr std::size_t kAlignment   = 256;
 
 Tensor norm_weight(const void* data, int width) {
@@ -54,12 +54,12 @@ Tensor fused_rows(const Tensor& fused, int first, int rows, WorkspaceArena& work
     const int tokens = fused.ne[1];
     auto* source     = static_cast<std::byte*>(fused.data) + static_cast<std::size_t>(first) * 2;
     if (tokens == 1) { return Tensor(source, DType::BF16, {rows, 1}); }
-    auto out                 = workspace.alloc(DType::BF16, {rows, tokens});
-    const std::size_t width  = static_cast<std::size_t>(rows) * 2;
-    const std::size_t pitch  = static_cast<std::size_t>(fused.ne[0]) * 2;
-    const cudaError_t status = cudaMemcpy2DAsync(out.data, width, source, pitch, width,
-                                                 static_cast<std::size_t>(tokens),
-                                                 cudaMemcpyDeviceToDevice, stream);
+    auto out                = workspace.alloc(DType::BF16, {rows, tokens});
+    const std::size_t width = static_cast<std::size_t>(rows) * 2;
+    const std::size_t pitch = static_cast<std::size_t>(fused.ne[0]) * 2;
+    const cudaError_t status =
+        cudaMemcpy2DAsync(out.data, width, source, pitch, width, static_cast<std::size_t>(tokens),
+                          cudaMemcpyDeviceToDevice, stream);
     if (status != cudaSuccess) {
         throw std::runtime_error(std::string("gemma4_layer: fused split: ") +
                                  cudaGetErrorString(status));
@@ -71,14 +71,14 @@ Tensor fused_rows(const Tensor& fused, int first, int rows, WorkspaceArena& work
 
 Weight bf16_matrix(const void* data, int rows, int cols) {
     Weight weight;
-    weight.qtype          = QType::BF16;
-    weight.layout         = QuantLayout::Contiguous;
-    weight.qdata          = data;
-    weight.n              = rows;
-    weight.k              = cols;
-    weight.ndim           = 2;
-    weight.shape[0]       = rows;
-    weight.shape[1]       = cols;
+    weight.qtype    = QType::BF16;
+    weight.layout   = QuantLayout::Contiguous;
+    weight.qdata    = data;
+    weight.n        = rows;
+    weight.k        = cols;
+    weight.ndim     = 2;
+    weight.shape[0] = rows;
+    weight.shape[1] = cols;
     return weight;
 }
 
@@ -90,12 +90,14 @@ std::size_t gemma4_layer_workspace_bytes(const Gemma4LayerWeights& weights, int 
     // qkv, q, qn, attn; k and v inside qkv plus k, kn, v, vn; hidden_n, projected, normed;
     // gate_up, gate, up, activated.
     const std::size_t elements = 4 * q + 6 * k + 3 * h + 5 * inter;
-    const std::size_t linear =
+    const std::size_t scratch =
         std::max({projection_bytes(weights.qkv, weights.qkv_policy, tokens),
                   projection_bytes(weights.o_proj, weights.o_policy, tokens),
                   projection_bytes(weights.gate_up, weights.gate_up_policy, tokens),
-                  projection_bytes(weights.down, weights.down_policy, tokens)});
-    return elements * 2 * static_cast<std::size_t>(tokens) + linear + kAllocations * kAlignment;
+                  projection_bytes(weights.down, weights.down_policy, tokens),
+                  ops::gemma4_attention_workspace_capacity_bytes(weights.head_dim, weights.q_heads,
+                                                                 weights.kv_heads, tokens)});
+    return elements * 2 * static_cast<std::size_t>(tokens) + scratch + kAllocations * kAlignment;
 }
 
 std::size_t gemma4_logits_workspace_bytes(const Weight& output_head, int tokens) {
@@ -157,7 +159,7 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
     ops::gemma4_kv_append(kn_heads, vn_heads, positions, k_pages, v_pages, block_table, stream);
     Tensor attn_heads(attn.data, DType::BF16, {dim, weights.q_heads, tokens});
     ops::gemma4_attention(qn_heads, k_pages, v_pages, block_table, positions, weights.window, 1.0f,
-                          attn_heads, stream);
+                          attn_heads, workspace, stream);
     project(attn, weights.o_proj, weights.o_policy, projected, gemm, workspace, stream);
     ops::rmsnorm(projected, norm_weight(weights.post_attn_norm, hidden), weights.rms_eps, false,
                  normed, stream);
@@ -181,8 +183,8 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
-                   const Tensor& v_norm_ones, ops::Bf16GemmContext& gemm,
-                   WorkspaceArena& workspace, cudaStream_t stream) {
+                   const Tensor& v_norm_ones, ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
+                   cudaStream_t stream) {
     if (layers.size() != caches.size()) {
         throw std::invalid_argument("gemma4_layers: one cache per layer");
     }
@@ -216,8 +218,8 @@ void gemma4_prefill(const Tensor& ids, Tensor& hidden, Tensor& logits,
                     const Weight& output_head, float softcap, float rms_eps,
                     std::span<const Gemma4LayerWeights> layers,
                     std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
-                    const Tensor& v_norm_ones, ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
-                    cudaStream_t stream) {
+                    const Tensor& v_norm_ones, ops::Bf16GemmContext& gemm,
+                    WorkspaceArena& workspace, cudaStream_t stream) {
     gemma4_layers(ids, hidden, token_embedding, layers, caches, positions, v_norm_ones, gemm,
                   workspace, stream);
     gemma4_logits(hidden, logits, final_norm, output_head, softcap, rms_eps, gemm, workspace,
