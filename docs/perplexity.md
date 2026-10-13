@@ -39,7 +39,8 @@ domain/overall table remains product output on stdout; the independent full-prec
 report is `report.json` under `profiles/perplexity/` unless `--output` supplies an empty directory.
 
 For KV-format comparisons, the recommended long-context profile is the full corpus with
-`--context 65536 --stride 32768` and without `--quick`.
+`--context 65536 --stride 32768` and without `--quick`. The default KV format is FP8; Gemma 4
+artifacts store bf16 KV only and need `--kv-dtype bf16`.
 
 `--prefix-ids 2,105,...` prepends the same token ids to every window. They are context only: the
 scored targets and token counts do not change. Use it for models that are far from their training

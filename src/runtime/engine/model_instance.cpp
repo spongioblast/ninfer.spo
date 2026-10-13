@@ -310,12 +310,24 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
                                   std::chrono::steady_clock::time_point start) {
     // One lane until the program batches; the KV cache keeps every layer at full length.
     options.max_concurrency = 1;
+    if (options.kv_cache != KvCacheStorage::BFloat16) {
+        throw std::invalid_argument("gemma4 KV cache is bf16 only");
+    }
     artifact::Binder binder(reader);
     const std::string tokenizer = resource_text(binder, "tokenizer.json");
     const std::string chat = resource_text(binder, "chat_template.jinja");
     auto loaded = std::make_unique<models::gemma4::LoadedText>(
         models::gemma4::load_text(options.artifact_path.string(), device));
     device.synchronize();
+    std::set<std::string> formats;
+    for (const Weight* weight : {&loaded->token_embedding, &loaded->output_head}) {
+        formats.emplace(artifact::format_name(weight->qtype));
+    }
+    for (const auto& layer : loaded->layers) {
+        for (const Weight* weight : {&layer.qkv, &layer.o_proj, &layer.gate_up, &layer.down}) {
+            formats.emplace(artifact::format_name(weight->qtype));
+        }
+    }
     const std::size_t kHeadroom = options.kv_capacity.mode == KvCapacityMode::Automatic &&
                                           options.kv_capacity.automatic_headroom_bytes != 0
                                       ? options.kv_capacity.automatic_headroom_bytes
@@ -357,7 +369,7 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
     summary.architecture = std::string(models::architecture_name(models::Architecture::Gemma4));
     summary.model_name = reader.directory().metadata.value("name", std::string("gemma4"));
     summary.prefill_signature = signature;
-    summary.weight_formats.push_back("bf16");
+    summary.weight_formats.assign(formats.begin(), formats.end());
     summary.load_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.context_cost = std::move(context_cost.summary);
     ConstructedModel constructed;
