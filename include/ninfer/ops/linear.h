@@ -22,6 +22,7 @@ public:
     Bf16GemmContext(const Bf16GemmContext&)            = delete;
     Bf16GemmContext& operator=(const Bf16GemmContext&) = delete;
 
+    // x BF16 [K,T], w contiguous BF16 [N,K]; out [N,T] is BF16 or FP32 (FP32 accumulation).
     void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
 private:

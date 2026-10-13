@@ -36,6 +36,10 @@ ninfer_add_op_test(ninfer_linear_gemma4_shapes_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gemma4_shapes.cpp"
   LIBRARIES ninfer_linear_test_support)
 
+ninfer_add_op_test(ninfer_fp8_row_cublas_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_row_cublas.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
 ninfer_add_op_test(ninfer_linear_fp8_a8_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_fp8_a8.cpp"
   LIBRARIES ninfer_linear_test_support)
