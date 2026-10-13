@@ -1,6 +1,10 @@
 set(ninfer_op_tests
   add_bias
   gelu
+  gemma4_attention
+  geglu
+  logit_softcap
+  residual_scale
   silu_mul
   residual_add
   sigmoid_mul

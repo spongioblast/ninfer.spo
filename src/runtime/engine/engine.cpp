@@ -66,7 +66,9 @@ public:
     PromptSummary summary;
     PromptPreparationStats prepare;
     SamplingMode sampling_mode = SamplingMode::Thinking;
-    std::variant<models::qwen3_5::PreparedPrompt, models::qwen3_8_flash_next::PreparedPrompt> value;
+    std::variant<models::qwen3_5::PreparedPrompt, models::qwen3_8_flash_next::PreparedPrompt,
+                 models::gemma4::PreparedPrompt>
+        value;
 };
 
 PreparedPrompt::PreparedPrompt() noexcept                            = default;
@@ -156,19 +158,26 @@ public:
     using QwenScoring     = runtime::CausalScoreCore<runtime::ModelInstance>;
     using FlashGeneration = runtime::EngineCore<runtime::FlashNextInstance>;
     using FlashScoring    = runtime::CausalScoreCore<runtime::FlashNextInstance>;
+    using GemmaGeneration = runtime::EngineCore<runtime::Gemma4Instance>;
+    using GemmaScoring    = runtime::CausalScoreCore<runtime::Gemma4Instance>;
     using Active          = std::variant<std::unique_ptr<runtime::ModelInstance>,
-                                         std::unique_ptr<runtime::FlashNextInstance>>;
+                                         std::unique_ptr<runtime::FlashNextInstance>,
+                                         std::unique_ptr<runtime::Gemma4Instance>>;
     using Core            = std::variant<std::monostate, std::unique_ptr<QwenGeneration>,
                                          std::unique_ptr<QwenScoring>, std::unique_ptr<FlashGeneration>,
-                                         std::unique_ptr<FlashScoring>>;
+                                         std::unique_ptr<FlashScoring>, std::unique_ptr<GemmaGeneration>,
+                                         std::unique_ptr<GemmaScoring>>;
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         auto constructed    = runtime::construct_model(options, device);
-        const bool flash    = constructed.flash != nullptr;
-        if (flash) {
+        const bool flash = constructed.flash != nullptr;
+        const bool gemma = constructed.gemma != nullptr;
+        if (gemma) {
+            active.emplace<std::unique_ptr<runtime::Gemma4Instance>>(std::move(constructed.gemma));
+        } else if (flash) {
             active.emplace<std::unique_ptr<runtime::FlashNextInstance>>(std::move(constructed.flash));
         } else if (constructed.instance) {
             active.emplace<std::unique_ptr<runtime::ModelInstance>>(std::move(constructed.instance));
@@ -189,7 +198,15 @@ public:
             active);
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
         const bool scoring = options.purpose == EnginePurpose::CausalScoring;
-        if (flash) {
+        if (gemma) {
+            auto& instance = *std::get<std::unique_ptr<runtime::Gemma4Instance>>(active);
+            if (scoring) {
+                core = std::make_unique<GemmaScoring>(instance, device);
+            } else {
+                core = std::make_unique<GemmaGeneration>(instance, device, options,
+                                                         std::move(constructed.context_cost));
+            }
+        } else if (flash) {
             auto& instance = *std::get<std::unique_ptr<runtime::FlashNextInstance>>(active);
             steering       = instance.program->steering_state();
             if (scoring) {
@@ -306,7 +323,8 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::QwenScoring>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::FlashScoring>>) {
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::FlashScoring>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::GemmaScoring>>) {
                 using Prompt = typename std::remove_cvref_t<decltype(*core)>::PreparedPrompt;
                 auto* stored = std::get_if<Prompt>(&prompt.impl_->value);
                 if (stored == nullptr) {
@@ -427,7 +445,8 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
                 throw std::logic_error("Engine core is unavailable");
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::QwenScoring>> ||
-                                 std::is_same_v<CoreState, std::unique_ptr<Impl::FlashScoring>>) {
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::FlashScoring>> ||
+                                 std::is_same_v<CoreState, std::unique_ptr<Impl::GemmaScoring>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
                 using Prompt = typename std::remove_cvref_t<decltype(*core)>::PreparedPrompt;

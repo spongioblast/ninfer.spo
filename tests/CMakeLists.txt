@@ -9,6 +9,7 @@ include(cmake/BenchSupportTests.cmake)
 include(program/tests.cmake)
 include(models/qwen3_5/tests.cmake)
 include(models/qwen3_8_flash_next/tests.cmake)
+include(models/gemma4/tests.cmake)
 include(ops/tests.cmake)
 
 # The oracles pipe UTF-8 text to the probes; Windows Python defaults to the ANSI code page.

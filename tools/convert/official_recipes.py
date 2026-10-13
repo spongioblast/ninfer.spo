@@ -174,10 +174,18 @@ def qwen3_8_27b_nvfp4(model, recipe, sources):
         )
 
 
+def gemma4_31b_bf16(model, recipe, sources):
+    if model.config.get("model_type") != "gemma4_text":
+        raise ValueError("gemma4_31b_bf16 requires Gemma 4 text mathematics")
+    for name, parameter in model.parameters.items():
+        recipe.assign(name, format=parameter.direct_format, method=cast_direct)
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,
     "qwen3_8_27b_nvfp4": qwen3_8_27b_nvfp4,
     "qwen3_6_35b_a3b": qwen3_6_35b_a3b,
+    "gemma4_31b_bf16": gemma4_31b_bf16,
 }

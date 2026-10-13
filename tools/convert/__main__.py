@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from .official_recipes import RECIPES
 from .pipeline import convert
 from .proposal import DEFAULT_RANKING, add_official_proposal
+from .gemma4 import build_model as build_gemma4
 from .qwen3_5 import build_model
 from .recipe import Recipe
 from .sources.safetensors import SafetensorsSource
@@ -146,12 +147,21 @@ def main(argv=None):
         companions = {
             key: sources[key] for key in ("dflash", "dflash2") if key in components
         }
-        model = build_model(
-            base,
-            components=components,
-            companions=companions,
-            resource_overrides=overrides,
-        )
+        architectures = base.config.get("architectures") or [""]
+        if architectures[0] == "Gemma4ForConditionalGeneration":
+            model = build_gemma4(
+                base,
+                components=components,
+                companions=companions,
+                resource_overrides=overrides,
+            )
+        else:
+            model = build_model(
+                base,
+                components=components,
+                companions=companions,
+                resource_overrides=overrides,
+            )
         recipe = Recipe(model)
         _function(args.recipe)(model, recipe, sources)
         if args.proposal:

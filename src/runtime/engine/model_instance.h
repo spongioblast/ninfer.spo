@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/gemma4/program/program.h"
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/runtime_types.h"
@@ -49,9 +50,26 @@ struct FlashNextInstance {
     std::unique_ptr<models::qwen3_8_flash_next::v3::Program> program;
 };
 
+struct Gemma4Instance {
+    using ModelContract = models::gemma4::RuntimeTypes;
+
+    Gemma4Instance(std::unique_ptr<models::gemma4::LoadedText> model_in,
+                   models::gemma4::Frontend frontend_in,
+                   std::unique_ptr<models::gemma4::Program> program_in, std::uint32_t capacity_in)
+        : model(std::move(model_in)), frontend(std::move(frontend_in)),
+          program(std::move(program_in)), capacity(capacity_in) {}
+
+    std::unique_ptr<models::gemma4::LoadedText> model;
+    models::gemma4::Frontend frontend;
+    std::unique_ptr<models::gemma4::Program> program;
+    KvCapacityResolution kv_capacity_resolution;
+    std::uint32_t capacity = 0;
+};
+
 struct ConstructedModel {
     std::unique_ptr<ModelInstance> instance;
     std::unique_ptr<FlashNextInstance> flash;
+    std::unique_ptr<Gemma4Instance> gemma;
     LoadSummary load;
     ContextMachineCostModel context_cost;
 };

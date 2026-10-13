@@ -128,6 +128,8 @@ def layer_of(rel):
         return "qwen3_5"
     if rel.startswith("src/models/qwen3_8_flash_next"):
         return "flash_next"
+    if rel.startswith("src/models/gemma4/"):
+        return "gemma4"
     if rel.startswith("src/runtime/engine/"):
         return "engine"
     return ""
@@ -139,6 +141,8 @@ def include_layer(header):
         return "qwen3_5"
     if header.startswith("models/qwen3_8_flash_next"):
         return "flash_next"
+    if header.startswith("models/gemma4/"):
+        return "gemma4"
     if header.startswith("models/"):
         return "models"
     if header.startswith(("runtime/", "serve/", "product/", "text/", "artifact/")):
@@ -176,17 +180,19 @@ def cmd_layers(files):
         for match in INCLUDE.finditer(text):
             target = include_layer(match.group(1))
             bad = False
-            if owner == "core" and target in {"qwen3_5", "flash_next", "models", "above-core", "ops", "program"}:
+            if owner == "core" and target in {"qwen3_5", "flash_next", "gemma4", "models", "above-core", "ops", "program"}:
                 bad = True
-            elif owner == "ops" and target in {"qwen3_5", "flash_next", "models", "above-core", "program"}:
+            elif owner == "ops" and target in {"qwen3_5", "flash_next", "gemma4", "models", "above-core", "program"}:
                 bad = True
-            elif owner == "program" and target in {"qwen3_5", "flash_next", "models"}:
+            elif owner == "program" and target in {"qwen3_5", "flash_next", "gemma4", "models"}:
                 bad = True
-            elif owner == "qwen3_5" and target == "flash_next":
+            elif owner == "qwen3_5" and target in {"flash_next", "gemma4"}:
                 bad = True
-            elif owner == "flash_next" and target == "qwen3_5":
+            elif owner == "flash_next" and target in {"qwen3_5", "gemma4"}:
                 bad = True
-            elif owner == "engine" and target in {"qwen3_5", "flash_next"} and "model_instance" not in rel and "registry" not in rel:
+            elif owner == "gemma4" and target in {"qwen3_5", "flash_next"}:
+                bad = True
+            elif owner == "engine" and target in {"qwen3_5", "flash_next", "gemma4"} and "model_instance" not in rel and "registry" not in rel:
                 bad = True
             if bad:
                 finding = f"include {rel} -> {match.group(1)}"
@@ -274,7 +280,7 @@ def cmd_dupes(left, right):
                 line = raw.strip()
                 if len(line) <= 12 or line.startswith("//"):
                     continue
-                line = line.replace("qwen3_5", "MODEL").replace("qwen3_8_flash_next", "MODEL")
+                line = line.replace("qwen3_5", "MODEL").replace("qwen3_8_flash_next", "MODEL").replace("gemma4", "MODEL")
                 lines.append(line)
             found.append((path.relative_to(ROOT).as_posix(), lines))
         return found

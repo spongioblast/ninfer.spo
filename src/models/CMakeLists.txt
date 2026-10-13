@@ -19,5 +19,7 @@ include(qwen3_5/frontend_sources.cmake)
 include(qwen3_5/execution_sources.cmake)
 include(qwen3_5/program_sources.cmake)
 
+include(gemma4/execution_sources.cmake)
+
 add_subdirectory(qwen3_8_flash_next)
 add_subdirectory(qwen3_8_flash_next_125b_a6b)

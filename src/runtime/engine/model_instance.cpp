@@ -300,14 +300,86 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
 
 ModelInstance::~ModelInstance() = default;
 
+std::string resource_text(artifact::Binder& binder, std::string_view role) {
+    const auto bytes = binder.host_object(binder.resource("text", role));
+    return {reinterpret_cast<const char*>(bytes.data()), bytes.size()};
+}
+
+ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
+                                  artifact::Reader& reader,
+                                  std::chrono::steady_clock::time_point start) {
+    // One lane until the program batches; the KV cache keeps every layer at full length.
+    options.max_concurrency = 1;
+    artifact::Binder binder(reader);
+    const std::string tokenizer = resource_text(binder, "tokenizer.json");
+    const std::string chat = resource_text(binder, "chat_template.jinja");
+    auto loaded = std::make_unique<models::gemma4::LoadedText>(
+        models::gemma4::load_text(options.artifact_path.string(), device));
+    device.synchronize();
+    const std::size_t kHeadroom = options.kv_capacity.mode == KvCapacityMode::Automatic &&
+                                          options.kv_capacity.automatic_headroom_bytes != 0
+                                      ? options.kv_capacity.automatic_headroom_bytes
+                                      : std::size_t{3} << 30U;
+    const std::size_t free_bytes = current_free_device_bytes();
+    const std::size_t fixed = models::gemma4::Program::fixed_bytes(*loaded, options.prefill_chunk);
+    const std::size_t per_token = models::gemma4::Program::kv_bytes_per_token(*loaded);
+    const std::size_t fit =
+        free_bytes > fixed + kHeadroom ? (free_bytes - fixed - kHeadroom) / per_token : 0;
+    std::uint64_t tokens = std::min<std::uint64_t>(options.max_context, fit / 64U * 64U);
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
+        if (options.kv_capacity.explicit_tokens > fit) {
+            throw std::invalid_argument("gemma4 explicit KV capacity does not fit in device memory");
+        }
+        tokens = std::min<std::uint64_t>(tokens, options.kv_capacity.explicit_tokens);
+    }
+    if (tokens < 64) { throw std::invalid_argument("gemma4 KV capacity does not fit in device memory"); }
+    options.max_context = static_cast<std::uint32_t>(tokens);
+    auto program = std::make_unique<models::gemma4::Program>(
+        *loaded, options.max_context, options.prefill_chunk, device.stream);
+    device.synchronize();
+    auto instance = std::make_unique<Gemma4Instance>(
+        std::move(loaded), models::gemma4::Frontend(tokenizer, chat), std::move(program),
+        options.max_context);
+    instance->kv_capacity_resolution.mode = options.kv_capacity.mode;
+    instance->kv_capacity_resolution.resolved_tokens = options.max_context;
+    instance->kv_capacity_resolution.main_page_groups = (options.max_context + 63U) / 64U;
+    instance->kv_capacity_resolution.maximum_main_page_groups =
+        instance->kv_capacity_resolution.main_page_groups;
+    instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
+    const std::string signature = "gemma4-prefill-1";
+    auto context_cost = resolve_context_machine_cost(
+        {.hardware_class = context_cost_hardware_class(device.props.name, device.props.major,
+                                                       device.props.minor),
+         .prefill_signature = signature},
+        options.context_cost.preset_path);
+    options.context_cache.host_capacity_bytes = 0;
+    LoadSummary summary;
+    summary.architecture = std::string(models::architecture_name(models::Architecture::Gemma4));
+    summary.model_name = reader.directory().metadata.value("name", std::string("gemma4"));
+    summary.prefill_signature = signature;
+    summary.weight_formats.push_back("bf16");
+    summary.load_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    summary.context_cost = std::move(context_cost.summary);
+    ConstructedModel constructed;
+    constructed.gemma = std::move(instance);
+    constructed.load = std::move(summary);
+    constructed.context_cost = std::move(context_cost.model);
+    log_startup_memory(options);
+    return constructed;
+}
+
 ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) {
     validate_options(options);
     const auto start = Clock::now();
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
-    if (peek_architecture(reader) == models::Architecture::Qwen3_8FlashNext) {
+    const auto architecture = peek_architecture(reader);
+    if (architecture == models::Architecture::Qwen3_8FlashNext) {
         return construct_flash_next(options, device, reader, start);
+    }
+    if (architecture == models::Architecture::Gemma4) {
+        return construct_gemma4(options, device, reader, start);
     }
     StartupPhaseScope binding(options.startup_observer, StartupPhase::TargetPlan);
     auto plan = models::qwen3_5::plan_load(reader, models::load_options(options));

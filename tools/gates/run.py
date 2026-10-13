@@ -125,7 +125,7 @@ def main():
         return 1
     elif args.level == "full":
         code |= build()
-        code |= ctest(regex="flash_next|qsa|rewrite_grouping|grammar|frontend")
+        code |= ctest(regex="flash_next|qsa|rewrite_grouping|grammar|frontend|gemma4")
         stamp = time.strftime("%Y%m%d_%H%M%S")
         code |= run(["cmd", "/c", str(ROOT / "tools" / "gates" / "probes" / "ppl_ab.cmd"), "dev", f"ppl_full_{stamp}"])
     elif args.level == "perf":

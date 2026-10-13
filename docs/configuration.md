@@ -43,6 +43,10 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `NINFER_BUILD_TEMP` | `build.cmd` | Compiler temp folder. Default `<build>\.tmp`. |
 | `NINFER_PERFORMANCE_TRACE` | CMake option (`build.cmd trace`) | Compiles the performance trace in. |
 | `NINFER_QWEN38_FLASH_NEXT_WEIGHTS` | Flash-Next real tests | Artifact for the real tests. Unset skips them. |
+| `NINFER_GEMMA4_WEIGHTS` | Gemma 4 real tests | bf16 artifact. Unset skips them. |
+| `NINFER_GEMMA4_HF` | Gemma 4 tokenizer, template, fixture, and France tests | Hugging Face model folder (`tokenizer.json`, `chat_template.jinja`). Unset skips them. |
+| `NINFER_GEMMA4_PARITY` | Gemma 4 parity test, engine test greedy check | Folder of Hugging Face logits and greedy dumps. Unset skips them. |
+| `NINFER_GEMMA4_FIXTURES` | Gemma 4 fixture test | Overrides `tests/models/gemma4/fixtures`. |
 | `NINFER_TEST_ARTIFACT` | qwen3_5 artifact tests | Artifact for those tests. Unset skips them. |
 | `NINFER_GATE_OUT` | `run.py`, `serve_ctl.py` | Gate output folder. Default `<workspace>/tmp/ninfer`. |
 | `NINFER_TOKENIZER` | `p8_probe.py`, `cross_path.py` | Tokenizer directory. |
