@@ -5,8 +5,7 @@
 #include "ninfer/ops/gemma4_qkv_prep.h"
 #include "ninfer/ops/geglu.h"
 #include "ninfer/ops/logit_softcap.h"
-#include "ninfer/ops/residual_add.h"
-#include "ninfer/ops/residual_scale.h"
+#include "ninfer/ops/gemma4_residual_norm.h"
 #include "ninfer/ops/rmsnorm.h"
 
 #include <algorithm>
@@ -86,8 +85,8 @@ std::size_t gemma4_layer_workspace_bytes(const Gemma4LayerWeights& weights, int 
     const auto k     = static_cast<std::size_t>(weights.kv_heads) * weights.head_dim;
     const auto h     = static_cast<std::size_t>(weights.hidden);
     const auto inter = static_cast<std::size_t>(weights.intermediate);
-    // qkv (with k and v), qn, attn; hidden_n, projected, normed; gate_up, gate, up, activated.
-    const std::size_t elements = 3 * q + 2 * k + 3 * h + 5 * inter;
+    // qkv (with k and v), qn, attn; hidden_n, projected; gate_up, gate, up, activated.
+    const std::size_t elements = 3 * q + 2 * k + 2 * h + 5 * inter;
     const std::size_t scratch =
         std::max({projection_bytes(weights.qkv, weights.qkv_policy, tokens),
                   projection_bytes(weights.o_proj, weights.o_policy, tokens),
@@ -103,9 +102,14 @@ std::size_t gemma4_logits_workspace_bytes(const Weight& output_head, int tokens)
            projection_bytes(output_head, ops::LinearPolicy::A16Only, tokens) + 2 * kAlignment;
 }
 
-void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& positions,
-                  Tensor& k_pages, Tensor& v_pages, const Tensor& block_table,
-                  ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+namespace {
+
+// hidden_n holds rmsnorm(x, input_norm) on entry. With next_input_norm the FFN tail leaves the
+// next layer's input norm there, otherwise hidden_n is scratch.
+void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
+                const void* next_input_norm, const Tensor& positions, Tensor& k_pages,
+                Tensor& v_pages, const Tensor& block_table, ops::Bf16GemmContext& gemm,
+                WorkspaceArena& workspace, cudaStream_t stream) {
     const int tokens = x.ne[1];
     const int hidden = weights.hidden;
     const int dim    = weights.head_dim;
@@ -121,15 +125,11 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
     require_matrix(weights.gate_up, 2 * inter, hidden, "gate_up");
     require_matrix(weights.down, hidden, inter, "down");
 
-    auto hidden_n  = workspace.alloc(DType::BF16, {hidden, tokens});
     auto qkv       = workspace.alloc(DType::BF16, {qkv_rows, tokens});
     auto qn        = workspace.alloc(DType::BF16, {q_rows, tokens});
     auto attn      = workspace.alloc(DType::BF16, {q_rows, tokens});
     auto projected = workspace.alloc(DType::BF16, {hidden, tokens});
-    auto normed    = workspace.alloc(DType::BF16, {hidden, tokens});
 
-    ops::rmsnorm(x, norm_weight(weights.input_norm, hidden), weights.rms_eps, false, hidden_n,
-                 stream);
     project(hidden_n, weights.qkv, weights.qkv_policy, qkv, gemm, workspace, stream);
     Tensor qn_heads(qn.data, DType::BF16, {dim, weights.q_heads, tokens});
     ops::gemma4_qkv_prep(qkv, norm_weight(weights.q_norm, dim), norm_weight(weights.k_norm, dim),
@@ -139,12 +139,10 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
     ops::gemma4_attention(qn_heads, k_pages, v_pages, block_table, positions, weights.window, 1.0f,
                           attn_heads, workspace, stream);
     project(attn, weights.o_proj, weights.o_policy, projected, gemm, workspace, stream);
-    ops::rmsnorm(projected, norm_weight(weights.post_attn_norm, hidden), weights.rms_eps, false,
-                 normed, stream);
-    ops::residual_add(normed, x, stream);
+    const Tensor pre_ff_norm = norm_weight(weights.pre_ff_norm, hidden);
+    ops::gemma4_residual_norm(projected, norm_weight(weights.post_attn_norm, hidden), 1.0f,
+                              &pre_ff_norm, weights.rms_eps, x, &hidden_n, stream);
 
-    ops::rmsnorm(x, norm_weight(weights.pre_ff_norm, hidden), weights.rms_eps, false, hidden_n,
-                 stream);
     auto gate_up = workspace.alloc(DType::BF16, {2 * inter, tokens});
     project(hidden_n, weights.gate_up, weights.gate_up_policy, gate_up, gemm, workspace, stream);
     const Tensor gate = fused_rows(gate_up, 0, inter, workspace, stream);
@@ -152,10 +150,26 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
     auto activated    = workspace.alloc(DType::BF16, {inter, tokens});
     ops::geglu(gate, up, activated, stream);
     project(activated, weights.down, weights.down_policy, projected, gemm, workspace, stream);
-    ops::rmsnorm(projected, norm_weight(weights.post_ff_norm, hidden), weights.rms_eps, false,
-                 normed, stream);
-    ops::residual_add(normed, x, stream);
-    ops::residual_scale(x, weights.layer_scalar, stream);
+    const Tensor next_norm = norm_weight(next_input_norm, hidden);
+    ops::gemma4_residual_norm(projected, norm_weight(weights.post_ff_norm, hidden),
+                              weights.layer_scalar,
+                              next_input_norm != nullptr ? &next_norm : nullptr, weights.rms_eps, x,
+                              next_input_norm != nullptr ? &hidden_n : nullptr, stream);
+}
+
+} // namespace
+
+void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& positions,
+                  Tensor& k_pages, Tensor& v_pages, const Tensor& block_table,
+                  ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+    if (x.ne[0] != weights.hidden || x.ne[1] <= 0) {
+        throw std::invalid_argument("gemma4_layer: x must be [hidden,T]");
+    }
+    auto hidden_n = workspace.alloc(DType::BF16, {weights.hidden, x.ne[1]});
+    ops::rmsnorm(x, norm_weight(weights.input_norm, weights.hidden), weights.rms_eps, false,
+                 hidden_n, stream);
+    layer_body(x, hidden_n, weights, nullptr, positions, k_pages, v_pages, block_table, gemm,
+               workspace, stream);
 }
 
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedding,
@@ -166,10 +180,16 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedd
         throw std::invalid_argument("gemma4_layers: one cache per layer");
     }
     ops::embedding(ids, token_embedding, hidden, stream);
+    if (layers.empty()) { return; }
+    auto scope    = workspace.scope();
+    auto hidden_n = workspace.alloc(DType::BF16, {hidden.ne[0], hidden.ne[1]});
+    ops::rmsnorm(hidden, norm_weight(layers[0].input_norm, hidden.ne[0]), layers[0].rms_eps, false,
+                 hidden_n, stream);
     for (std::size_t layer = 0; layer < layers.size(); ++layer) {
-        auto scope = workspace.scope();
-        gemma4_layer(hidden, layers[layer], positions, *caches[layer].k_pages,
-                     *caches[layer].v_pages, *caches[layer].block_table, gemm, workspace, stream);
+        auto layer_scope = workspace.scope();
+        const void* next = layer + 1 < layers.size() ? layers[layer + 1].input_norm : nullptr;
+        layer_body(hidden, hidden_n, layers[layer], next, positions, *caches[layer].k_pages,
+                   *caches[layer].v_pages, *caches[layer].block_table, gemm, workspace, stream);
     }
 }
 

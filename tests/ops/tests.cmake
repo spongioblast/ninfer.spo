@@ -3,6 +3,7 @@ set(ninfer_op_tests
   gelu
   gemma4_attention
   gemma4_qkv_prep
+  gemma4_residual_norm
   geglu
   logit_softcap
   residual_scale
