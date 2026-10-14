@@ -1,4 +1,4 @@
-// Gemma 4 31B NVFP4 (A16 and A4) and FP8 (A16) linear shapes against the FP64 oracle.
+// Gemma 4 31B NVFP4 (A16 and A4) and FP8 (A16 and A8) linear shapes against the FP64 oracle.
 #include "ops/linear/linear_test_common.h"
 
 #include <array>
@@ -12,14 +12,13 @@ namespace {
 using namespace ninfer;
 using namespace ninfer::test::linear;
 
-constexpr std::array kTrunk{std::pair{16384, 5376}, std::pair{18432, 5376},
-                            std::pair{43008, 5376}, std::pair{5376, 8192},
-                            std::pair{5376, 16384}, std::pair{5376, 21504}};
+constexpr std::array kTrunk{std::pair{16384, 5376}, std::pair{18432, 5376}, std::pair{43008, 5376},
+                            std::pair{5376, 8192},  std::pair{5376, 16384}, std::pair{5376, 21504}};
 
 std::vector<Invocation> a16_calls() {
     std::vector<Invocation> calls;
-    for (int t : {1, 2, 3, 4, 5, 8, 9, 16, 17, 24, 25, 32, 33, 40, 48, 49, 64, 65, 96, 97, 128,
-                  129, 512, 1024, 1600})
+    for (int t : {1,  2,  3,  4,  5,  8,  9,  16,  17,  24,  25,   32,  33,
+                  40, 48, 49, 64, 65, 96, 97, 128, 129, 512, 1024, 1600})
         calls.push_back({t});
     for (int t : {1, 7, 33, 129})
         calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});
@@ -29,19 +28,38 @@ std::vector<Invocation> a16_calls() {
 
 std::vector<Invocation> a4_calls() {
     std::vector<Invocation> calls;
-    for (int t : {1, 8, 17, 32, 33, 64, 96, 97, 128, 129, 192, 193, 384, 385, 512, 513, 1023, 1024,
-                  1025, 2048})
+    for (int t : {1,   8,   17,  32,  33,  64,  96,   97,   128,  129,
+                  192, 193, 384, 385, 512, 513, 1023, 1024, 1025, 2048})
         calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4});
     for (int t : {33, 513, 1024})
         calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA4, true});
     return calls;
 }
 
+// AllowA8 below 128 tokens keeps A16.
+std::vector<Invocation> a8_small_calls() {
+    std::vector<Invocation> calls;
+    for (int t : {1, 4, 17, 64, 127})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
+    return calls;
+}
+
+std::vector<Invocation> a8_calls() {
+    std::vector<Invocation> calls;
+    for (int t : {128, 129, 192, 255, 256, 257, 384, 511, 512, 513, 1023, 1024, 1025, 2048})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
+    for (int t : {129, 1025})
+        calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
+    return calls;
+}
+
 int run_gemma4_shapes() {
-    int failures      = 0;
-    std::uint32_t seed = 901U;
-    const auto a16    = a16_calls();
-    const auto a4     = a4_calls();
+    int failures        = 0;
+    std::uint32_t seed  = 901U;
+    const auto a16      = a16_calls();
+    const auto a4       = a4_calls();
+    const auto a8       = a8_calls();
+    const auto a8_small = a8_small_calls();
     for (auto [n, k] : kTrunk) {
         failures += run_shape("Gemma4 NVFP4_A16", ActivationCompute::A16, make_nvfp4_weight,
                               {n, k, seed++, Comparison::Sampled, true, a16});
@@ -49,6 +67,10 @@ int run_gemma4_shapes() {
                               {n, k, seed++, Comparison::Sampled, true, a4});
         failures += run_shape("Gemma4 FP8_A16", ActivationCompute::A16, make_fp8_weight,
                               {n, k, seed++, Comparison::Sampled, true, a16});
+        failures += run_shape("Gemma4 FP8_A16 (AllowA8)", ActivationCompute::A16, make_fp8_weight,
+                              {n, k, seed++, Comparison::Sampled, true, a8_small});
+        failures += run_shape("Gemma4 FP8_A8", ActivationCompute::A8, make_fp8_weight,
+                              {n, k, seed++, Comparison::Sampled, true, a8});
         failures += verify_workspace_envelopes(QType::NVFP4, n, k);
         failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, n, k);
     }

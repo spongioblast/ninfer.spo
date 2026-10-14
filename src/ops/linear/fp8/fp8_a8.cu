@@ -68,9 +68,8 @@ __global__ __launch_bounds__(Threads,
     if (tid == 0) { scales[token] = scale; }
 }
 
-template <class ActivationGeometry>
+template <class ActivationGeometry, int kThreads = 256>
 void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream_t stream) {
-    constexpr int kThreads = 256;
     fp8_a8_quantize_kernel<ActivationGeometry, kThreads><<<x.ne[1], kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), workspace.codes, workspace.scales);
     CUDA_CHECK(cudaGetLastError());
@@ -92,6 +91,19 @@ void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspac
         return;
     case Fp8Activation17408Geometry::kInputRows:
         launch_quantize_exact<Fp8Activation17408Geometry>(x, workspace, stream);
+        return;
+    case Fp8Activation5376Geometry::kInputRows:
+        // 2688 value pairs per token: 21 per thread at 128 threads.
+        launch_quantize_exact<Fp8Activation5376Geometry, 128>(x, workspace, stream);
+        return;
+    case Fp8Activation8192Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation8192Geometry>(x, workspace, stream);
+        return;
+    case Fp8Activation16384Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation16384Geometry>(x, workspace, stream);
+        return;
+    case Fp8Activation21504Geometry::kInputRows:
+        launch_quantize_exact<Fp8Activation21504Geometry>(x, workspace, stream);
         return;
     default:
         throw std::invalid_argument("fp8 A8 quantize: unsupported K");
