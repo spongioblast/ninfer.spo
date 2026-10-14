@@ -9,6 +9,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gdn_gating.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gelu.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_attention.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_attention_mma.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_kv_append.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_qkv_prep.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/gemma4_residual_norm.cu"

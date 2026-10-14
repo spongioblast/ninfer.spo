@@ -160,6 +160,12 @@ int main() {
     failures += run_case("global decode short", 512, 32, 4, 1, 3, 0);
     failures += run_case("global verify tokens", 512, 32, 4, 5, 2000, 0);
     failures += run_case("sliding verify tokens", 256, 32, 16, 6, 1100, 1024);
+    // From 64 query tokens: the tensor-core path.
+    failures += run_case("sliding one tile", 256, 32, 16, 64, 64, 1024);
+    failures += run_case("sliding chunk past window", 256, 32, 16, 300, 1400, 1024);
+    failures += run_case("sliding chunk narrow window", 256, 32, 16, 129, 400, 70);
+    failures += run_case("global one tile", 512, 32, 4, 64, 64, 0);
+    failures += run_case("global chunk after prefix", 512, 32, 4, 193, 700, 0);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_attention\n";
     return failures ? 1 : 0;
 }

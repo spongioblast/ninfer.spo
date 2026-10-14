@@ -59,9 +59,9 @@ std::size_t common_prefix(const std::vector<ninfer::TokenId>& a,
 ninfer::RequestOptions greedy(std::uint32_t tokens) {
     ninfer::RequestOptions request;
     request.execution.requested_output_tokens = tokens;
-    request.execution.sampling.temperature = 0.0F;
-    request.execution.sampling.top_k = 1;
-    request.execution.allow_prefix_reuse = false;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.sampling.top_k          = 1;
+    request.execution.allow_prefix_reuse      = false;
     return request;
 }
 
@@ -75,6 +75,14 @@ double since(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
+// An early greedy divergence from HF, checked by scoring once the generation engine is gone.
+struct Divergence {
+    std::string name;
+    std::vector<ninfer::TokenId> context; // prompt plus the agreed tokens
+    ninfer::TokenId ours      = 0;
+    ninfer::TokenId reference = 0;
+};
+
 } // namespace
 
 int main() {
@@ -84,49 +92,53 @@ int main() {
         return 77;
     }
     try {
+        std::vector<Divergence> divergences;
         {
             ninfer::EngineOptions options;
-            options.artifact_path = artifact;
-            options.max_context = 8192;
-            options.kv_capacity = ninfer::KvCapacityPolicy::automatic();
-            options.enable_vision = false;
+            options.artifact_path  = artifact;
+            options.max_context    = 8192;
+            options.kv_capacity    = ninfer::KvCapacityPolicy::automatic();
+            options.enable_vision  = false;
             options.use_cuda_graph = false;
             ninfer::Engine engine(options);
 
             const std::vector<ninfer::TokenId> prompt{818, 5279, 529, 7001, 563};
-            auto raw = greedy(9);
+            auto raw                        = greedy(9);
             raw.stop.include_model_defaults = false;
-            auto start = std::chrono::steady_clock::now();
-            const auto loop = engine.generate(engine.prepare_tokens(prompt), raw);
+            auto start                      = std::chrono::steady_clock::now();
+            const auto loop                 = engine.generate(engine.prepare_tokens(prompt), raw);
             report("raw", loop, since(start));
-            check(loop.generated_token_ids ==
-                      std::vector<ninfer::TokenId>{7001, 563, 7001, 563, 7001, 563, 7001, 563, 7001},
+            check(loop.generated_token_ids == std::vector<ninfer::TokenId>{7001, 563, 7001, 563,
+                                                                           7001, 563, 7001, 563,
+                                                                           7001},
                   "raw greedy tokens match Hugging Face");
             check(loop.content == " France is France is France is France is France",
                   "raw greedy text");
 
-            start = std::chrono::steady_clock::now();
+            start             = std::chrono::steady_clock::now();
             const auto answer = engine.generate(
                 engine.prepare(chat("What is the capital of France? Answer with one word.")),
                 greedy(32));
             report("chat", answer, since(start));
-            check(answer.finish_reason == ninfer::FinishReason::StopToken, "chat stops at end of turn");
+            check(answer.finish_reason == ninfer::FinishReason::StopToken,
+                  "chat stops at end of turn");
             check(answer.content.find("Paris") != std::string::npos, "chat answers Paris");
             check(answer.reasoning.empty(), "no reasoning without thinking");
 
-            auto sampled = greedy(48);
+            auto sampled                           = greedy(48);
             sampled.execution.sampling.temperature = 1.0F;
-            sampled.execution.sampling.top_k = 20;
-            sampled.execution.sampling.top_p = 0.95F;
-            sampled.execution.sampling.seed = 7;
-            start = std::chrono::steady_clock::now();
-            const auto first = engine.generate(engine.prepare(chat("Write one sentence about rain.")),
-                                               sampled);
-            const auto second = engine.generate(engine.prepare(chat("Write one sentence about rain.")),
-                                                sampled);
+            sampled.execution.sampling.top_k       = 20;
+            sampled.execution.sampling.top_p       = 0.95F;
+            sampled.execution.sampling.seed        = 7;
+            start                                  = std::chrono::steady_clock::now();
+            const auto first =
+                engine.generate(engine.prepare(chat("Write one sentence about rain.")), sampled);
+            const auto second =
+                engine.generate(engine.prepare(chat("Write one sentence about rain.")), sampled);
             report("sampled", first, since(start) / 2.0);
             check(!first.content.empty(), "sampled text is not empty");
-            check(first.generated_token_ids == second.generated_token_ids, "same seed, same tokens");
+            check(first.generated_token_ids == second.generated_token_ids,
+                  "same seed, same tokens");
 
             std::string filler;
             for (int line = 0; filler.size() < 14000; ++line) {
@@ -135,14 +147,14 @@ int main() {
             }
             std::cout << "capacity " << engine.memory_summary().max_context << ", filler tokens "
                       << engine.tokenize_text(filler).size() << '\n';
-            const auto long_prompt = engine.prepare(
-                chat("Remember this: the secret word is BLUEBERRY.\n\n" + filler +
-                     "\nWhat is the secret word? Answer with the word only."));
+            const auto long_prompt =
+                engine.prepare(chat("Remember this: the secret word is BLUEBERRY.\n\n" + filler +
+                                    "\nWhat is the secret word? Answer with the word only."));
             std::cout << "long prompt tokens " << long_prompt.summary().prompt_tokens << '\n';
-            start = std::chrono::steady_clock::now();
-            const auto recall = engine.generate(engine.prepare(
-                chat("Remember this: the secret word is BLUEBERRY.\n\n" + filler +
-                     "\nWhat is the secret word? Answer with the word only.")),
+            start             = std::chrono::steady_clock::now();
+            const auto recall = engine.generate(
+                engine.prepare(chat("Remember this: the secret word is BLUEBERRY.\n\n" + filler +
+                                    "\nWhat is the secret word? Answer with the word only.")),
                 greedy(16));
             report("long", recall, since(start));
             check(long_prompt.summary().prompt_tokens > 2048, "long prompt spans several chunks");
@@ -151,32 +163,42 @@ int main() {
                   "recalls a word from the first chunk");
 
             // HF bf16 greedy continuations written by tmp hf_parity.py; a divergence after
-            // token 32 is accepted as a near tie.
+            // token 32 is accepted as a near tie, an earlier one only at an exact tie (below).
             if (const char* fixtures = std::getenv("NINFER_GEMMA4_PARITY")) {
                 const std::filesystem::path dir(fixtures);
                 for (const char* name : {"prose", "code", "chinese"}) {
-                    const auto bf16 = dir / (std::string(name) + ".greedy_bf16");
+                    const auto bf16   = dir / (std::string(name) + ".greedy_bf16");
                     const auto expect = read_ids(std::filesystem::exists(bf16)
                                                      ? bf16
                                                      : dir / (std::string(name) + ".greedy"));
-                    const auto ids = read_ids(dir / (std::string(name) + ".ids"));
-                    start = std::chrono::steady_clock::now();
-                    const auto result = engine.generate(
-                        engine.prepare_tokens(ids),
-                        greedy(static_cast<std::uint32_t>(expect.size())));
-                    const double seconds = since(start);
+                    const auto ids    = read_ids(dir / (std::string(name) + ".ids"));
+                    start             = std::chrono::steady_clock::now();
+                    const auto result =
+                        engine.generate(engine.prepare_tokens(ids),
+                                        greedy(static_cast<std::uint32_t>(expect.size())));
+                    const double seconds   = since(start);
                     const std::size_t same = common_prefix(result.generated_token_ids, expect);
                     std::cout << name << ": " << ids.size() << " prompt tokens, greedy " << same
                               << '/' << expect.size() << ", " << seconds << " s\n";
-                    check(same == expect.size() || same >= 32,
-                          std::string(name) + " engine greedy matches HF");
+                    if (same == expect.size() || same >= 32) {
+                        check(true, std::string(name) + " engine greedy matches HF");
+                    } else if (same < result.generated_token_ids.size()) {
+                        Divergence divergence{name, ids, result.generated_token_ids[same],
+                                              expect[same]};
+                        divergence.context.insert(divergence.context.end(), expect.begin(),
+                                                  expect.begin() +
+                                                      static_cast<std::ptrdiff_t>(same));
+                        divergences.push_back(std::move(divergence));
+                    } else {
+                        check(false, std::string(name) + " engine greedy matches HF");
+                    }
                 }
             }
 
-            auto reuse = greedy(24);
+            auto reuse                         = greedy(24);
             reuse.execution.allow_prefix_reuse = true;
             auto conversation = chat("Name three rivers in Europe. Keep it short.");
-            const auto turn1 = engine.generate(engine.prepare(conversation), reuse);
+            const auto turn1  = engine.generate(engine.prepare(conversation), reuse);
             add_message(conversation, ninfer::ChatRole::Assistant, turn1.content);
             add_message(conversation, ninfer::ChatRole::User, "Which of them is the longest?");
             const auto turn2 = engine.generate(engine.prepare(conversation), reuse);
@@ -196,16 +218,17 @@ int main() {
         }
         {
             ninfer::EngineOptions options;
-            options.artifact_path = artifact;
-            options.purpose = ninfer::EnginePurpose::CausalScoring;
-            options.max_context = 4096;
-            options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(4096);
-            options.enable_vision = false;
+            options.artifact_path  = artifact;
+            options.purpose        = ninfer::EnginePurpose::CausalScoring;
+            options.max_context    = 4096;
+            options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(4096);
+            options.enable_vision  = false;
             options.use_cuda_graph = false;
             ninfer::Engine engine(options);
-            std::vector<ninfer::TokenId> tokens = engine.tokenize_text("The capital of France is Paris.");
+            std::vector<ninfer::TokenId> tokens =
+                engine.tokenize_text("The capital of France is Paris.");
             tokens.insert(tokens.begin(), 2);
-            const auto start = std::chrono::steady_clock::now();
+            const auto start                  = std::chrono::steady_clock::now();
             const std::vector<float> logprobs = engine.score_tokens(tokens, 1);
             std::cout << "score (" << since(start) << " s):";
             bool finite = logprobs.size() == tokens.size() - 1;
@@ -215,7 +238,25 @@ int main() {
             }
             std::cout << '\n';
             check(finite, "scores are finite log-probabilities");
-            check(logprobs.size() >= 6 && logprobs[5] > -1.0F, "\" Paris\" is likely after the prompt");
+            check(logprobs.size() >= 6 && logprobs[5] > -1.0F,
+                  "\" Paris\" is likely after the prompt");
+
+            // An early divergence passes only if both tokens score the same: equal BF16 logits,
+            // where greedy's lower-index rule and HF's arithmetic may pick either.
+            for (const Divergence& divergence : divergences) {
+                const auto first = static_cast<std::uint32_t>(divergence.context.size());
+                auto with_ours   = divergence.context;
+                with_ours.push_back(divergence.ours);
+                auto with_reference = divergence.context;
+                with_reference.push_back(divergence.reference);
+                const float ours      = engine.score_tokens(with_ours, first).at(0);
+                const float reference = engine.score_tokens(with_reference, first).at(0);
+                std::cout << divergence.name << ": diverges at " << first << " (ours "
+                          << divergence.ours << ' ' << ours << ", HF " << divergence.reference
+                          << ' ' << reference << ")\n";
+                check(std::fabs(ours - reference) <= 1.0e-6F,
+                      divergence.name + " engine greedy matches HF up to an exact tie");
+            }
         }
     } catch (const std::exception& error) {
         std::cerr << "EXC " << error.what() << '\n';

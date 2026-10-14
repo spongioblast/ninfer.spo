@@ -22,6 +22,8 @@ constexpr int kMaxChunks    = 128;
 // A split warp should see at least this many keys of its chunk.
 constexpr int kMinKeysPerWarp = 4;
 constexpr int kCombineThreads = 128;
+// From one full 64-row query tile on, prefill goes through the tensor-core kernel.
+constexpr int kMmaMinTokens = 64;
 
 template <int E>
 __device__ __forceinline__ void load_row(const __nv_bfloat16* row, float (&out)[E]) {
@@ -255,6 +257,11 @@ void gemma4_attention_launch(const Tensor& q, const Tensor& k_pages, const Tenso
                              cudaStream_t stream) {
     if (q.ne[1] / k_pages.ne[2] * kWarp > kMaxThreads) {
         throw std::invalid_argument("gemma4_attention: at most 32 query heads per KV head");
+    }
+    if (q.ne[2] >= kMmaMinTokens) {
+        gemma4_attention_mma_launch(q, k_pages, v_pages, block_table, positions, window, scale, out,
+                                    stream);
+        return;
     }
     if (q.ne[0] == 256) {
         launch<256>(q, k_pages, v_pages, block_table, positions, window, scale, out, partial, stats,

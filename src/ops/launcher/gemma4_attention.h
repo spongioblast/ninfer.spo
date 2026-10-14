@@ -18,4 +18,9 @@ void gemma4_attention_launch(const Tensor& q, const Tensor& k_pages, const Tenso
                              float scale, Tensor& out, float* partial, float* stats,
                              cudaStream_t stream);
 
+// Tensor-core path for wide prefill chunks (D=256 or 512); needs no workspace.
+void gemma4_attention_mma_launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
+                                 const Tensor& block_table, const Tensor& positions, int window,
+                                 float scale, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail
