@@ -308,6 +308,21 @@ def gemma4_nvfp4_a4_mlp(model, recipe, sources):
     _gemma4_a4(model, recipe, sources, "gemma4_nvfp4_a4_mlp", mlp_only=True)
 
 
+def gemma4_fp8_a8(model, recipe, sources):
+    """Override: allow A8 (per-token FP8 activations) on every FP8 text-layer projection.
+
+    The embedding and the output head keep A16Only.
+    """
+    _require_gemma4(model, "gemma4_fp8_a8")
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if not all(s.format == FP8 for s in recipe.selections[name]):
+            continue
+        for input_name in parameter.inputs:
+            recipe.use(name, input_name, activation_policy="AllowA8")
+
+
 RECIPES = {
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
@@ -323,4 +338,5 @@ RECIPES = {
     "gemma4_31b_nvfp4_mlp": gemma4_31b_nvfp4_mlp,
     "gemma4_nvfp4_a4": gemma4_nvfp4_a4,
     "gemma4_nvfp4_a4_mlp": gemma4_nvfp4_a4_mlp,
+    "gemma4_fp8_a8": gemma4_fp8_a8,
 }

@@ -423,6 +423,26 @@ def test_a4_mlp_override_leaves_attention_a16(tmp_path):
             assert bool(use.get("auxiliaries")) == a4
 
 
+def test_a8_override_allows_a8_on_fp8_layer_projections(tmp_path):
+    from tools.convert.official_recipes import gemma4_31b_fp8, gemma4_fp8_a8
+
+    with _checkpoint(tmp_path / "source", **NVFP4_DIMS) as source:
+        model = build_model(source)
+        recipe = Recipe(model)
+        sources = {"base": source}
+        gemma4_31b_fp8(model, recipe, sources)
+        gemma4_fp8_a8(model, recipe, sources)
+        out = tmp_path / "gemma.ninfer"
+        convert(model, recipe, out, device="cpu", rows_per_chunk=128)
+    with Artifact(out) as artifact:
+        uses = artifact.directory.uses
+        for use in uses:
+            a8 = use["parameter"].startswith("text/layers/")
+            assert use["activation_policy"] == ("AllowA8" if a8 else "A16Only")
+            assert not use.get("auxiliaries")
+        assert any(use["parameter"] == "text/output_head" for use in uses)
+
+
 def test_a4_override_requires_every_input(tmp_path):
     from tools.convert.official_recipes import gemma4_31b_nvfp4_base, gemma4_nvfp4_a4
 
