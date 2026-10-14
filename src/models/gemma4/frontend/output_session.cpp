@@ -72,19 +72,25 @@ bool OutputSession::is_stop(TokenId token) const noexcept {
 runtime::OutputDecision OutputSession::preview_model(std::span<const TokenId> tokens,
                                                      std::uint32_t total_budget_remaining,
                                                      FinishReason limit_reason) {
-    if (tokens.size() != 1 || total_budget_remaining == 0) {
-        throw std::logic_error("gemma4 output preview expects one token inside the budget");
+    if (tokens.empty() || total_budget_remaining == 0) {
+        throw std::logic_error("gemma4 output preview expects tokens inside the budget");
     }
     runtime::OutputDecision decision;
-    decision.accepted_tokens = 1;
-    decision.continuation    = runtime::ContinuationAction::Decode;
-    if (is_stop(tokens[0])) {
-        decision.finish_reason = FinishReason::StopToken;
-    } else if (total_budget_remaining == 1) {
+    decision.continuation = runtime::ContinuationAction::Decode;
+    staged_tokens_.clear();
+    for (const TokenId token : tokens) {
+        if (staged_tokens_.size() == total_budget_remaining) { break; }
+        staged_tokens_.push_back(token);
+        if (is_stop(token)) {
+            decision.finish_reason = FinishReason::StopToken;
+            break;
+        }
+    }
+    if (!decision.finished() && staged_tokens_.size() == total_budget_remaining) {
         decision.finish_reason = limit_reason;
     }
-    staged_token_    = tokens[0];
-    staged_terminal_ = decision.finished();
+    decision.accepted_tokens = static_cast<std::uint32_t>(staged_tokens_.size());
+    staged_terminal_         = decision.finished();
     return decision;
 }
 
@@ -96,7 +102,7 @@ runtime::OutputDecision OutputSession::preview_terminal(FinishReason reason) {
     runtime::OutputDecision decision;
     decision.finish_reason   = reason;
     decision.accepted_tokens = 0;
-    staged_token_.reset();
+    staged_tokens_.clear();
     staged_terminal_ = true;
     return decision;
 }
@@ -199,10 +205,10 @@ void OutputSession::flush_terminal() {
 }
 
 PublishedOutput OutputSession::commit_preview() {
-    if (staged_token_) { consume(*staged_token_); }
+    for (const TokenId token : staged_tokens_) { consume(token); }
     const bool final = staged_terminal_;
     if (final) { flush_terminal(); }
-    staged_token_.reset();
+    staged_tokens_.clear();
     staged_terminal_ = false;
 
     PublishedOutput published;

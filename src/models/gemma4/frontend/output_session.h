@@ -72,7 +72,7 @@ public:
     }
     void constraint_uploaded(std::size_t) noexcept {}
     void discard_preview() noexcept {
-        staged_token_.reset();
+        staged_tokens_.clear();
         staged_terminal_ = false;
     }
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept {
@@ -106,7 +106,7 @@ private:
     bool publish_stop_ = false;
     ThinkingBudgetStats thinking_;
     Mode mode_ = Mode::Content;
-    std::optional<TokenId> staged_token_;
+    std::vector<TokenId> staged_tokens_;
     bool staged_terminal_ = false;
     std::string content_;
     std::string reasoning_;
