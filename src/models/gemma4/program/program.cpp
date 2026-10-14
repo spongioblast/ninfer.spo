@@ -36,6 +36,9 @@ void check(cudaError_t status, const char* what) {
     }
 }
 
+constexpr std::uint32_t kMinChunk = 16;
+constexpr std::uint32_t kMaxChunk = 16384;
+
 // Workspace bytes of the widest layer for a `chunk`-token prefill.
 std::size_t layer_bytes(const LoadedText& model, std::uint32_t chunk) {
     std::size_t widest = 0;
@@ -108,7 +111,7 @@ struct Program::Impl {
          cudaStream_t device_stream)
         : model(&loaded), stream(device_stream), gemm(device_stream), vocab(loaded.vocab),
           hidden(loaded.hidden), capacity(token_capacity),
-          chunk(std::clamp<std::uint32_t>(prefill_chunk, 16U, 2048U)),
+          chunk(std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk)),
           workspace(workspace_bytes(loaded, chunk)) {
         if (vocab <= 0 || hidden <= 0 || loaded.layers.empty() || capacity == 0) {
             throw std::invalid_argument("gemma4 program: model is empty");
@@ -346,7 +349,7 @@ std::size_t Program::kv_bytes_per_token(const LoadedText& model) {
 }
 
 std::size_t Program::fixed_bytes(const LoadedText& model, std::uint32_t prefill_chunk) {
-    const std::uint32_t chunk = std::clamp<std::uint32_t>(prefill_chunk, 16U, 2048U);
+    const std::uint32_t chunk = std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk);
     return Impl::workspace_bytes(model, chunk) +
            static_cast<std::size_t>(model.hidden) * chunk * 2U +
            static_cast<std::size_t>(model.vocab) * 4U;
