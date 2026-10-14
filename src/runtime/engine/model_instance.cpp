@@ -315,11 +315,21 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
     if (options.kv_cache != KvCacheStorage::BFloat16) {
         throw std::invalid_argument("gemma4 KV cache is bf16 only");
     }
+    // MTP drafts a fixed count per round; `auto` takes the count that measured best.
+    constexpr std::uint32_t kGemma4AutoDraftTokens = 5;
+    const SpeculativeOptions& speculative = options.speculative;
+    if (speculative.backend != SpeculativeBackend::None &&
+        speculative.backend != SpeculativeBackend::Mtp) {
+        throw std::invalid_argument("gemma4 speculative decoding is MTP only");
+    }
+    const bool mtp = speculative.backend == SpeculativeBackend::Mtp;
+    const std::uint32_t draft_tokens =
+        !mtp ? 0U : speculative.adaptive_draft_tokens ? kGemma4AutoDraftTokens : speculative.draft_tokens;
     artifact::Binder binder(reader);
     const std::string tokenizer = resource_text(binder, "tokenizer.json");
     const std::string chat      = resource_text(binder, "chat_template.jinja");
     auto loaded                 = std::make_unique<models::gemma4::LoadedText>(
-        models::gemma4::load_text(options.artifact_path.string(), device));
+        models::gemma4::load_text(options.artifact_path.string(), device, mtp));
     device.synchronize();
     std::set<std::string> formats;
     for (const Weight* weight : {&loaded->token_embedding, &loaded->output_head}) {
@@ -351,8 +361,8 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
         throw std::invalid_argument("gemma4 KV capacity does not fit in device memory");
     }
     options.max_context = static_cast<std::uint32_t>(tokens);
-    auto program        = std::make_unique<models::gemma4::Program>(*loaded, options.max_context,
-                                                                    options.prefill_chunk, device.stream);
+    auto program        = std::make_unique<models::gemma4::Program>(
+        *loaded, options.max_context, options.prefill_chunk, draft_tokens, device.stream);
     device.synchronize();
     auto instance                         = std::make_unique<Gemma4Instance>(std::move(loaded),
                                                                              models::gemma4::Frontend(tokenizer, chat),

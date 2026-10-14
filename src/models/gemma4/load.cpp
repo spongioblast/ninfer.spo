@@ -90,6 +90,136 @@ int config_int(const artifact::Json& config, const char* key) {
     return config.at(key).get<int>();
 }
 
+// The MTP assistant's references, bound in the same plan as the target.
+struct DraftRefs {
+    artifact::Json config;
+    // input_projection, output_projection, output_head, final_norm.
+    std::vector<artifact::ParameterReference> outer;
+    std::vector<InputUse> outer_uses;
+    // Per layer: query, output, gate, up, down, then query_norm and the four norms.
+    std::vector<std::vector<artifact::ParameterReference>> layers;
+    std::vector<std::vector<InputUse>> uses;
+    std::vector<float> scalars;
+};
+
+DraftRefs bind_draft(artifact::Binder& binder, const artifact::Json& config, int target_layers) {
+    DraftRefs refs;
+    refs.config = config;
+    const auto u = [](int value) { return static_cast<std::uint64_t>(value); };
+    const int layers = config_int(config, "num_hidden_layers");
+    const int hidden = config_int(config, "hidden_size");
+    const int backbone = config_int(config, "backbone_hidden_size");
+    const int heads = config_int(config, "num_attention_heads");
+    const int inter = config_int(config, "intermediate_size");
+    const auto& kinds = config.at("layer_types");
+    const auto& sources = config.at("kv_source_layers");
+    if (static_cast<int>(kinds.size()) != layers || static_cast<int>(sources.size()) != layers) {
+        throw std::invalid_argument("gemma4 load: mtp layer_types or kv_source_layers length");
+    }
+    auto outer = [&](const char* name, artifact::Shape shape, const char* input) {
+        refs.outer.push_back(binder.parameter(name, std::move(shape)));
+        if (input != nullptr) { refs.outer_uses.push_back(read_use(binder, name, input)); }
+    };
+    outer("mtp/input_projection", {u(hidden), u(2 * backbone)}, "mtp/stem_input");
+    outer("mtp/output_projection", {u(backbone), u(hidden)}, "mtp/final_hidden");
+    outer("mtp/output_head", {u(config_int(config, "vocab_size")), u(hidden)}, "mtp/final_hidden");
+    outer("mtp/final_norm", {u(hidden)}, nullptr);
+    for (const InputUse& use : refs.outer_uses) {
+        if (use.policy != ops::LinearPolicy::A16Only || use.divisor) {
+            throw std::invalid_argument("gemma4 load: the mtp projections run A16Only");
+        }
+    }
+    refs.layers.resize(static_cast<std::size_t>(layers));
+    refs.uses.resize(static_cast<std::size_t>(layers));
+    for (int layer = 0; layer < layers; ++layer) {
+        const int source = sources[layer].get<int>();
+        if (source < 0 || source >= target_layers) {
+            throw std::invalid_argument("gemma4 load: mtp KV source is outside the target");
+        }
+        const bool global = kinds[layer] == "full_attention";
+        const int dim = config_int(config, global ? "global_head_dim" : "head_dim");
+        const auto prefix = "mtp/layers/" + std::to_string(layer) + "/";
+        auto& layer_refs = refs.layers[static_cast<std::size_t>(layer)];
+        auto& layer_uses = refs.uses[static_cast<std::size_t>(layer)];
+        auto matrix = [&](const char* name, artifact::Shape shape, const char* input) {
+            layer_refs.push_back(binder.parameter(prefix + name, std::move(shape)));
+            layer_uses.push_back(read_use(binder, prefix + name, prefix + input));
+        };
+        matrix("attention/query", {u(heads * dim), u(hidden)}, "mixer_input");
+        matrix("attention/output", {u(hidden), u(heads * dim)}, "attention_output");
+        matrix("mlp/gate", {u(inter), u(hidden)}, "ffn_input");
+        matrix("mlp/up", {u(inter), u(hidden)}, "ffn_input");
+        matrix("mlp/down", {u(hidden), u(inter)}, "mlp/product");
+        layer_refs.push_back(binder.parameter(prefix + "attention/query_norm", {u(dim)}));
+        for (const char* name : {"input_norm", "post_attention_norm", "pre_feedforward_norm",
+                                 "post_feedforward_norm"}) {
+            layer_refs.push_back(binder.parameter(prefix + name, {u(hidden)}));
+        }
+        auto scalar = binder.parameter(prefix + "layer_scalar", {1}, artifact::Residency::Host,
+                                       QType::FP32);
+        refs.scalars.push_back(binder.values(scalar.binding, QType::FP32).scalar_f32());
+    }
+    return refs;
+}
+
+std::unique_ptr<Gemma4DraftWeights> finish_draft(const artifact::MaterializedArtifact& artifact,
+                                                 const DraftRefs& refs) {
+    const auto& config = refs.config;
+    auto draft = std::make_unique<Gemma4DraftWeights>();
+    draft->hidden = config_int(config, "hidden_size");
+    draft->backbone = config_int(config, "backbone_hidden_size");
+    draft->vocab = config_int(config, "vocab_size");
+    draft->rms_eps = config.at("rms_norm_eps").get<float>();
+    draft->input_projection = single_weight(artifact, refs.outer[0]);
+    draft->output_projection = single_weight(artifact, refs.outer[1]);
+    draft->output_head = single_weight(artifact, refs.outer[2]);
+    draft->final_norm = device_data(artifact, refs.outer[3]);
+    const auto& kinds = config.at("layer_types");
+    for (std::size_t layer = 0; layer < refs.layers.size(); ++layer) {
+        const std::span<const artifact::ParameterReference> layer_refs = refs.layers[layer];
+        const std::span<const InputUse> layer_uses = refs.uses[layer];
+        auto take = [&](std::size_t first, std::size_t count) {
+            return projection(artifact, layer_refs.subspan(first, count),
+                              layer_uses.subspan(first, count));
+        };
+        const bool global = kinds[layer] == "full_attention";
+        Gemma4LayerWeights weights;
+        const auto query = take(0, 1);
+        const auto output = take(1, 1);
+        const auto gate_up = take(2, 2);
+        const auto down = take(4, 1);
+        weights.qkv = query.weight;
+        weights.qkv_policy = query.policy;
+        weights.o_proj = output.weight;
+        weights.o_policy = output.policy;
+        weights.gate_up = gate_up.weight;
+        weights.gate_up_policy = gate_up.policy;
+        weights.down = down.weight;
+        weights.down_policy = down.policy;
+        weights.q_norm = device_data(artifact, layer_refs[5]);
+        weights.input_norm = device_data(artifact, layer_refs[6]);
+        weights.post_attn_norm = device_data(artifact, layer_refs[7]);
+        weights.pre_ff_norm = device_data(artifact, layer_refs[8]);
+        weights.post_ff_norm = device_data(artifact, layer_refs[9]);
+        weights.layer_scalar = refs.scalars[layer];
+        weights.hidden = draft->hidden;
+        weights.intermediate = config_int(config, "intermediate_size");
+        weights.head_dim = config_int(config, global ? "global_head_dim" : "head_dim");
+        weights.q_heads = config_int(config, "num_attention_heads");
+        weights.kv_heads =
+            config_int(config, global ? "num_global_key_value_heads" : "num_key_value_heads");
+        weights.window = global ? 0 : config_int(config, "sliding_window");
+        weights.rotary_dim = global ? config_int(config, "prope_rotary_dim") : weights.head_dim;
+        weights.rope_theta = global ? config.at("prope_theta_eff").get<float>()
+                                    : config.at("rope_sliding_theta").get<float>();
+        weights.rms_eps = draft->rms_eps;
+        weights.global_layer = global;
+        draft->layers.push_back(weights);
+        draft->kv_source.push_back(config.at("kv_source_layers")[layer].get<int>());
+    }
+    return draft;
+}
+
 } // namespace
 
 LoadedText::LoadedText() = default;
@@ -97,7 +227,7 @@ LoadedText::~LoadedText() = default;
 LoadedText::LoadedText(LoadedText&&) noexcept = default;
 LoadedText& LoadedText::operator=(LoadedText&&) noexcept = default;
 
-LoadedText load_text(const std::string& artifact_path, DeviceContext& device) {
+LoadedText load_text(const std::string& artifact_path, DeviceContext& device, bool with_draft) {
     artifact::Reader reader(artifact_path);
     const auto& config = reader.directory().component("text").config;
     const int layers = config_int(config, "num_hidden_layers");
@@ -164,6 +294,15 @@ LoadedText load_text(const std::string& artifact_path, DeviceContext& device) {
                                        QType::FP32);
         scalars[static_cast<std::size_t>(layer)] = binder.values(scalar.binding, QType::FP32).scalar_f32();
     }
+    std::optional<DraftRefs> draft;
+    if (with_draft) {
+        const auto& components = reader.directory().components;
+        const auto found = components.find("mtp");
+        if (found == components.end()) {
+            throw std::invalid_argument("gemma4 --spec mtp needs an artifact with the mtp component");
+        }
+        draft.emplace(bind_draft(binder, found->second.config, layers));
+    }
     auto plan = std::move(binder).finish();
     LoadedText loaded;
     loaded.artifact = std::make_unique<artifact::MaterializedArtifact>(
@@ -227,6 +366,21 @@ LoadedText load_text(const std::string& artifact_path, DeviceContext& device) {
         weights.rms_eps = loaded.rms_eps;
         weights.global_layer = global;
         loaded.layers[static_cast<std::size_t>(layer)] = weights;
+    }
+    if (draft) {
+        loaded.draft = finish_draft(*loaded.artifact, *draft);
+        if (loaded.draft->backbone != hidden || loaded.draft->vocab != vocab) {
+            throw std::invalid_argument("gemma4 load: mtp does not match the target");
+        }
+        for (std::size_t index = 0; index < loaded.draft->layers.size(); ++index) {
+            const Gemma4LayerWeights& own = loaded.draft->layers[index];
+            const Gemma4LayerWeights& source =
+                loaded.layers[static_cast<std::size_t>(loaded.draft->kv_source[index])];
+            if (own.global_layer != source.global_layer || own.head_dim != source.head_dim ||
+                own.kv_heads != source.kv_heads || own.window != source.window) {
+                throw std::invalid_argument("gemma4 load: mtp layer and its KV source disagree");
+            }
+        }
     }
     return loaded;
 }

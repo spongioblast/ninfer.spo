@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/gemma4/execution/draft_forward.h"
 #include "models/gemma4/execution/text_forward.h"
 
 #include <memory>
@@ -32,8 +33,11 @@ struct LoadedText {
     int hidden                  = 0;
     float softcap               = 30.0f;
     float rms_eps               = 1.0e-6f;
+    // The MTP assistant when loaded with with_draft.
+    std::unique_ptr<Gemma4DraftWeights> draft;
 };
 
-[[nodiscard]] LoadedText load_text(const std::string& artifact_path, DeviceContext& device);
+[[nodiscard]] LoadedText load_text(const std::string& artifact_path, DeviceContext& device,
+                                   bool with_draft = false);
 
 } // namespace ninfer::models::gemma4

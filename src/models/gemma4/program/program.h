@@ -19,8 +19,10 @@ namespace ninfer::models::gemma4 {
 class Program {
 public:
     // One lane with `capacity` KV positions; prefill runs in chunks of `prefill_chunk` tokens.
+    // A nonzero `draft_tokens` (1..15, needs model.draft) drafts that many tokens per decode
+    // round with the MTP assistant for greedy requests without penalties.
     Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
-            cudaStream_t stream);
+            std::uint32_t draft_tokens, cudaStream_t stream);
     ~Program();
 
     // KV bytes per position of the global layers; the sliding layers' ring is in fixed_bytes.

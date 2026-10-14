@@ -2,10 +2,14 @@
 
 #include "core/arena.h"
 #include "core/decode_graph.h"
+#include "models/gemma4/execution/draft_forward.h"
+#include "models/gemma4/execution/projection.h"
 #include "models/gemma4/execution/text_forward.h"
 #include "models/gemma4/program/sliding_ring.h"
 #include "models/gemma4/program/top_tokens.h"
+#include "ninfer/ops/argmax.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/target_logprobs.h"
 
@@ -39,6 +43,8 @@ void check(cudaError_t status, const char* what) {
 
 constexpr std::uint32_t kMinChunk = 16;
 constexpr std::uint32_t kMaxChunk = 16384;
+// A round verifies the anchor and its drafts in one forward of at most kMinChunk tokens.
+constexpr std::uint32_t kMaxDraftTokens = kMinChunk - 1;
 
 // Workspace bytes of the widest layer for a `chunk`-token prefill.
 std::size_t layer_bytes(const LoadedText& model, std::uint32_t chunk) {
@@ -118,26 +124,51 @@ struct Program::Impl {
     bool prefilled        = false;
     TokenId pending_token = 0;
     std::vector<TokenId> pending_tokens;
+    std::vector<std::int32_t> pending_counts;
     std::uint64_t transaction = 1;
     runtime::ExecutionTiming pending_timing;
     SequenceHandle handle;
+
+    // MTP. A round drafts up to draft_tokens tokens from carry_buf (the target's final-normed
+    // hidden state at fed - 1), verifies the anchor next_id and the drafts in one forward at
+    // positions [fed, fed + drafts], and offers the argmax of every column up to the first
+    // mismatch. Rejected K/V past the committed length is overwritten by the next round.
+    std::uint32_t draft_tokens = 0;
+    bool speculating           = false;
+    bool round_pending         = false;
+    std::uint32_t round_drafts = 0;
+    std::uint32_t round_agreed = 0;
+    DeviceBuffer carry_buf;
+    // I32 anchor, position, then one slot per draft.
+    DeviceBuffer draft_buf;
+    std::vector<TokenId> round_ids;
+    SpeculativeStats spec_stats;
 
     static std::size_t workspace_bytes(const LoadedText& loaded, std::uint32_t chunk) {
         const std::size_t layers = layer_bytes(loaded, chunk);
         const std::size_t logits = static_cast<std::size_t>(loaded.vocab) * kScoreTile * 2U +
                                    gemma4_logits_workspace_bytes(loaded.output_head, kScoreTile);
         const std::size_t sampling = ops::sampling_workspace_capacity_bytes(loaded.vocab, 1, 1);
-        return std::max(layers, logits + sampling) + (64U << 20U);
+        const std::size_t draft =
+            loaded.draft != nullptr ? gemma4_draft_workspace_bytes(*loaded.draft) : 0;
+        return std::max({layers, logits + sampling, draft}) + (64U << 20U);
     }
 
     Impl(LoadedText& loaded, std::uint32_t token_capacity, std::uint32_t prefill_chunk,
-         cudaStream_t device_stream)
+         std::uint32_t drafts, cudaStream_t device_stream)
         : model(&loaded), stream(device_stream), gemm(device_stream), vocab(loaded.vocab),
           hidden(loaded.hidden), capacity(token_capacity),
           chunk(std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk)),
-          workspace(workspace_bytes(loaded, chunk)) {
+          workspace(workspace_bytes(loaded, chunk)), draft_tokens(drafts) {
         if (vocab <= 0 || hidden <= 0 || loaded.layers.empty() || capacity == 0) {
             throw std::invalid_argument("gemma4 program: model is empty");
+        }
+        if (draft_tokens > kMaxDraftTokens || (draft_tokens > 0 && loaded.draft == nullptr)) {
+            throw std::invalid_argument("gemma4 program: MTP needs the assistant and 1..15 drafts");
+        }
+        if (draft_tokens > 0) {
+            carry_buf = DeviceBuffer(static_cast<std::size_t>(hidden) * 2);
+            draft_buf = DeviceBuffer((2U + kMaxDraftTokens) * sizeof(std::int32_t));
         }
         pages      = static_cast<int>((capacity + 63U) / 64U);
         id_buf     = DeviceBuffer(static_cast<std::size_t>(chunk) * 4);
@@ -186,10 +217,11 @@ struct Program::Impl {
     }
 
     void clear_lane() {
-        occupied  = false;
-        fed       = 0;
-        has_next  = false;
-        prefilled = false;
+        occupied      = false;
+        fed           = 0;
+        has_next      = false;
+        prefilled     = false;
+        round_pending = false;
         pending_tokens.clear();
     }
 
@@ -359,6 +391,94 @@ struct Program::Impl {
         }
     }
 
+    // The final-normed hidden state of hidden column `column` into carry_buf.
+    void carry_column(std::int32_t column) {
+        Tensor carry(carry_buf.p, DType::BF16, {hidden, 1});
+        ops::rmsnorm(hidden_columns(column, 1), norm_weight(model->final_norm, hidden),
+                     model->rms_eps, false, carry, stream);
+    }
+
+    // Drafts from carry_buf at position fed - 1 into draft_buf slots [2, 2 + count).
+    void draft(std::uint32_t count) {
+        std::int32_t head[2] = {next_id, static_cast<std::int32_t>(fed) - 1};
+        check(cudaMemcpyAsync(draft_buf.p, head, sizeof(head), cudaMemcpyHostToDevice, stream),
+              "draft upload");
+        auto* slots = static_cast<std::int32_t*>(draft_buf.p);
+        const Tensor position(slots + 1, DType::I32, {1});
+        Tensor carry(carry_buf.p, DType::BF16, {hidden, 1});
+        for (std::uint32_t step = 0; step < count; ++step) {
+            workspace.reset();
+            const Tensor token(step == 0 ? slots : slots + 1 + step, DType::I32, {1});
+            Tensor next(slots + 2 + step, DType::I32, {1});
+            gemma4_draft_step(token, position, carry, next, model->token_embedding, *model->draft,
+                              caches, gemm, workspace, stream);
+        }
+        check(cudaStreamSynchronize(stream), "draft sync");
+    }
+
+    PendingBatch speculative_round(std::uint32_t remaining,
+                                   std::chrono::steady_clock::time_point start) {
+        const std::uint32_t room = std::min(capacity - fed, chunk);
+        const std::uint32_t drafts =
+            std::min({draft_tokens, remaining > 0 ? remaining - 1U : 0U, room - 1U});
+        round_ids.assign(drafts + 1U, 0);
+        round_ids[0] = next_id;
+        if (drafts > 0) {
+            draft(drafts);
+            check(cudaMemcpy(round_ids.data() + 1, static_cast<std::int32_t*>(draft_buf.p) + 2,
+                             static_cast<std::size_t>(drafts) * 4, cudaMemcpyDeviceToHost),
+                  "draft copy");
+        }
+        const std::uint32_t width = drafts + 1U;
+        run_layers(round_ids.data(), fed, width);
+        workspace.reset();
+        Tensor logits = workspace.alloc(DType::BF16, {vocab, static_cast<std::int32_t>(width)});
+        Tensor out    = workspace.alloc(DType::I32, {static_cast<std::int32_t>(width)});
+        gemma4_logits(hidden_columns(0, static_cast<std::int32_t>(width)), logits,
+                      model->final_norm, model->output_head, model->softcap, model->rms_eps, gemm,
+                      workspace, stream);
+        ops::argmax(logits, out, vocab, stream);
+        pending_tokens.assign(width, 0);
+        check(cudaMemcpyAsync(pending_tokens.data(), out.data, static_cast<std::size_t>(width) * 4,
+                              cudaMemcpyDeviceToHost, stream),
+              "verify copy");
+        check(cudaStreamSynchronize(stream), "verify sync");
+        std::uint32_t agreed = 0;
+        while (agreed < drafts && round_ids[agreed + 1U] == pending_tokens[agreed]) { ++agreed; }
+        round_drafts   = drafts;
+        round_agreed   = agreed;
+        round_pending  = true;
+        has_next       = false;
+        pending_counts = {static_cast<std::int32_t>(agreed + 1U)};
+        pending_timing = timed(start);
+        ++transaction;
+        return program::HandleAccess::make_pending(this, transaction,
+                                                   std::span<const SequenceHandle>(&handle, 1), 1,
+                                                   pending_tokens, pending_counts, width,
+                                                   pending_timing);
+    }
+
+    // Keeps the first `accepted` verified tokens of the pending round.
+    void commit_round(std::uint32_t accepted, bool terminal) {
+        if (accepted > round_agreed + 1U) {
+            throw std::logic_error("gemma4 commit accepted more tokens than the round verified");
+        }
+        round_pending = false;
+        ++spec_stats.rounds;
+        spec_stats.drafted_tokens += round_drafts;
+        const std::uint32_t drafted = std::min(round_agreed, accepted);
+        spec_stats.accepted_tokens += drafted;
+        for (std::uint32_t index = 0; index < drafted; ++index) {
+            ++spec_stats.accepted_per_position[index];
+        }
+        resident.resize(fed + accepted);
+        if (accepted == 0) { return; }
+        fed += accepted;
+        next_id  = pending_tokens[accepted - 1U];
+        has_next = true;
+        if (!terminal) { carry_column(static_cast<std::int32_t>(accepted) - 1); }
+    }
+
     PendingBatch stage(TokenId token, runtime::ExecutionTiming timing) {
         pending_token  = token;
         pending_tokens = {token};
@@ -371,8 +491,8 @@ struct Program::Impl {
 };
 
 Program::Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
-                 cudaStream_t stream)
-    : impl_(std::make_unique<Impl>(model, capacity, prefill_chunk, stream)) {}
+                 std::uint32_t draft_tokens, cudaStream_t stream)
+    : impl_(std::make_unique<Impl>(model, capacity, prefill_chunk, draft_tokens, stream)) {}
 
 Program::~Program() = default;
 
@@ -575,7 +695,17 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
         impl_->plan.reset();
         return progress;
     }
-    impl_->upload_sampling(impl_->plan->sampling);
+    const ResolvedSamplingParameters& sampling = impl_->plan->sampling;
+    impl_->upload_sampling(sampling);
+    impl_->speculating = impl_->draft_tokens > 0 && sampling.temperature <= 0.0F &&
+                         sampling.presence_penalty == 0.0F && sampling.frequency_penalty == 0.0F;
+    impl_->spec_stats  = {};
+    if (impl_->speculating) {
+        impl_->spec_stats.backend      = SpeculativeBackend::Mtp;
+        impl_->spec_stats.enabled      = true;
+        impl_->spec_stats.draft_window = impl_->draft_tokens;
+        impl_->spec_stats.accepted_per_position.assign(impl_->draft_tokens, 0);
+    }
     impl_->occupied  = true;
     impl_->fed       = impl_->bind_reused;
     impl_->has_next  = false;
@@ -616,6 +746,7 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     }
     const TokenId next = impl_->sample_column(static_cast<std::int32_t>(width) - 1, impl_->fed,
                                               ops::kSamplePurposePrefill);
+    if (impl_->speculating) { impl_->carry_column(static_cast<std::int32_t>(width) - 1); }
     impl_->prefilled   = true;
     progress.complete  = true;
     progress.timing    = timed(start);
@@ -637,7 +768,10 @@ PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
     if (impl_->fed >= impl_->capacity) {
         throw std::logic_error("gemma4 decode ran past the KV capacity");
     }
-    const auto start   = std::chrono::steady_clock::now();
+    const auto start = std::chrono::steady_clock::now();
+    if (impl_->speculating) {
+        return impl_->speculative_round(budgets[0].generated_tokens_remaining, start);
+    }
     const TokenId next = impl_->decode_step(impl_->next_id);
     ++impl_->fed;
     impl_->has_next = false;
@@ -660,7 +794,10 @@ CommitResult Program::commit(PendingBatch&& pending,
         throw std::logic_error("gemma4 commit does not match the pending batch");
     }
     const runtime::CommitDecision& decision = decisions[0];
-    if (!decision.failed && !decision.cancelled && decision.accepted_tokens == 1) {
+    if (impl_->round_pending) {
+        const bool dropped = decision.failed || decision.cancelled;
+        impl_->commit_round(dropped ? 0U : decision.accepted_tokens, dropped || decision.terminal);
+    } else if (!decision.failed && !decision.cancelled && decision.accepted_tokens == 1) {
         impl_->next_id  = impl_->pending_token;
         impl_->has_next = true;
     } else if (decision.accepted_tokens != 0) {
@@ -671,6 +808,10 @@ CommitResult Program::commit(PendingBatch&& pending,
     CommitResult result;
     result.row_count           = 1;
     result.timing              = impl_->pending_timing;
+    const SpeculativeStats& stats             = impl_->spec_stats;
+    result.rows[0].speculative_counters       = {stats.rounds, stats.drafted_tokens,
+                                                 stats.accepted_tokens, stats.fallback_steps};
+    if (decision.failed || decision.cancelled) { result.rows[0].speculative = stats; }
     result.rows[0].disposition = decision.failed ? runtime::CommitDisposition::FailedReleased
                                  : decision.cancelled
                                      ? runtime::CommitDisposition::CancelledReleased
@@ -684,6 +825,10 @@ DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
         program::HandleAccess::transaction(pending) != impl_->transaction) {
         return {};
     }
+    if (impl_->round_pending) {
+        impl_->round_pending = false;
+        impl_->resident.resize(impl_->fed);
+    }
     impl_->pending_tokens.clear();
     program::HandleAccess::consume(pending);
     return {.status = runtime::ConsumeStatus::Consumed, .row_count = 1};
@@ -694,7 +839,7 @@ FinishResult Program::finish(SequenceHandle sequence) noexcept {
     ++impl_->epoch;
     impl_->clear_lane();
     impl_->plan.reset();
-    return {.status = runtime::ConsumeStatus::Consumed};
+    return {.status = runtime::ConsumeStatus::Consumed, .speculative = std::move(impl_->spec_stats)};
 }
 
 AbortResult Program::abort(SequenceHandle sequence) noexcept {
@@ -702,7 +847,7 @@ AbortResult Program::abort(SequenceHandle sequence) noexcept {
     ++impl_->epoch;
     impl_->clear_lane();
     impl_->plan.reset();
-    return {.status = runtime::ConsumeStatus::Consumed};
+    return {.status = runtime::ConsumeStatus::Consumed, .speculative = std::move(impl_->spec_stats)};
 }
 
 void Program::fail_all_cleanup() noexcept {
