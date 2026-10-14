@@ -7,6 +7,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/launcher/gemma4_attention_tile.cuh"
 #include "ops/softmax_attention/common/causal_tile_io.cuh"
 #include "ops/softmax_attention/dense/causal_cache/bf16/softmax.cuh"
 
@@ -30,36 +31,18 @@ constexpr std::size_t kSharedBytes =
     (static_cast<std::size_t>(kRows) * D + static_cast<std::size_t>(Bc) * D +
      static_cast<std::size_t>(Bc) * kSlice);
 
-// One [Bc, Width] tile of keys [k0, k0 + Bc) from columns [column, column + Width) of the
-// [D,64,Hkv,pages] cache into swizzled shared memory. Keys past `last` are zeroed so the
-// unwritten cache tail never reaches the tensor cores.
 template <int D, int Width, int Bc>
 __device__ __forceinline__ void stage_keys(__nv_bfloat16* dst, const __nv_bfloat16* cache,
                                            int kv_heads, int kv_head, int physical, int k0,
                                            int last, int column, int tid) {
-    constexpr int VecPerRow = Width / 8;
-    const __nv_bfloat16* block =
-        cache +
-        ((static_cast<std::int64_t>(physical) * kv_heads + kv_head) * kPagedKVPageSize +
-         (k0 & kPagedKVPageMask)) *
-            D +
-        column;
-#pragma unroll
-    for (int chunk = tid; chunk < Bc * VecPerRow; chunk += kThreads) {
-        const int key    = chunk / VecPerRow;
-        const int d      = (chunk % VecPerRow) * 8;
-        __nv_bfloat16* p = &dst[key * Width + causal_swizzle(key, d)];
-        if (physical >= 0 && k0 + key <= last) {
-            cp_async<16, Cache::cg>(p, &block[key * D + d]);
-        } else {
-            store_vec(p, make_int4(0, 0, 0, 0));
-        }
-    }
+    gemma4_stage_keys<D, Width, Bc, kThreads>(dst, cache, kv_heads, kv_head, physical, k0, last,
+                                              column, tid);
 }
 
 // grid (query tiles, Hq, D / 256); CTA (tile, h, s) writes dimensions [256 s, 256 s + 256) of
 // query rows [64 tile, 64 tile + 64) of head h. Online softmax over the union of the rows'
-// visible keys in Bc-key tiles; each row masks with its own position and the window.
+// visible keys in Bc-key tiles; each row masks with its own position and the window. Used for
+// D256; D512 runs gemma4_attention_mma_d512.cu, one 8-warp CTA for both output halves.
 template <int D, int Bc>
 __launch_bounds__(kThreads, 1) __global__
     void gemma4_attention_mma_kernel(const __nv_bfloat16* __restrict__ q,
@@ -407,7 +390,8 @@ void gemma4_attention_mma_launch(const Tensor& q, const Tensor& k_pages, const T
     if (q.ne[0] == 256) {
         launch<256, 64>(q, k_pages, v_pages, block_table, positions, window, scale, out, stream);
     } else if (q.ne[0] == 512) {
-        launch<512, 16>(q, k_pages, v_pages, block_table, positions, window, scale, out, stream);
+        gemma4_attention_mma_d512_launch(q, k_pages, v_pages, block_table, positions, window, scale,
+                                         out, stream);
     } else {
         throw std::invalid_argument("gemma4_attention: the tensor-core path needs D=256 or 512");
     }

@@ -23,4 +23,9 @@ void gemma4_attention_mma_launch(const Tensor& q, const Tensor& k_pages, const T
                                  const Tensor& block_table, const Tensor& positions, int window,
                                  float scale, Tensor& out, cudaStream_t stream);
 
+// The D=512 kernel behind gemma4_attention_mma_launch.
+void gemma4_attention_mma_d512_launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
+                                      const Tensor& block_table, const Tensor& positions,
+                                      int window, float scale, Tensor& out, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail
