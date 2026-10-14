@@ -151,6 +151,102 @@ def text_config(source: dict) -> dict:
     return result
 
 
+# The assistant reads the target's K/V, so its attention geometry and RoPE must match.
+_ASSISTANT_SAME_KEYS = (
+    "head_dim",
+    "global_head_dim",
+    "num_key_value_heads",
+    "num_global_key_value_heads",
+    "sliding_window",
+    "vocab_size",
+)
+
+
+def assistant_config(source: dict, target_source: dict, text: dict) -> dict:
+    """Config of the MTP assistant (`Gemma4AssistantForCausalLM`) for a target text config.
+
+    Every assistant layer is query-only and attends to the K/V of the target's last layer of
+    the same type. Draft steps reuse the target's RoPE at the last target position.
+    """
+    if source.get("architectures") != ["Gemma4AssistantForCausalLM"]:
+        raise ValueError(
+            f"unsupported Gemma 4 assistant architecture {source.get('architectures')!r}"
+        )
+    if source.get("use_ordered_embeddings"):
+        raise ValueError("the assistant's centroid head is not in this adapter")
+    if source.get("backbone_hidden_size") != text["hidden_size"]:
+        raise ValueError("assistant backbone_hidden_size differs from the target hidden size")
+    if source.get("tie_word_embeddings") is False:
+        raise ValueError("the assistant head must be tied to its embedding")
+    if target_source.get("text_config", {}).get("num_kv_shared_layers", 0):
+        raise ValueError("a target with KV-shared layers is not in this adapter")
+    raw = source.get("text_config")
+    if not isinstance(raw, dict):
+        raise ValueError("the assistant requires text_config")
+    if raw.get("hidden_activation") != "gelu_pytorch_tanh":
+        raise ValueError("assistant MLP must be gelu_pytorch_tanh")
+    if raw.get("final_logit_softcapping") is not None:
+        raise ValueError("assistant logit softcap is not in this adapter")
+    if raw.get("enable_moe_block") or raw.get("hidden_size_per_layer_input"):
+        raise ValueError("assistant MoE or per-layer inputs are not in this adapter")
+    count = _positive(raw.get("num_hidden_layers"), "assistant.num_hidden_layers")
+    layers = raw.get("layer_types")
+    if (
+        not isinstance(layers, list)
+        or len(layers) != count
+        or any(kind not in ("sliding_attention", "full_attention") for kind in layers)
+    ):
+        raise ValueError("assistant.layer_types must describe every block")
+    if raw.get("num_kv_shared_layers") != count:
+        raise ValueError("every assistant layer must read the target's K/V")
+    for key in _ASSISTANT_SAME_KEYS:
+        value = raw.get(key)
+        if value != text[key]:
+            raise ValueError(f"assistant {key} {value!r} differs from the target")
+    heads = _positive(raw.get("num_attention_heads"), "assistant.num_attention_heads")
+    if heads % text["num_key_value_heads"] or heads % text["num_global_key_value_heads"]:
+        raise ValueError("assistant heads must group over the target's KV heads")
+    rope = raw.get("rope_parameters")
+    if not isinstance(rope, dict):
+        raise ValueError("assistant.rope_parameters must be an object")
+    full, sliding = rope.get("full_attention", {}), rope.get("sliding_attention", {})
+    if (
+        full.get("rope_type") != "proportional"
+        or _f32(full.get("partial_rotary_factor", 0.25), "partial_rotary_factor")
+        != text["partial_rotary_factor"]
+        or _f32(full.get("rope_theta", 1e6), "full.rope_theta") != text["rope_global_theta"]
+        or _f32(sliding.get("rope_theta", 10000.0), "sliding.rope_theta")
+        != text["rope_sliding_theta"]
+    ):
+        raise ValueError("assistant RoPE differs from the target")
+    eps = _f32(raw.get("rms_norm_eps", 1e-6), "assistant.rms_norm_eps")
+    last = {kind: i for i, kind in enumerate(text["layer_types"])}
+    if any(kind not in last for kind in layers):
+        raise ValueError("the target has no layer of an assistant layer's type")
+    return {
+        "architectures": ["Gemma4Assistant"],
+        "hidden_size": _positive(raw.get("hidden_size"), "assistant.hidden_size"),
+        "backbone_hidden_size": text["hidden_size"],
+        "intermediate_size": _positive(
+            raw.get("intermediate_size"), "assistant.intermediate_size"
+        ),
+        "num_hidden_layers": count,
+        "num_attention_heads": heads,
+        "head_dim": text["head_dim"],
+        "global_head_dim": text["global_head_dim"],
+        "num_key_value_heads": text["num_key_value_heads"],
+        "num_global_key_value_heads": text["num_global_key_value_heads"],
+        "layer_types": list(layers),
+        "kv_source_layers": [last[kind] for kind in layers],
+        "sliding_window": text["sliding_window"],
+        "rms_norm_eps": eps,
+        "vocab_size": text["vocab_size"],
+        "rope_sliding_theta": text["rope_sliding_theta"],
+        "prope_rotary_dim": text["prope_rotary_dim"],
+        "prope_theta_eff": text["prope_theta_eff"],
+    }
+
+
 def _scale_bf16(source: LogicalSource, scale: float) -> LogicalSource:
     factor = torch.tensor(scale, dtype=torch.float32).to(torch.bfloat16)
 
@@ -274,6 +370,84 @@ def _annotate_k_norm(model: Model) -> None:
     config["global_k_norm_scalar"] = scalars
 
 
+def _add_assistant(builder: _Builder, config: dict, perm: torch.Tensor) -> None:
+    """MTP assistant parameters. The query side of global layers takes the target's permutation."""
+    hidden = config["hidden_size"]
+    backbone = config["backbone_hidden_size"]
+    heads = config["num_attention_heads"]
+    intermediate = config["intermediate_size"]
+    builder.add(
+        "mtp/input_projection",
+        "pre_projection.weight",
+        (hidden, 2 * backbone),
+        inputs=("mtp/stem_input",),
+    )
+    builder.add(
+        "mtp/output_projection",
+        "post_projection.weight",
+        (backbone, hidden),
+        inputs=("mtp/final_hidden",),
+    )
+    builder.add(
+        "mtp/output_head",
+        "model.embed_tokens.weight",
+        (config["vocab_size"], hidden),
+        inputs=("mtp/final_hidden",),
+    )
+    builder.add("mtp/final_norm", "model.norm.weight", (hidden,))
+    for index, kind in enumerate(config["layer_types"]):
+        global_layer = kind == "full_attention"
+        dim = config["global_head_dim"] if global_layer else config["head_dim"]
+        stem = f"mtp/layers/{index}/"
+        src = f"model.layers.{index}."
+        builder.add(
+            stem + "attention/query",
+            src + "self_attn.q_proj.weight",
+            (heads * dim, hidden),
+            transform=(
+                (lambda source: _permute_rows(source, heads, perm)) if global_layer else None
+            ),
+            inputs=(stem + "mixer_input",),
+        )
+        builder.add(
+            stem + "attention/query_norm",
+            src + "self_attn.q_norm.weight",
+            (dim,),
+            transform=(lambda source: _permute_vector(source, perm)) if global_layer else None,
+        )
+        builder.add(
+            stem + "attention/output",
+            src + "self_attn.o_proj.weight",
+            (hidden, heads * dim),
+            transform=(
+                (lambda source: _permute_cols(source, heads, perm)) if global_layer else None
+            ),
+            inputs=(stem + "attention_output",),
+        )
+        for role in ("gate", "up"):
+            builder.add(
+                stem + "mlp/" + role,
+                src + f"mlp.{role}_proj.weight",
+                (intermediate, hidden),
+                inputs=(stem + "ffn_input",),
+            )
+        builder.add(
+            stem + "mlp/down",
+            src + "mlp.down_proj.weight",
+            (hidden, intermediate),
+            inputs=(stem + "mlp/product",),
+        )
+        for role, source_name in (
+            ("input_norm", "input_layernorm"),
+            ("post_attention_norm", "post_attention_layernorm"),
+            ("pre_feedforward_norm", "pre_feedforward_layernorm"),
+            ("post_feedforward_norm", "post_feedforward_layernorm"),
+        ):
+            builder.add(stem + role, src + source_name + ".weight", (hidden,))
+        builder.add(stem + "layer_scalar", src + "layer_scalar", (1,), direct="fp32")
+        builder.group(stem + "mlp/gate", stem + "mlp/up")
+
+
 def build_model(
     base: SafetensorsSource,
     *,
@@ -282,12 +456,18 @@ def build_model(
     resource_overrides: Mapping[str, str | Path] | None = None,
 ) -> Model:
     selected = set(components)
-    if selected != {"text"}:
-        raise ValueError("Gemma 4 text is the supported component in this adapter")
-    if companions:
-        raise ValueError("Gemma 4 text does not take companion sources")
+    if "text" not in selected or selected - {"text", "mtp"}:
+        raise ValueError("Gemma 4 supports the text and mtp components")
+    companions = {} if companions is None else dict(companions)
+    if set(companions) - {"mtp"} or set(companions) != selected - {"text"}:
+        raise ValueError("Gemma 4 mtp requires --source mtp=ASSISTANT and nothing else")
     config = text_config(base.config)
     records = {"text": {"config": config}}
+    if "mtp" in selected:
+        records["mtp"] = {
+            "config": assistant_config(companions["mtp"].config, base.config, config),
+            "target": "text",
+        }
     refs, resources, count, special = load_resources(
         base.root,
         vocab_size=config["vocab_size"],
@@ -401,6 +581,8 @@ def build_model(
             qkv.append(stem + "attention/value")
         builder.group(*qkv)
         builder.group(stem + "mlp/gate", stem + "mlp/up")
+    if "mtp" in selected:
+        _add_assistant(_Builder(model, companions["mtp"]), records["mtp"]["config"], perm)
     _annotate_k_norm(model)
     if prod(model.parameters["text/token_embedding"].shape) <= 0:
         raise ValueError("empty Gemma 4 embedding")

@@ -152,7 +152,7 @@ def main(argv=None):
             model = build_gemma4(
                 base,
                 components=components,
-                companions=companions,
+                companions={key: sources[key] for key in ("mtp",) if key in components},
                 resource_overrides=overrides,
             )
         else:

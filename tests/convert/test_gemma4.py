@@ -455,3 +455,132 @@ def test_a4_override_requires_every_input(tmp_path):
             gemma4_31b_nvfp4_base(model, recipe, sources)
             with pytest.raises(ValueError, match="attention_output"):
                 gemma4_nvfp4_a4(model, recipe, sources)
+
+
+def _assistant_config(hidden=8, backbone=16, dim=8, window=32):
+    return {
+        "architectures": ["Gemma4AssistantForCausalLM"],
+        "model_type": "gemma4_assistant",
+        "backbone_hidden_size": backbone,
+        "use_ordered_embeddings": False,
+        "tie_word_embeddings": True,
+        "text_config": {
+            "hidden_size": hidden,
+            "intermediate_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 2,
+            "num_global_key_value_heads": 1,
+            "num_kv_shared_layers": 2,
+            "head_dim": dim,
+            "global_head_dim": dim,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "sliding_window": window,
+            "vocab_size": 8,
+            "hidden_activation": "gelu_pytorch_tanh",
+            "rms_norm_eps": 1e-6,
+            "final_logit_softcapping": None,
+            "rope_parameters": {
+                "full_attention": {
+                    "partial_rotary_factor": 0.25,
+                    "rope_theta": 1000000.0,
+                    "rope_type": "proportional",
+                },
+                "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"},
+            },
+        },
+    }
+
+
+def _assistant(path, **config):
+    path.mkdir()
+    settings = _assistant_config(**config)
+    (path / "config.json").write_text(json.dumps(settings))
+    text = settings["text_config"]
+    hidden, dim = text["hidden_size"], text["head_dim"]
+    backbone = settings["backbone_hidden_size"]
+    tensors = {
+        "model.embed_tokens.weight": torch.arange(8 * hidden).reshape(8, hidden).to(torch.bfloat16),
+        "model.norm.weight": torch.ones(hidden, dtype=torch.bfloat16),
+        "pre_projection.weight": torch.ones(hidden, 2 * backbone, dtype=torch.bfloat16),
+        "post_projection.weight": torch.ones(backbone, hidden, dtype=torch.bfloat16),
+    }
+    for index in range(2):
+        src = f"model.layers.{index}."
+        q_rows = 2 * dim
+        tensors[src + "self_attn.q_proj.weight"] = torch.arange(q_rows * hidden).reshape(
+            q_rows, hidden
+        ).to(torch.bfloat16)
+        tensors[src + "self_attn.q_norm.weight"] = torch.arange(dim).to(torch.bfloat16)
+        tensors[src + "self_attn.o_proj.weight"] = torch.arange(hidden * q_rows).reshape(
+            hidden, q_rows
+        ).to(torch.bfloat16)
+        for role in ("gate", "up"):
+            tensors[src + f"mlp.{role}_proj.weight"] = torch.ones(16, hidden, dtype=torch.bfloat16)
+        tensors[src + "mlp.down_proj.weight"] = torch.ones(hidden, 16, dtype=torch.bfloat16)
+        for name in (
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ):
+            tensors[src + name + ".weight"] = torch.ones(hidden, dtype=torch.bfloat16)
+        tensors[src + "layer_scalar"] = torch.tensor([0.5], dtype=torch.bfloat16)
+    save_file(tensors, path / "model.safetensors")
+    return SafetensorsSource(path)
+
+
+def test_assistant_reads_target_kv_and_permutes_global_queries(tmp_path):
+    from tools.convert.official_recipes import gemma4_31b_fp8, gemma4_fp8_a8
+
+    with _checkpoint(tmp_path / "source", **NVFP4_DIMS) as source, _assistant(
+        tmp_path / "assistant", dim=128, backbone=128
+    ) as assistant:
+        model = build_model(source, components=("text", "mtp"), companions={"mtp": assistant})
+        config = model.components["mtp"]["config"]
+        assert config["kv_source_layers"] == [0, 1]
+        assert config["backbone_hidden_size"] == 128
+        assert config["prope_rotary_dim"] == model.config["prope_rotary_dim"]
+        perm = prope_perm(128, 0.25)
+        q = assistant.read_flat("model.layers.1.self_attn.q_proj.weight", 0, 256 * 8).reshape(
+            2, 128, 8
+        )
+        got = _values(model, "mtp/layers/1/attention/query").reshape(2, 128, 8)
+        assert torch.equal(got, q[:, perm, :])
+        o = assistant.read_flat("model.layers.1.self_attn.o_proj.weight", 0, 8 * 256).reshape(
+            8, 2, 128
+        )
+        got_o = _values(model, "mtp/layers/1/attention/output").reshape(8, 2, 128)
+        assert torch.equal(got_o, o[:, :, perm])
+        sliding = assistant.read_flat("model.layers.0.self_attn.q_proj.weight", 0, 256 * 8)
+        assert torch.equal(_values(model, "mtp/layers/0/attention/query").reshape(-1), sliding)
+        head = assistant.read_flat("model.embed_tokens.weight", 0, 64)
+        assert torch.equal(_values(model, "mtp/output_head").reshape(-1), head)
+        recipe = Recipe(model)
+        sources = {"base": source, "mtp": assistant}
+        gemma4_31b_fp8(model, recipe, sources)
+        gemma4_fp8_a8(model, recipe, sources)
+        out = tmp_path / "gemma.ninfer"
+        convert(model, recipe, out, device="cpu", rows_per_chunk=128)
+    with Artifact(out) as artifact:
+        assert artifact.directory.components["mtp"]["target"] == "text"
+        for name in ("mtp/input_projection", "mtp/output_head", "mtp/layers/1/attention/query"):
+            assert artifact.by_id[_objects(artifact, name)[0][0]].format == "bf16"
+        _packed(artifact, ["mtp/layers/0/mlp/gate", "mtp/layers/0/mlp/up"])
+        for use in artifact.directory.uses:
+            if use["parameter"].startswith("mtp/"):
+                assert use["activation_policy"] == "A16Only"
+
+
+def test_assistant_must_match_target_attention(tmp_path):
+    with _checkpoint(tmp_path / "source") as source, _assistant(
+        tmp_path / "assistant", window=16
+    ) as assistant:
+        with pytest.raises(ValueError, match="sliding_window"):
+            build_model(source, components=("text", "mtp"), companions={"mtp": assistant})
+
+
+def test_mtp_component_requires_assistant_source(tmp_path):
+    with _checkpoint(tmp_path / "source") as source:
+        with pytest.raises(ValueError, match="source mtp"):
+            build_model(source, components=("text", "mtp"))
