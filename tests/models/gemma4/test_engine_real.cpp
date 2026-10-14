@@ -215,6 +215,25 @@ int main() {
             check(again.generated_token_ids == fresh.generated_token_ids &&
                       turn2.generated_token_ids == fresh.generated_token_ids,
                   "reused and fresh prefill produce the same tokens");
+
+            // A long prompt wraps the sliding layers' ring. Reusing all but its last token keeps
+            // the window before it; a prompt sharing only the start must not reuse wrapped slots.
+            const std::string intro = "Remember this: the secret word is BLUEBERRY.\n\n";
+            const std::string ask   = "\nWhat is the secret word? Answer with the word only.";
+            const auto long_first =
+                engine.generate(engine.prepare(chat(intro + filler + ask)), reuse);
+            const auto long_again =
+                engine.generate(engine.prepare(chat(intro + filler + ask)), reuse);
+            check(long_again.reused_prompt_tokens + 1 == long_again.prompt.prompt_tokens &&
+                      long_again.generated_token_ids == long_first.generated_token_ids,
+                  "long prompt reuses the wrapped ring with the same tokens");
+            const std::string short_prompt = intro + filler.substr(0, 300) + ask;
+            const auto short_reuse = engine.generate(engine.prepare(chat(short_prompt)), reuse);
+            const auto short_fresh =
+                engine.generate(engine.prepare(chat(short_prompt)), greedy(24));
+            check(short_reuse.reused_prompt_tokens == 0 &&
+                      short_reuse.generated_token_ids == short_fresh.generated_token_ids,
+                  "shared start after a wrapped ring is recomputed");
         }
         {
             ninfer::EngineOptions options;

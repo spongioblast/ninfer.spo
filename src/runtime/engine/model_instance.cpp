@@ -74,27 +74,26 @@ void validate_options(const EngineOptions& options) {
 }
 
 template <class Contract>
-concept GenerationContract = requires(typename Contract::Program& program,
-                                      typename Contract::PreparedPrompt prompt,
-                                      const runtime::ResolvedExecutionOptions& options,
-                                      const typename Contract::RequestBasePlan& base,
-                                      typename Contract::SequenceHandle sequence,
-                                      typename Contract::PendingBatch pending,
-                                      std::span<const typename Contract::SequenceHandle> sequences,
-                                      std::span<const runtime::RoundBudget> budgets,
-                                      std::span<const runtime::CommitDecision> decisions) {
-    program.plan_request(std::move(prompt), options);
-    program.inspect_source(base, std::optional<typename Contract::CheckpointHandle>{});
-    program.reserve_units(std::span<const typename Contract::ExecutionUnit>{});
-    program.advance_prefill(sequence, nullptr, nullptr);
-    program.decode(sequences, budgets, nullptr, nullptr);
-    program.commit(std::move(pending), decisions);
-    program.finish(sequence);
-    program.abort(sequence);
-    program.has_context_transaction();
-    program.memory_summary();
-    program.physical_usage();
-};
+concept GenerationContract =
+    requires(typename Contract::Program& program, typename Contract::PreparedPrompt prompt,
+             const runtime::ResolvedExecutionOptions& options,
+             const typename Contract::RequestBasePlan& base,
+             typename Contract::SequenceHandle sequence, typename Contract::PendingBatch pending,
+             std::span<const typename Contract::SequenceHandle> sequences,
+             std::span<const runtime::RoundBudget> budgets,
+             std::span<const runtime::CommitDecision> decisions) {
+        program.plan_request(std::move(prompt), options);
+        program.inspect_source(base, std::optional<typename Contract::CheckpointHandle>{});
+        program.reserve_units(std::span<const typename Contract::ExecutionUnit>{});
+        program.advance_prefill(sequence, nullptr, nullptr);
+        program.decode(sequences, budgets, nullptr, nullptr);
+        program.commit(std::move(pending), decisions);
+        program.finish(sequence);
+        program.abort(sequence);
+        program.has_context_transaction();
+        program.memory_summary();
+        program.physical_usage();
+    };
 
 static_assert(GenerationContract<models::qwen3_5::RuntimeTypes>);
 static_assert(GenerationContract<models::qwen3_8_flash_next::v3::RuntimeTypes>);
@@ -131,9 +130,9 @@ ConstructedModel construct_flash_next(EngineOptions& options, DeviceContext& dev
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const std::string signature = "qwen3_8_flash_next-prefill-1";
     auto context_cost           = resolve_context_machine_cost(
-        {.hardware_class = context_cost_hardware_class(device.props.name, device.props.major,
-                                                                device.props.minor),
-                  .prefill_signature = signature},
+        {.hardware_class =
+                       context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
+                   .prefill_signature = signature},
         options.context_cost.preset_path);
     auto planner    = flash::Package::make_sequence_planner(device, options, profile);
     auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),
@@ -161,11 +160,11 @@ ConstructedModel construct_flash_next(EngineOptions& options, DeviceContext& dev
     LoadSummary summary;
     summary.architecture =
         std::string(models::architecture_name(models::Architecture::Qwen3_8FlashNext));
-    summary.model_name   = reader.directory().metadata.value("name", std::string(flash::Package::model_id));
+    summary.model_name =
+        reader.directory().metadata.value("name", std::string(flash::Package::model_id));
     summary.prefill_signature = signature;
-    summary.weight_formats.push_back(profile == flash::Package::WeightsProfile::Nvfp4
-                                         ? "nvfp4"
-                                         : "nvfp4-bf16-ple");
+    summary.weight_formats.push_back(
+        profile == flash::Package::WeightsProfile::Nvfp4 ? "nvfp4" : "nvfp4-bf16-ple");
     summary.load_seconds         = std::chrono::duration<double>(Clock::now() - start).count();
     summary.upload_seconds       = facts.upload_seconds;
     summary.artifact_bytes_read  = facts.read_bytes;
@@ -207,9 +206,9 @@ void log_startup_memory(const EngineOptions& options) {
     const PinnedHostUsage pinned = pinned_host_usage();
     const std::uint64_t host_kv  = options.context_cache.host_kv_capacity_bytes;
     std::ostringstream line;
-    line << std::fixed << std::setprecision(2) << "pinned host memory: " << gib(pinned.current_bytes)
-         << " GiB (peak " << gib(pinned.peak_bytes) << ", host KV " << gib(host_kv)
-         << ", host state + staging "
+    line << std::fixed << std::setprecision(2)
+         << "pinned host memory: " << gib(pinned.current_bytes) << " GiB (peak "
+         << gib(pinned.peak_bytes) << ", host KV " << gib(host_kv) << ", host state + staging "
          << gib(pinned.current_bytes > host_kv ? pinned.current_bytes - host_kv : 0) << ")";
     if (pinned.ceiling_bytes != 0) { line << ", ceiling " << gib(pinned.ceiling_bytes); }
     line << "; device memory: cudaMemGetInfo free " << gib(cuda_free) << " of " << gib(cuda_total)
@@ -228,7 +227,8 @@ void log_startup_memory(const EngineOptions& options) {
 EngineOptions normalize_engine_options(EngineOptions options) {
     if (!options.capture_path.empty()) {
         auto ancestor = std::filesystem::weakly_canonical(options.capture_path);
-        const auto model_dir = std::filesystem::weakly_canonical(options.artifact_path).parent_path();
+        const auto model_dir =
+            std::filesystem::weakly_canonical(options.artifact_path).parent_path();
         while (!ancestor.empty()) {
             if (ancestor == model_dir || std::filesystem::exists(ancestor / "config.json") ||
                 std::filesystem::exists(ancestor / "model.safetensors.index.json")) {
@@ -243,7 +243,8 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         }
         std::set<std::string> unique;
         for (const auto& site : options.capture_sites) {
-            if ((site != "prompt_last" && site != "completion_last") || !unique.insert(site).second) {
+            if ((site != "prompt_last" && site != "completion_last") ||
+                !unique.insert(site).second) {
                 throw std::invalid_argument("invalid or duplicate capture site: " + site);
             }
         }
@@ -308,15 +309,16 @@ std::string resource_text(artifact::Binder& binder, std::string_view role) {
 ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
                                   artifact::Reader& reader,
                                   std::chrono::steady_clock::time_point start) {
-    // One lane until the program batches; the KV cache keeps every layer at full length.
+    // One lane until the program batches. Global layers keep full-length KV; sliding layers use a
+    // fixed ring, counted in the fixed bytes.
     options.max_concurrency = 1;
     if (options.kv_cache != KvCacheStorage::BFloat16) {
         throw std::invalid_argument("gemma4 KV cache is bf16 only");
     }
     artifact::Binder binder(reader);
     const std::string tokenizer = resource_text(binder, "tokenizer.json");
-    const std::string chat = resource_text(binder, "chat_template.jinja");
-    auto loaded = std::make_unique<models::gemma4::LoadedText>(
+    const std::string chat      = resource_text(binder, "chat_template.jinja");
+    auto loaded                 = std::make_unique<models::gemma4::LoadedText>(
         models::gemma4::load_text(options.artifact_path.string(), device));
     device.synchronize();
     std::set<std::string> formats;
@@ -328,10 +330,10 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
             formats.emplace(artifact::format_name(weight->qtype));
         }
     }
-    const std::size_t kHeadroom = options.kv_capacity.mode == KvCapacityMode::Automatic &&
+    const std::size_t kHeadroom  = options.kv_capacity.mode == KvCapacityMode::Automatic &&
                                           options.kv_capacity.automatic_headroom_bytes != 0
-                                      ? options.kv_capacity.automatic_headroom_bytes
-                                      : std::size_t{3} << 30U;
+                                       ? options.kv_capacity.automatic_headroom_bytes
+                                       : std::size_t{3} << 30U;
     const std::size_t free_bytes = current_free_device_bytes();
     const std::size_t fixed = models::gemma4::Program::fixed_bytes(*loaded, options.prefill_chunk);
     const std::size_t per_token = models::gemma4::Program::kv_bytes_per_token(*loaded);
@@ -340,41 +342,45 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
     std::uint64_t tokens = std::min<std::uint64_t>(options.max_context, fit / 64U * 64U);
     if (options.kv_capacity.mode == KvCapacityMode::Explicit) {
         if (options.kv_capacity.explicit_tokens > fit) {
-            throw std::invalid_argument("gemma4 explicit KV capacity does not fit in device memory");
+            throw std::invalid_argument(
+                "gemma4 explicit KV capacity does not fit in device memory");
         }
         tokens = std::min<std::uint64_t>(tokens, options.kv_capacity.explicit_tokens);
     }
-    if (tokens < 64) { throw std::invalid_argument("gemma4 KV capacity does not fit in device memory"); }
+    if (tokens < 64) {
+        throw std::invalid_argument("gemma4 KV capacity does not fit in device memory");
+    }
     options.max_context = static_cast<std::uint32_t>(tokens);
-    auto program = std::make_unique<models::gemma4::Program>(
-        *loaded, options.max_context, options.prefill_chunk, device.stream);
+    auto program        = std::make_unique<models::gemma4::Program>(*loaded, options.max_context,
+                                                                    options.prefill_chunk, device.stream);
     device.synchronize();
-    auto instance = std::make_unique<Gemma4Instance>(
-        std::move(loaded), models::gemma4::Frontend(tokenizer, chat), std::move(program),
-        options.max_context);
+    auto instance                         = std::make_unique<Gemma4Instance>(std::move(loaded),
+                                                                             models::gemma4::Frontend(tokenizer, chat),
+                                                                             std::move(program), options.max_context);
     instance->kv_capacity_resolution.mode = options.kv_capacity.mode;
-    instance->kv_capacity_resolution.resolved_tokens = options.max_context;
+    instance->kv_capacity_resolution.resolved_tokens  = options.max_context;
     instance->kv_capacity_resolution.main_page_groups = (options.max_context + 63U) / 64U;
     instance->kv_capacity_resolution.maximum_main_page_groups =
         instance->kv_capacity_resolution.main_page_groups;
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
-    const std::string signature = "gemma4-prefill-1";
-    auto context_cost = resolve_context_machine_cost(
-        {.hardware_class = context_cost_hardware_class(device.props.name, device.props.major,
-                                                       device.props.minor),
-         .prefill_signature = signature},
+    const std::string signature                                    = "gemma4-prefill-1";
+    auto context_cost                                              = resolve_context_machine_cost(
+        {.hardware_class =
+                                                          context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
+                                                      .prefill_signature = signature},
         options.context_cost.preset_path);
     options.context_cache.host_capacity_bytes = 0;
     LoadSummary summary;
     summary.architecture = std::string(models::architecture_name(models::Architecture::Gemma4));
-    summary.model_name = reader.directory().metadata.value("name", std::string("gemma4"));
+    summary.model_name   = reader.directory().metadata.value("name", std::string("gemma4"));
     summary.prefill_signature = signature;
     summary.weight_formats.assign(formats.begin(), formats.end());
-    summary.load_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    summary.load_seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.context_cost = std::move(context_cost.summary);
     ConstructedModel constructed;
-    constructed.gemma = std::move(instance);
-    constructed.load = std::move(summary);
+    constructed.gemma        = std::move(instance);
+    constructed.load         = std::move(summary);
     constructed.context_cost = std::move(context_cost.model);
     log_startup_memory(options);
     return constructed;

@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/decode_graph.h"
 #include "models/gemma4/execution/text_forward.h"
+#include "models/gemma4/program/sliding_ring.h"
 #include "models/gemma4/program/top_tokens.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/sampling.h"
@@ -48,6 +49,20 @@ std::size_t layer_bytes(const LoadedText& model, std::uint32_t chunk) {
     return widest;
 }
 
+// The widest sliding window, 0 when every layer is global.
+int sliding_window(const LoadedText& model) {
+    int window = 0;
+    for (const Gemma4LayerWeights& layer : model.layers) {
+        if (!layer.global_layer) { window = std::max(window, layer.window); }
+    }
+    return window;
+}
+
+std::size_t layer_kv_bytes(const Gemma4LayerWeights& layer, int pages) {
+    return 2U * static_cast<std::size_t>(layer.head_dim) * kKvPageTokens *
+           static_cast<std::size_t>(layer.kv_heads) * static_cast<std::size_t>(pages) * 2U;
+}
+
 } // namespace
 
 struct Program::Impl {
@@ -64,6 +79,7 @@ struct Program::Impl {
     DeviceBuffer pos_buf;
     DeviceBuffer hidden_buf;
     DeviceBuffer table_buf;
+    DeviceBuffer ring_table_buf;
     DeviceBuffer config_buf;
     DeviceBuffer counts_buf;
     // One-token decode step as a CUDA graph. step_buf holds the token id, its position and the
@@ -77,6 +93,13 @@ struct Program::Impl {
     std::vector<Tensor> k_pages;
     std::vector<Tensor> v_pages;
     Tensor block;
+    // Sliding layers: `ring_pages` physical pages behind `ring_block`. ring_high is the highest
+    // position written since the cache last restarted at 0; a slot may hold it instead of the
+    // position ring_pages * 64 below.
+    int window     = 0;
+    int ring_pages = 0;
+    Tensor ring_block;
+    std::int64_t ring_high = -1;
     std::vector<Gemma4CacheLayer> caches;
 
     bool binding = false;
@@ -123,36 +146,36 @@ struct Program::Impl {
         config_buf = DeviceBuffer(sizeof(ops::SamplingConfig));
         counts_buf = DeviceBuffer(static_cast<std::size_t>(vocab) * 4);
         step_buf   = DeviceBuffer(3 * sizeof(std::int32_t));
-        std::vector<std::int32_t> table(static_cast<std::size_t>(pages));
-        for (int page = 0; page < pages; ++page) { table[static_cast<std::size_t>(page)] = page; }
-        table_buf = DeviceBuffer(table.size() * 4);
+        window     = sliding_window(loaded);
+        ring_pages = window > 0 ? std::min(pages, sliding_ring_pages(chunk, window)) : pages;
+        const std::vector<std::int32_t> table = ring_block_table(pages, pages);
+        table_buf                             = DeviceBuffer(table.size() * 4);
         table_buf.copy_from_host(table.data(), table_buf.bytes);
-        block = Tensor(table_buf.p, DType::I32, {pages});
+        block                                = Tensor(table_buf.p, DType::I32, {pages});
+        const std::vector<std::int32_t> ring = ring_block_table(pages, ring_pages);
+        ring_table_buf                       = DeviceBuffer(ring.size() * 4);
+        ring_table_buf.copy_from_host(ring.data(), ring_table_buf.bytes);
+        ring_block = Tensor(ring_table_buf.p, DType::I32, {pages});
         k_store.reserve(loaded.layers.size());
         v_store.reserve(loaded.layers.size());
         k_pages.reserve(loaded.layers.size());
         v_pages.reserve(loaded.layers.size());
         caches.reserve(loaded.layers.size());
         for (const Gemma4LayerWeights& layer : loaded.layers) {
-            const std::size_t bytes = static_cast<std::size_t>(layer.head_dim) * 64U *
-                                      static_cast<std::size_t>(layer.kv_heads) *
-                                      static_cast<std::size_t>(pages) * 2U;
+            const int layer_pages   = layer.global_layer ? pages : ring_pages;
+            const std::size_t bytes = layer_kv_bytes(layer, layer_pages) / 2U;
             k_store.emplace_back(bytes);
             v_store.emplace_back(bytes);
             k_store.back().fill(0);
             v_store.back().fill(0);
+            const std::initializer_list<std::int32_t> shape{layer.head_dim, kKvPageTokens,
+                                                            layer.kv_heads, layer_pages};
+            k_pages.emplace_back(k_store.back().p, DType::BF16, shape);
+            v_pages.emplace_back(v_store.back().p, DType::BF16, shape);
         }
         for (std::size_t index = 0; index < loaded.layers.size(); ++index) {
-            const Gemma4LayerWeights& layer = loaded.layers[index];
-            k_pages.emplace_back(
-                k_store[index].p, DType::BF16,
-                std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads, pages});
-            v_pages.emplace_back(
-                v_store[index].p, DType::BF16,
-                std::initializer_list<std::int32_t>{layer.head_dim, 64, layer.kv_heads, pages});
-        }
-        for (std::size_t index = 0; index < loaded.layers.size(); ++index) {
-            caches.push_back({&k_pages[index], &v_pages[index], &block});
+            const Tensor* table_of = loaded.layers[index].global_layer ? &block : &ring_block;
+            caches.push_back({&k_pages[index], &v_pages[index], table_of});
         }
     }
 
@@ -192,6 +215,12 @@ struct Program::Impl {
         gemma4_layers(id_tensor, hidden_tensor, model->token_embedding, model->layers, caches,
                       position_tensor, gemm, workspace, stream);
         resident.insert(resident.end(), ids, ids + count);
+        note_written(first, count);
+    }
+
+    void note_written(std::uint32_t first, std::uint32_t count) {
+        const std::int64_t last = static_cast<std::int64_t>(first) + count - 1;
+        ring_high               = first == 0 ? last : std::max(ring_high, last);
     }
 
     // Prompt tokens whose K/V can be kept from the resident cache. At least the last prompt
@@ -201,6 +230,12 @@ struct Program::Impl {
         const std::size_t limit = std::min(resident.size(), request.tokens.size() - 1);
         std::size_t length      = 0;
         while (length < limit && resident[length] == request.tokens[length]) { ++length; }
+        // The sliding window before the reuse point must still be in the ring.
+        const std::int64_t oldest =
+            std::max<std::int64_t>(0, static_cast<std::int64_t>(length) - (window - 1));
+        if (length > 0 && oldest + std::int64_t{ring_pages} * kKvPageTokens <= ring_high) {
+            return 0;
+        }
         return static_cast<std::uint32_t>(length);
     }
 
@@ -286,6 +321,7 @@ struct Program::Impl {
         decode_graph.launch(stream);
         check(cudaStreamSynchronize(stream), "decode sync");
         resident.push_back(id);
+        note_written(fed, 1);
         return host[3];
     }
 
@@ -343,14 +379,23 @@ Program::~Program() = default;
 std::size_t Program::kv_bytes_per_token(const LoadedText& model) {
     std::size_t bytes = 0;
     for (const Gemma4LayerWeights& layer : model.layers) {
-        bytes += 2U * static_cast<std::size_t>(layer.head_dim) * layer.kv_heads * 2U;
+        if (layer.global_layer) {
+            bytes += 2U * static_cast<std::size_t>(layer.head_dim) * layer.kv_heads * 2U;
+        }
     }
     return bytes;
 }
 
 std::size_t Program::fixed_bytes(const LoadedText& model, std::uint32_t prefill_chunk) {
     const std::uint32_t chunk = std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk);
-    return Impl::workspace_bytes(model, chunk) +
+    const int window          = sliding_window(model);
+    std::size_t rings         = 0;
+    for (const Gemma4LayerWeights& layer : model.layers) {
+        if (!layer.global_layer) {
+            rings += layer_kv_bytes(layer, sliding_ring_pages(chunk, window));
+        }
+    }
+    return Impl::workspace_bytes(model, chunk) + rings +
            static_cast<std::size_t>(model.hidden) * chunk * 2U +
            static_cast<std::size_t>(model.vocab) * 4U;
 }

@@ -4,6 +4,7 @@
 #include "core/device.h"
 #include "models/gemma4/execution/text_forward.h"
 #include "models/gemma4/load.h"
+#include "models/gemma4/program/sliding_ring.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ops/op_tester.h"
@@ -72,40 +73,51 @@ int argmax(const std::vector<float>& values) {
     return static_cast<int>(std::max_element(values.begin(), values.end()) - values.begin());
 }
 
-// Per-layer paged KV for one sequence with an identity block table.
+// Per-layer paged KV for one sequence with an identity block table. With `ring_pages`, sliding
+// layers use the program's ring of that many pages instead.
 struct Cache {
     std::vector<ninfer::DeviceBuffer> k_store;
     std::vector<ninfer::DeviceBuffer> v_store;
     std::vector<ninfer::Tensor> k_pages;
     std::vector<ninfer::Tensor> v_pages;
     ninfer::DeviceBuffer table_buf;
+    ninfer::DeviceBuffer ring_buf;
     ninfer::Tensor table;
+    ninfer::Tensor ring;
     std::vector<g4::Gemma4CacheLayer> layers;
 
-    Cache(const g4::LoadedText& loaded, int pages)
+    Cache(const g4::LoadedText& loaded, int pages, int ring_pages = 0)
         : table_buf(static_cast<std::size_t>(pages) * 4),
-          table(nullptr, ninfer::DType::I32, {pages}) {
-        std::vector<std::int32_t> ids(static_cast<std::size_t>(pages));
-        for (int i = 0; i < pages; ++i) { ids[static_cast<std::size_t>(i)] = i; }
+          ring_buf(static_cast<std::size_t>(pages) * 4),
+          table(nullptr, ninfer::DType::I32, {pages}), ring(nullptr, ninfer::DType::I32, {pages}) {
+        if (ring_pages <= 0) { ring_pages = pages; }
+        const auto ids = g4::ring_block_table(pages, pages);
         table_buf.copy_from_host(ids.data(), table_buf.bytes);
-        table                   = ninfer::Tensor(table_buf.p, ninfer::DType::I32, {pages});
+        table               = ninfer::Tensor(table_buf.p, ninfer::DType::I32, {pages});
+        const auto ring_ids = g4::ring_block_table(pages, ring_pages);
+        ring_buf.copy_from_host(ring_ids.data(), ring_buf.bytes);
+        ring                    = ninfer::Tensor(ring_buf.p, ninfer::DType::I32, {pages});
         const std::size_t count = loaded.layers.size();
         k_store.reserve(count);
         v_store.reserve(count);
         k_pages.reserve(count);
         v_pages.reserve(count);
         for (const auto& layer : loaded.layers) {
+            const int layer_pages   = layer.global_layer ? pages : ring_pages;
             const std::size_t bytes = static_cast<std::size_t>(layer.head_dim) * kPage *
-                                      static_cast<std::size_t>(layer.kv_heads) * pages * 2;
+                                      static_cast<std::size_t>(layer.kv_heads) * layer_pages * 2;
             k_store.emplace_back(bytes);
             v_store.emplace_back(bytes);
+            k_store.back().fill(0);
+            v_store.back().fill(0);
             const std::initializer_list<std::int32_t> shape{layer.head_dim, kPage, layer.kv_heads,
-                                                            pages};
+                                                            layer_pages};
             k_pages.emplace_back(k_store.back().p, ninfer::DType::BF16, shape);
             v_pages.emplace_back(v_store.back().p, ninfer::DType::BF16, shape);
         }
         for (std::size_t i = 0; i < count; ++i) {
-            layers.push_back({&k_pages[i], &v_pages[i], &table});
+            layers.push_back(
+                {&k_pages[i], &v_pages[i], loaded.layers[i].global_layer ? &table : &ring});
         }
     }
 };
@@ -368,6 +380,48 @@ int run_prompt(Runner& runner, const fs::path& dir, const std::string& name) {
     return ok ? 0 : 1;
 }
 
+// Sliding layers on a ring that wraps several times give the same logits, bit for bit, as
+// full-length sliding KV: only the physical pages differ. Chunked prefill, then decode steps.
+int ring_check(Runner& runner, const std::vector<int>& seed) {
+    constexpr int kChunk  = 256;
+    constexpr int kTokens = 3200;
+    constexpr int kDecode = 4;
+    int window            = 0;
+    for (const auto& layer : runner.loaded.layers) {
+        if (!layer.global_layer) { window = std::max(window, layer.window); }
+    }
+    std::vector<int> ids;
+    while (static_cast<int>(ids.size()) < kTokens) {
+        ids.insert(ids.end(), seed.begin(), seed.end());
+    }
+    ids.resize(kTokens);
+    const int pages      = (kTokens + kDecode) / kPage + 1;
+    const int ring_pages = g4::sliding_ring_pages(kChunk, window);
+    Cache full(runner.loaded, pages);
+    Cache ring(runner.loaded, pages, ring_pages);
+    std::size_t mismatches = 0;
+    std::vector<float> last;
+    for (int first = 0; first < kTokens; first += kChunk) {
+        const std::vector<int> part(ids.begin() + first,
+                                    ids.begin() + std::min(kTokens, first + kChunk));
+        last               = runner.forward(full, part, first);
+        const auto wrapped = runner.forward(ring, part, first);
+        mismatches += std::memcmp(last.data(), wrapped.data(), last.size() * 4) != 0;
+    }
+    const std::size_t vocab = static_cast<std::size_t>(runner.loaded.vocab);
+    for (int step = 0; step < kDecode; ++step) {
+        const std::vector<float> column(last.end() - static_cast<std::ptrdiff_t>(vocab),
+                                        last.end());
+        const int token    = argmax(column);
+        last               = runner.forward(full, {token}, kTokens + step);
+        const auto wrapped = runner.forward(ring, {token}, kTokens + step);
+        mismatches += std::memcmp(last.data(), wrapped.data(), last.size() * 4) != 0;
+    }
+    std::cout << "ring " << ring_pages << " pages over " << kTokens << " tokens: " << mismatches
+              << " forwards differ\n";
+    return mismatches == 0 ? 0 : 1;
+}
+
 } // namespace
 
 int main() {
@@ -388,9 +442,14 @@ int main() {
         int failures = 0;
         {
             Runner runner(loaded, stream);
+            std::vector<int> seed;
             for (const auto& entry : index) {
-                failures += run_prompt(runner, dir, entry.at("name").get<std::string>());
+                const std::string name = entry.at("name").get<std::string>();
+                failures += run_prompt(runner, dir, name);
+                const auto ids = read_raw<std::int32_t>(dir / (name + ".ids"));
+                seed.insert(seed.end(), ids.begin(), ids.end());
             }
+            failures += ring_check(runner, seed);
         }
         cudaStreamDestroy(stream);
         std::cout << (failures ? "FAIL" : "OK") << " gemma4 parity\n";
