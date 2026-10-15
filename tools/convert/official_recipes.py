@@ -208,16 +208,17 @@ def gemma4_attention(config, name):
 
 
 def _gemma4_quantized(model, recipe, trunk, *, values=None, mlp=None, fp8=None):
-    """FP8 embedding and head; every text-layer projection gets `trunk(name)`.
+    """FP8 embedding and heads; every text-layer projection gets `trunk(name)`.
 
     `values` replaces the base checkpoint for every text parameter. `mlp` imports the MLP's
     encoded NVFP4 words from that checkpoint instead of quantizing them. `fp8(config, name)`
-    selects projections that stay FP8 instead of `trunk`. Other components stay direct.
+    selects projections that stay FP8 instead of `trunk`. The MTP output head is FP8 like the
+    target head. Other MTP parameters stay direct.
     """
     for name, parameter in model.parameters.items():
         text = name.startswith("text/")
         source = None if values is None or not text else model.source(name, values)
-        if name in ("text/token_embedding", "text/output_head"):
+        if name in ("text/token_embedding", "text/output_head", "mtp/output_head"):
             recipe.assign(name, format=FP8, method=fp8_row_maxabs, source=source)
         elif name.startswith("text/layers/") and parameter.projection:
             if fp8 is not None and fp8(model.config, name):

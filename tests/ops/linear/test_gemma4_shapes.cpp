@@ -77,6 +77,13 @@ int run_gemma4_shapes() {
     failures += run_shape("Gemma4 FP8_A16 head", ActivationCompute::A16, make_fp8_weight,
                           {262144, 5376, seed++, Comparison::Sampled, true, a16});
     failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, 262144, 5376);
+    std::vector<Invocation> draft_head;
+    for (int t : {1, 8, 16, 32, 33}) draft_head.push_back({t});
+    draft_head.push_back({1, CallForm::A16Convenience});
+    draft_head.push_back({1, CallForm::Policy, ops::LinearPolicy::A16Only, true});
+    failures += run_shape("Gemma4 FP8_A16 draft head", ActivationCompute::A16, make_fp8_weight,
+                          {262144, 1024, seed++, Comparison::Sampled, true, draft_head});
+    failures += verify_workspace_envelopes(QType::FP8_E4M3FN_ROW_BF16, 262144, 1024);
     return failures;
 }
 

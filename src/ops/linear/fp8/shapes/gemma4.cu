@@ -1,6 +1,6 @@
-// Gemma 4 31B projections and output head in the row-scaled FP8 profile. A16 runs on the dense
+// Gemma 4 31B projections and output heads in the row-scaled FP8 profile. A16 runs on the dense
 // routes of fp8_dense_a16.cuh (not yet tuned). The trunk projections also admit A8 from 128
-// tokens (gemma4_a8.h); the head stays A16.
+// tokens (gemma4_a8.h); both vocabulary heads stay A16.
 #include "ops/linear/fp8/fp8_dense_a16.cuh"
 #include "ops/linear/fp8/shapes/gemma4_a8.h"
 
@@ -23,4 +23,5 @@ const Fp8LinearShape kFp8N5376K8192   = trunk<5376, 8192>();
 const Fp8LinearShape kFp8N5376K16384  = trunk<5376, 16384>();
 const Fp8LinearShape kFp8N5376K21504  = trunk<5376, 21504>();
 const Fp8LinearShape kFp8N262144K5376 = fp8_dense::shape<262144, 5376>();
+const Fp8LinearShape kFp8N262144K1024 = fp8_dense::shape<262144, 1024>();
 } // namespace ninfer::ops::detail

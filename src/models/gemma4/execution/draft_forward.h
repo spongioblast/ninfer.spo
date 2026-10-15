@@ -13,7 +13,8 @@ namespace ninfer::models::gemma4 {
 struct Gemma4DraftWeights {
     Weight input_projection;  // [hidden, 2*backbone] over [token embedding; carried state]
     Weight output_projection; // [backbone, hidden]
-    Weight output_head;       // [vocab, hidden]
+    Weight output_head;       // [vocab, hidden]; FP8 when the registered 262144x1024 GEMV exists
+    DeviceBuffer quantized_head; // owns the FP8 payload if the artifact stored the head as BF16
     const void* final_norm = nullptr;
     std::vector<Gemma4LayerWeights> layers;
     std::vector<int> kv_source;

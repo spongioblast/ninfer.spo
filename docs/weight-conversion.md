@@ -58,12 +58,12 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `gemma4_31b_bf16` | Gemma 4 31B text, every parameter in its direct format | None |
-| `gemma4_31b_fp8` | FP8 row projections, FP8 embedding and head | None |
-| `gemma4_31b_nvfp4_base` | NVFP4 4/6 MSE projections, FP8 embedding and head | None |
+| `gemma4_31b_fp8` | FP8 row projections, FP8 embedding, target head, and MTP head | None |
+| `gemma4_31b_nvfp4_base` | NVFP4 4/6 MSE projections, FP8 embedding, target head, and MTP head | None |
 | `gemma4_31b_nvfp4_qat` | As `nvfp4_base`, quantized from Google's QAT BF16 weights | `qat` |
 | `gemma4_31b_nvfp4_nvidia` | As `nvfp4_base`, MLP words imported from NVIDIA ModelOpt NVFP4 | `quantized` |
 | `gemma4_31b_nvfp4_mixed` | As `nvfp4_base`, but layers 0-1 and the last two, and global-layer attention, in FP8 | None |
-| `gemma4_31b_nvfp4_mlp` | NVFP4 MLP, FP8 attention, FP8 embedding and head | None |
+| `gemma4_31b_nvfp4_mlp` | NVFP4 MLP, FP8 attention, FP8 embedding, target head, and MTP head | None |
 
 The Gemma 4 recipes pack Q/K/V (Q/K on global layers) and gate/up into one stored matrix each.
 `gemma4_nvfp4_a4` is an override for the NVFP4 Gemma recipes: it permits A4 on every NVFP4 text

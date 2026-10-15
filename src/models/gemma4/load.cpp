@@ -5,6 +5,7 @@
 #include "artifact/reader.h"
 #include "artifact/views.h"
 #include "core/device.h"
+#include "ninfer/ops/fp8_row_quantize.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <optional>
@@ -163,7 +164,7 @@ DraftRefs bind_draft(artifact::Binder& binder, const artifact::Json& config, int
 }
 
 std::unique_ptr<Gemma4DraftWeights> finish_draft(const artifact::MaterializedArtifact& artifact,
-                                                 const DraftRefs& refs) {
+                                                 const DraftRefs& refs, cudaStream_t stream) {
     const auto& config = refs.config;
     auto draft = std::make_unique<Gemma4DraftWeights>();
     draft->hidden = config_int(config, "hidden_size");
@@ -173,6 +174,12 @@ std::unique_ptr<Gemma4DraftWeights> finish_draft(const artifact::MaterializedArt
     draft->input_projection = single_weight(artifact, refs.outer[0]);
     draft->output_projection = single_weight(artifact, refs.outer[1]);
     draft->output_head = single_weight(artifact, refs.outer[2]);
+    // The MTP head is 262144x1024. The registered FP8 GEMV is that shape; a BF16 artifact is
+    // quantized here so a reconvert is not required.
+    if (draft->output_head.qtype == QType::BF16 && draft->output_head.n == 262144 &&
+        draft->output_head.k == 1024) {
+        ops::quantize_fp8_row_bf16(draft->output_head, draft->quantized_head, stream);
+    }
     draft->final_norm = device_data(artifact, refs.outer[3]);
     const auto& kinds = config.at("layer_types");
     for (std::size_t layer = 0; layer < refs.layers.size(); ++layer) {
@@ -368,7 +375,7 @@ LoadedText load_text(const std::string& artifact_path, DeviceContext& device, bo
         loaded.layers[static_cast<std::size_t>(layer)] = weights;
     }
     if (draft) {
-        loaded.draft = finish_draft(*loaded.artifact, *draft);
+        loaded.draft = finish_draft(*loaded.artifact, *draft, device.stream);
         if (loaded.draft->backbone != hidden || loaded.draft->vocab != vocab) {
             throw std::invalid_argument("gemma4 load: mtp does not match the target");
         }

@@ -564,8 +564,13 @@ def test_assistant_reads_target_kv_and_permutes_global_queries(tmp_path):
         convert(model, recipe, out, device="cpu", rows_per_chunk=128)
     with Artifact(out) as artifact:
         assert artifact.directory.components["mtp"]["target"] == "text"
-        for name in ("mtp/input_projection", "mtp/output_head", "mtp/layers/1/attention/query"):
-            assert artifact.by_id[_objects(artifact, name)[0][0]].format == "bf16"
+        assert artifact.by_id[_objects(artifact, "mtp/input_projection")[0][0]].format == "bf16"
+        assert artifact.by_id[_objects(artifact, "mtp/output_head")[0][0]].format == (
+            "fp8_e4m3fn_row_bf16"
+        )
+        assert artifact.by_id[_objects(artifact, "mtp/layers/1/attention/query")[0][0]].format == (
+            "bf16"
+        )
         _packed(artifact, ["mtp/layers/0/mlp/gate", "mtp/layers/0/mlp/up"])
         for use in artifact.directory.uses:
             if use["parameter"].startswith("mtp/"):
