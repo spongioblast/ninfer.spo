@@ -45,6 +45,13 @@ constexpr std::uint32_t kMinChunk = 16;
 constexpr std::uint32_t kMaxChunk = 16384;
 // A round verifies the anchor and its drafts in one forward of at most kMinChunk tokens.
 constexpr std::uint32_t kMaxDraftTokens = kMinChunk - 1;
+// Round slots: the drafter's position, the anchor then the drafts (the verify ids), the verify
+// positions, and the verify argmax.
+constexpr std::size_t kRoundPosition = 0;
+constexpr std::size_t kRoundIds      = 1;
+constexpr std::size_t kRoundVerify   = kRoundIds + kMinChunk;
+constexpr std::size_t kRoundOut      = kRoundVerify + kMinChunk;
+constexpr std::size_t kRoundSlots    = kRoundOut + kMinChunk;
 
 // Workspace bytes of the widest layer for a `chunk`-token prefill.
 std::size_t layer_bytes(const LoadedText& model, std::uint32_t chunk) {
@@ -139,8 +146,12 @@ struct Program::Impl {
     std::uint32_t round_drafts = 0;
     std::uint32_t round_agreed = 0;
     DeviceBuffer carry_buf;
-    // I32 anchor, position, then one slot per draft.
-    DeviceBuffer draft_buf;
+    // I32 round slots (kRound* offsets), mirrored in round_host. A round with draft_tokens
+    // drafts runs as one CUDA graph; a shorter one near the budget or capacity runs eagerly.
+    DeviceBuffer round_buf;
+    PinnedHostBuffer round_host{kRoundSlots * sizeof(std::int32_t)};
+    DecodeGraphDefinition round_definition;
+    DecodeGraphExecutable round_graph;
     std::vector<TokenId> round_ids;
     SpeculativeStats spec_stats;
 
@@ -168,7 +179,7 @@ struct Program::Impl {
         }
         if (draft_tokens > 0) {
             carry_buf = DeviceBuffer(static_cast<std::size_t>(hidden) * 2);
-            draft_buf = DeviceBuffer((2U + kMaxDraftTokens) * sizeof(std::int32_t));
+            round_buf = DeviceBuffer(kRoundSlots * sizeof(std::int32_t));
         }
         pages      = static_cast<int>((capacity + 63U) / 64U);
         id_buf     = DeviceBuffer(static_cast<std::size_t>(chunk) * 4);
@@ -398,22 +409,31 @@ struct Program::Impl {
                      model->rms_eps, false, carry, stream);
     }
 
-    // Drafts from carry_buf at position fed - 1 into draft_buf slots [2, 2 + count).
-    void draft(std::uint32_t count) {
-        std::int32_t head[2] = {next_id, static_cast<std::int32_t>(fed) - 1};
-        check(cudaMemcpyAsync(draft_buf.p, head, sizeof(head), cudaMemcpyHostToDevice, stream),
-              "draft upload");
-        auto* slots = static_cast<std::int32_t*>(draft_buf.p);
-        const Tensor position(slots + 1, DType::I32, {1});
+    // Drafts `drafts` tokens from carry_buf, then verifies the anchor and the drafts in one
+    // forward and writes the argmax of every column. Reads and writes only round_buf, carry_buf,
+    // hidden_buf, the caches and the workspace, so it can be captured once and replayed.
+    void round_body(std::uint32_t drafts) {
+        workspace.reset();
+        auto* slots = static_cast<std::int32_t*>(round_buf.p);
+        const Tensor position(slots + kRoundPosition, DType::I32, {1});
         Tensor carry(carry_buf.p, DType::BF16, {hidden, 1});
-        for (std::uint32_t step = 0; step < count; ++step) {
-            workspace.reset();
-            const Tensor token(step == 0 ? slots : slots + 1 + step, DType::I32, {1});
-            Tensor next(slots + 2 + step, DType::I32, {1});
+        for (std::uint32_t step = 0; step < drafts; ++step) {
+            const Tensor token(slots + kRoundIds + step, DType::I32, {1});
+            Tensor next(slots + kRoundIds + step + 1, DType::I32, {1});
             gemma4_draft_step(token, position, carry, next, model->token_embedding, *model->draft,
                               caches, gemm, workspace, stream);
         }
-        check(cudaStreamSynchronize(stream), "draft sync");
+        const auto width = static_cast<std::int32_t>(drafts + 1U);
+        const Tensor ids(slots + kRoundIds, DType::I32, {width});
+        const Tensor positions(slots + kRoundVerify, DType::I32, {width});
+        Tensor columns(hidden_buf.p, DType::BF16, {hidden, width});
+        gemma4_layers(ids, columns, model->token_embedding, model->layers, caches, positions, gemm,
+                      workspace, stream);
+        Tensor logits = workspace.alloc(DType::BF16, {vocab, width});
+        Tensor out(slots + kRoundOut, DType::I32, {width});
+        gemma4_logits(columns, logits, model->final_norm, model->output_head, model->softcap,
+                      model->rms_eps, gemm, workspace, stream);
+        ops::argmax(logits, out, vocab, stream);
     }
 
     PendingBatch speculative_round(std::uint32_t remaining,
@@ -421,28 +441,37 @@ struct Program::Impl {
         const std::uint32_t room = std::min(capacity - fed, chunk);
         const std::uint32_t drafts =
             std::min({draft_tokens, remaining > 0 ? remaining - 1U : 0U, room - 1U});
-        round_ids.assign(drafts + 1U, 0);
-        round_ids[0] = next_id;
-        if (drafts > 0) {
-            draft(drafts);
-            check(cudaMemcpy(round_ids.data() + 1, static_cast<std::int32_t*>(draft_buf.p) + 2,
-                             static_cast<std::size_t>(drafts) * 4, cudaMemcpyDeviceToHost),
-                  "draft copy");
-        }
         const std::uint32_t width = drafts + 1U;
-        run_layers(round_ids.data(), fed, width);
-        workspace.reset();
-        Tensor logits = workspace.alloc(DType::BF16, {vocab, static_cast<std::int32_t>(width)});
-        Tensor out    = workspace.alloc(DType::I32, {static_cast<std::int32_t>(width)});
-        gemma4_logits(hidden_columns(0, static_cast<std::int32_t>(width)), logits,
-                      model->final_norm, model->output_head, model->softcap, model->rms_eps, gemm,
-                      workspace, stream);
-        ops::argmax(logits, out, vocab, stream);
-        pending_tokens.assign(width, 0);
-        check(cudaMemcpyAsync(pending_tokens.data(), out.data, static_cast<std::size_t>(width) * 4,
+        if (fed == 0 || fed > resident.size()) {
+            throw std::logic_error("gemma4 round is outside the resident cache");
+        }
+        auto* host                  = static_cast<std::int32_t*>(round_host.data());
+        host[kRoundPosition]        = static_cast<std::int32_t>(fed) - 1;
+        host[kRoundIds]             = next_id;
+        for (std::uint32_t index = 0; index < width; ++index) {
+            host[kRoundVerify + index] = static_cast<std::int32_t>(fed + index);
+        }
+        check(cudaMemcpyAsync(round_buf.p, host, kRoundOut * sizeof(std::int32_t),
+                              cudaMemcpyHostToDevice, stream),
+              "round upload");
+        if (drafts == draft_tokens) {
+            if (!round_graph.ready()) {
+                round_definition.capture(stream, [this, drafts] { round_body(drafts); });
+                round_graph.instantiate(round_definition);
+            }
+            round_graph.launch(stream);
+        } else {
+            round_body(drafts);
+        }
+        check(cudaMemcpyAsync(host, round_buf.p, kRoundSlots * sizeof(std::int32_t),
                               cudaMemcpyDeviceToHost, stream),
-              "verify copy");
-        check(cudaStreamSynchronize(stream), "verify sync");
+              "round copy");
+        check(cudaStreamSynchronize(stream), "round sync");
+        round_ids.assign(host + kRoundIds, host + kRoundIds + width);
+        pending_tokens.assign(host + kRoundOut, host + kRoundOut + width);
+        resident.resize(fed);
+        resident.insert(resident.end(), round_ids.begin(), round_ids.end());
+        note_written(fed, width);
         std::uint32_t agreed = 0;
         while (agreed < drafts && round_ids[agreed + 1U] == pending_tokens[agreed]) { ++agreed; }
         round_drafts   = drafts;
