@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from math import isfinite, prod
 from pathlib import Path
+import json
 import struct
 from typing import Mapping
 
@@ -17,7 +18,7 @@ import torch
 from .model import Model, Parameter
 from .resources import load_resources
 from .sources.compressed_tensors import matrix_source
-from .sources.logical import LogicalSource
+from .sources.logical import LogicalSource, array_source
 from .sources.safetensors import SafetensorsSource, tensor_source
 
 
@@ -37,6 +38,12 @@ def _f32(value, name):
     if not isfinite(result):
         raise ValueError(f"{name}: expected finite F32")
     return result
+
+
+def _nonneg(value, name):
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name}: expected a non-negative integer")
+    return value
 
 
 def prope_perm(head_dim: int, partial_rotary_factor: float) -> torch.Tensor:
@@ -149,6 +156,62 @@ def text_config(source: dict) -> dict:
     if result["prope_theta_eff"] <= 0:
         raise ValueError("proportional RoPE theta must be positive")
     return result
+
+
+def vision_config(source: dict, text: dict) -> dict:
+    raw = source.get("vision_config")
+    if not isinstance(raw, dict):
+        raise ValueError("Gemma 4 vision requires vision_config")
+    if raw.get("hidden_activation") != "gelu_pytorch_tanh":
+        raise ValueError("Gemma 4 vision MLP must be gelu_pytorch_tanh")
+    if raw.get("attention_bias"):
+        raise ValueError("Gemma 4 vision attention is bias-free")
+    if raw.get("standardize") is not True:
+        raise ValueError("Gemma 4 vision requires standardize")
+    hidden = _positive(raw.get("hidden_size"), "vision.hidden_size")
+    heads = _positive(raw.get("num_attention_heads"), "vision.num_attention_heads")
+    kv = _positive(raw.get("num_key_value_heads"), "vision.num_key_value_heads")
+    dim = _positive(raw.get("head_dim"), "vision.head_dim")
+    if hidden != heads * dim or kv != heads:
+        raise ValueError("vision heads, dim, and hidden_size must match")
+    if dim % 4:
+        raise ValueError("vision.head_dim must be divisible by 4 for 2-D RoPE")
+    patch = _positive(raw.get("patch_size"), "vision.patch_size")
+    rope = raw.get("rope_parameters")
+    if not isinstance(rope, dict):
+        raise ValueError("vision.rope_parameters is required")
+    output = source.get("vision_soft_tokens_per_image", raw.get("default_output_length"))
+    return {
+        "model_type": "gemma4_vision",
+        "hidden_size": hidden,
+        "text_hidden_size": text["hidden_size"],
+        "intermediate_size": _positive(
+            raw.get("intermediate_size"), "vision.intermediate_size"
+        ),
+        "num_hidden_layers": _positive(
+            raw.get("num_hidden_layers"), "vision.num_hidden_layers"
+        ),
+        "num_attention_heads": heads,
+        "num_key_value_heads": kv,
+        "head_dim": dim,
+        "patch_size": patch,
+        "patch_pixels": 3 * patch * patch,
+        "pooling_kernel_size": _positive(
+            raw.get("pooling_kernel_size"), "vision.pooling_kernel_size"
+        ),
+        "position_embedding_size": _positive(
+            raw.get("position_embedding_size"), "vision.position_embedding_size"
+        ),
+        "default_output_length": _positive(output, "vision.default_output_length"),
+        "rope_theta": _f32(rope.get("rope_theta", 100.0), "vision.rope_theta"),
+        "rms_norm_eps": _f32(raw.get("rms_norm_eps", 1e-6), "vision.rms_norm_eps"),
+        "standardize": True,
+        "hidden_activation": "gelu_pytorch_tanh",
+        "attention_scale": 1.0,
+        "boi_token_id": _nonneg(source.get("boi_token_id"), "boi_token_id"),
+        "eoi_token_id": _nonneg(source.get("eoi_token_id"), "eoi_token_id"),
+        "image_token_id": _nonneg(source.get("image_token_id"), "image_token_id"),
+    }
 
 
 # The assistant reads the target's K/V, so its attention geometry and RoPE must match.
@@ -351,6 +414,27 @@ class _Builder:
             )
         )
 
+    def add_constant(self, name, values, *, direct="fp32"):
+        data = values.detach().cpu().contiguous()
+        source = array_source(data, name)
+
+        def factory(selected, format=None):
+            if format is not None:
+                raise ValueError(f"{name}: encoded import needs a matrix")
+            return source
+
+        self.model.add(
+            Parameter(
+                name,
+                tuple(data.shape),
+                source,
+                factory,
+                (),
+                direct,
+                residency=name.split("/", 1)[0],
+            )
+        )
+
     def group(self, *names):
         self.model.packing_groups.append(tuple(names))
 
@@ -448,6 +532,92 @@ def _add_assistant(builder: _Builder, config: dict, perm: torch.Tensor) -> None:
         builder.group(stem + "mlp/gate", stem + "mlp/up")
 
 
+def _add_vision(builder: _Builder, config: dict) -> None:
+    """Vision tower, 2-D position table, post-pool standardize, and the 1152→text projection.
+
+    HF stores ClippableLinear as `.linear.weight`. layer_scalar is not in the checkpoint
+    (SGLang defaults it to 1). v_norm is weightless, so it is not a parameter.
+    """
+    hidden = config["hidden_size"]
+    text_hidden = config["text_hidden_size"]
+    heads = config["num_attention_heads"]
+    dim = config["head_dim"]
+    intermediate = config["intermediate_size"]
+    pixels = config["patch_pixels"]
+    positions = config["position_embedding_size"]
+    q_rows = heads * dim
+    builder.add(
+        "vision/patch_projection",
+        "model.vision_tower.patch_embedder.input_proj.weight",
+        (hidden, pixels),
+        inputs=("vision/patch_input",),
+    )
+    builder.add(
+        "vision/position_table",
+        "model.vision_tower.patch_embedder.position_embedding_table",
+        (2, positions, hidden),
+    )
+    builder.add("vision/std_bias", "model.vision_tower.std_bias", (hidden,))
+    builder.add("vision/std_scale", "model.vision_tower.std_scale", (hidden,))
+    builder.add(
+        "vision/embedding_projection",
+        "model.embed_vision.embedding_projection.weight",
+        (text_hidden, hidden),
+        inputs=("vision/pooled_norm",),
+    )
+    for index in range(config["num_hidden_layers"]):
+        stem = f"vision/layers/{index}/"
+        src = f"model.vision_tower.encoder.layers.{index}."
+        for role, source_name, rows, input_name in (
+            ("query", "q_proj", q_rows, "mixer_input"),
+            ("key", "k_proj", q_rows, "mixer_input"),
+            ("value", "v_proj", q_rows, "mixer_input"),
+            ("output", "o_proj", hidden, "attention_output"),
+        ):
+            shape = (hidden, q_rows) if role == "output" else (rows, hidden)
+            builder.add(
+                stem + "attention/" + role,
+                src + f"self_attn.{source_name}.linear.weight",
+                shape,
+                inputs=(stem + input_name,),
+            )
+        for role, source_name in (("query_norm", "q_norm"), ("key_norm", "k_norm")):
+            builder.add(
+                stem + "attention/" + role,
+                src + f"self_attn.{source_name}.weight",
+                (dim,),
+            )
+        for role in ("gate", "up"):
+            builder.add(
+                stem + "mlp/" + role,
+                src + f"mlp.{role}_proj.linear.weight",
+                (intermediate, hidden),
+                inputs=(stem + "ffn_input",),
+            )
+        builder.add(
+            stem + "mlp/down",
+            src + "mlp.down_proj.linear.weight",
+            (hidden, intermediate),
+            inputs=(stem + "mlp/product",),
+        )
+        for role, source_name in (
+            ("input_norm", "input_layernorm"),
+            ("post_attention_norm", "post_attention_layernorm"),
+            ("pre_feedforward_norm", "pre_feedforward_layernorm"),
+            ("post_feedforward_norm", "post_feedforward_layernorm"),
+        ):
+            builder.add(stem + role, src + source_name + ".weight", (hidden,))
+        builder.add_constant(
+            stem + "layer_scalar", torch.ones(1, dtype=torch.float32), direct="fp32"
+        )
+        builder.group(
+            stem + "attention/query",
+            stem + "attention/key",
+            stem + "attention/value",
+        )
+        builder.group(stem + "mlp/gate", stem + "mlp/up")
+
+
 def build_model(
     base: SafetensorsSource,
     *,
@@ -456,10 +626,10 @@ def build_model(
     resource_overrides: Mapping[str, str | Path] | None = None,
 ) -> Model:
     selected = set(components)
-    if "text" not in selected or selected - {"text", "mtp"}:
-        raise ValueError("Gemma 4 supports the text and mtp components")
+    if "text" not in selected or selected - {"text", "mtp", "vision"}:
+        raise ValueError("Gemma 4 supports the text, mtp, and vision components")
     companions = {} if companions is None else dict(companions)
-    if set(companions) - {"mtp"} or set(companions) != selected - {"text"}:
+    if set(companions) - {"mtp"} or ("mtp" in selected) != ("mtp" in companions):
         raise ValueError("Gemma 4 mtp requires --source mtp=ASSISTANT and nothing else")
     config = text_config(base.config)
     records = {"text": {"config": config}}
@@ -468,12 +638,33 @@ def build_model(
             "config": assistant_config(companions["mtp"].config, base.config, config),
             "target": "text",
         }
+    if "vision" in selected:
+        records["vision"] = {"config": vision_config(base.config, config)}
     refs, resources, count, special = load_resources(
         base.root,
         vocab_size=config["vocab_size"],
         overrides=resource_overrides,
     )
     records["text"]["resources"] = refs["text"]
+    if "vision" in selected:
+        processor = base.root / "processor_config.json"
+        data = processor.read_bytes()
+        if not data:
+            raise ValueError(f"{processor}: resource is empty")
+        parsed = json.loads(data.decode("utf-8"))
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{processor}: resource must contain a JSON object")
+        image = parsed.get("image_processor")
+        vision = records["vision"]["config"]
+        if (
+            not isinstance(image, dict)
+            or image.get("patch_size") != vision["patch_size"]
+            or image.get("pooling_kernel_size") != vision["pooling_kernel_size"]
+        ):
+            raise ValueError(f"{processor}: patch or pool size differs from vision_config")
+        object_id = "resource/vision/processor_config.json"
+        records["vision"]["resources"] = {"processor_config.json": object_id}
+        resources[object_id] = data
     model = Model(
         records, resources=resources, token_count=count, special_token_ids=special
     )
@@ -583,6 +774,8 @@ def build_model(
         builder.group(stem + "mlp/gate", stem + "mlp/up")
     if "mtp" in selected:
         _add_assistant(_Builder(model, companions["mtp"]), records["mtp"]["config"], perm)
+    if "vision" in selected:
+        _add_vision(builder, records["vision"]["config"])
     _annotate_k_norm(model)
     if prod(model.parameters["text/token_embedding"].shape) <= 0:
         raise ValueError("empty Gemma 4 embedding")

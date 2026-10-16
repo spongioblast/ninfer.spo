@@ -20,8 +20,8 @@ from tools.convert.sources.safetensors import SafetensorsSource
 NVFP4_DIMS = {"hidden": 128, "inter": 64, "dim": 128}
 
 
-def _config(hidden=16, inter=32, dim=8):
-    return {
+def _config(hidden=16, inter=32, dim=8, vision=False):
+    config = {
         "architectures": ["Gemma4ForConditionalGeneration"],
         "model_type": "gemma4",
         "text_config": {
@@ -51,11 +51,36 @@ def _config(hidden=16, inter=32, dim=8):
             },
         },
     }
+    if vision:
+        config.update(
+            {
+                "boi_token_id": 5,
+                "eoi_token_id": 6,
+                "image_token_id": 7,
+                "vision_soft_tokens_per_image": 4,
+                "vision_config": {
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "num_key_value_heads": 2,
+                    "head_dim": 4,
+                    "patch_size": 2,
+                    "pooling_kernel_size": 3,
+                    "position_embedding_size": 8,
+                    "hidden_activation": "gelu_pytorch_tanh",
+                    "rms_norm_eps": 1e-6,
+                    "standardize": True,
+                    "rope_parameters": {"rope_theta": 100.0, "rope_type": "default"},
+                },
+            }
+        )
+    return config
 
 
-def _checkpoint(path, hidden=16, inter=32, dim=8):
+def _checkpoint(path, hidden=16, inter=32, dim=8, vision=False):
     path.mkdir()
-    (path / "config.json").write_text(json.dumps(_config(hidden, inter, dim)))
+    (path / "config.json").write_text(json.dumps(_config(hidden, inter, dim, vision=vision)))
     vocab = 8
     tensors = {
         "model.language_model.embed_tokens.weight": torch.arange(vocab * hidden)
@@ -102,6 +127,52 @@ def _checkpoint(path, hidden=16, inter=32, dim=8):
         ):
             tensors[src + name + ".weight"] = torch.ones(hidden, dtype=torch.bfloat16)
         tensors[src + "layer_scalar"] = torch.tensor([0.25], dtype=torch.float32)
+    if vision:
+        v_hidden, v_inter, v_dim, patch, pos = 8, 16, 4, 2, 8
+        pixels = 3 * patch * patch
+        q_rows = 2 * v_dim
+        tensors["model.embed_vision.embedding_projection.weight"] = torch.arange(
+            hidden * v_hidden
+        ).reshape(hidden, v_hidden).to(torch.bfloat16)
+        tensors["model.vision_tower.patch_embedder.input_proj.weight"] = torch.arange(
+            v_hidden * pixels
+        ).reshape(v_hidden, pixels).to(torch.bfloat16)
+        tensors["model.vision_tower.patch_embedder.position_embedding_table"] = torch.arange(
+            2 * pos * v_hidden
+        ).reshape(2, pos, v_hidden).to(torch.bfloat16)
+        tensors["model.vision_tower.std_bias"] = torch.arange(v_hidden).to(torch.bfloat16)
+        tensors["model.vision_tower.std_scale"] = (torch.arange(v_hidden) + 1).to(
+            torch.bfloat16
+        )
+        src = "model.vision_tower.encoder.layers.0."
+        tensors[src + "self_attn.q_proj.linear.weight"] = torch.arange(
+            q_rows * v_hidden
+        ).reshape(q_rows, v_hidden).to(torch.bfloat16)
+        tensors[src + "self_attn.k_proj.linear.weight"] = (
+            torch.arange(q_rows * v_hidden).reshape(q_rows, v_hidden) + 1
+        ).to(torch.bfloat16)
+        tensors[src + "self_attn.v_proj.linear.weight"] = (
+            torch.arange(q_rows * v_hidden).reshape(q_rows, v_hidden) + 2
+        ).to(torch.bfloat16)
+        tensors[src + "self_attn.o_proj.linear.weight"] = torch.arange(
+            v_hidden * q_rows
+        ).reshape(v_hidden, q_rows).to(torch.bfloat16)
+        tensors[src + "self_attn.q_norm.weight"] = torch.arange(v_dim).to(torch.bfloat16)
+        tensors[src + "self_attn.k_norm.weight"] = torch.arange(v_dim).to(torch.bfloat16)
+        for role in ("gate", "up"):
+            tensors[src + f"mlp.{role}_proj.linear.weight"] = torch.ones(
+                v_inter, v_hidden, dtype=torch.bfloat16
+            )
+        tensors[src + "mlp.down_proj.linear.weight"] = torch.ones(
+            v_hidden, v_inter, dtype=torch.bfloat16
+        )
+        for name in (
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ):
+            tensors[src + name + ".weight"] = torch.ones(v_hidden, dtype=torch.bfloat16)
     save_file(tensors, path / "model.safetensors")
     for role, value in {
         "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(8)}}},
@@ -110,6 +181,19 @@ def _checkpoint(path, hidden=16, inter=32, dim=8):
     }.items():
         (path / role).write_text(json.dumps(value))
     (path / "chat_template.jinja").write_text("{{ messages }}")
+    if vision:
+        (path / "processor_config.json").write_text(
+            json.dumps(
+                {
+                    "image_processor": {
+                        "patch_size": 2,
+                        "pooling_kernel_size": 3,
+                        "image_seq_length": 4,
+                        "image_processor_type": "Gemma4ImageProcessor",
+                    }
+                }
+            )
+        )
     return SafetensorsSource(path)
 
 
@@ -589,3 +673,83 @@ def test_mtp_component_requires_assistant_source(tmp_path):
     with _checkpoint(tmp_path / "source") as source:
         with pytest.raises(ValueError, match="source mtp"):
             build_model(source, components=("text", "mtp"))
+
+
+def test_vision_maps_clippable_linears_and_constant_scalar(tmp_path):
+    with _checkpoint(tmp_path / "source", vision=True) as source:
+        model = build_model(source, components=("text", "vision"))
+        cfg = model.components["vision"]["config"]
+        assert cfg["patch_pixels"] == 12
+        assert cfg["image_token_id"] == 7
+        assert cfg["boi_token_id"] == 5
+        assert cfg["eoi_token_id"] == 6
+        assert cfg["attention_scale"] == 1.0
+        assert cfg["text_hidden_size"] == 16
+        raw = source.read_flat(
+            "model.vision_tower.patch_embedder.input_proj.weight", 0, 8 * 12
+        )
+        assert torch.equal(_values(model, "vision/patch_projection").reshape(-1), raw)
+        table = source.read_flat(
+            "model.vision_tower.patch_embedder.position_embedding_table", 0, 2 * 8 * 8
+        )
+        assert torch.equal(_values(model, "vision/position_table").reshape(-1), table)
+        q = source.read_flat(
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight",
+            0,
+            8 * 8,
+        )
+        assert torch.equal(_values(model, "vision/layers/0/attention/query").reshape(-1), q)
+        proj = source.read_flat("model.embed_vision.embedding_projection.weight", 0, 16 * 8)
+        assert torch.equal(_values(model, "vision/embedding_projection").reshape(-1), proj)
+        scale = source.read_flat("model.vision_tower.std_scale", 0, 8)
+        assert torch.equal(_values(model, "vision/std_scale").reshape(-1), scale)
+        assert torch.equal(_values(model, "vision/layers/0/layer_scalar"), torch.ones(1))
+        assert model.parameters["vision/layers/0/layer_scalar"].direct_format == "fp32"
+        assert "vision/layers/0/attention/value" in model.parameters
+        assert (
+            "vision/layers/0/attention/query",
+            "vision/layers/0/attention/key",
+            "vision/layers/0/attention/value",
+        ) in model.packing_groups
+        assert (
+            model.components["vision"]["resources"]["processor_config.json"]
+            == "resource/vision/processor_config.json"
+        )
+        recipe = Recipe(model)
+        gemma4_31b_bf16(model, recipe, {"base": source})
+        out = tmp_path / "gemma.ninfer"
+        convert(model, recipe, out, device="cpu", rows_per_chunk=4)
+    with Artifact(out) as artifact:
+        assert artifact.directory.components["vision"]["config"]["head_dim"] == 4
+        stored = torch.frombuffer(
+            bytearray(artifact.read_object(artifact.directory.bindings["vision/patch_projection"]["object"])),
+            dtype=torch.bfloat16,
+        ).reshape(8, 12)
+        assert torch.equal(stored, torch.arange(8 * 12).reshape(8, 12).to(torch.bfloat16))
+        scalar = torch.frombuffer(
+            bytearray(artifact.read_object(artifact.directory.bindings["vision/layers/0/layer_scalar"]["object"])),
+            dtype=torch.float32,
+        )
+        assert torch.equal(scalar, torch.ones(1))
+        _packed(
+            artifact,
+            [
+                "vision/layers/0/attention/query",
+                "vision/layers/0/attention/key",
+                "vision/layers/0/attention/value",
+            ],
+        )
+        _packed(artifact, ["vision/layers/0/mlp/gate", "vision/layers/0/mlp/up"])
+
+
+def test_vision_component_requires_processor(tmp_path):
+    with _checkpoint(tmp_path / "source", vision=True) as source:
+        (source.root / "processor_config.json").unlink()
+        with pytest.raises(FileNotFoundError):
+            build_model(source, components=("text", "vision"))
+
+
+def test_vision_without_text_is_rejected(tmp_path):
+    with _checkpoint(tmp_path / "source", vision=True) as source:
+        with pytest.raises(ValueError, match="text, mtp, and vision"):
+            build_model(source, components=("vision",))
