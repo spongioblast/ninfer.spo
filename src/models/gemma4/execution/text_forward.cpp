@@ -27,26 +27,6 @@ void require_matrix(const Weight& weight, int rows, int cols, const char* name) 
     }
 }
 
-// Rows [first, first + rows) of every column of `fused` [R,T]. One column is already contiguous
-// and is returned as a view; wider inputs are copied into workspace.
-Tensor fused_rows(const Tensor& fused, int first, int rows, WorkspaceArena& workspace,
-                  cudaStream_t stream) {
-    const int tokens = fused.ne[1];
-    auto* source     = static_cast<std::byte*>(fused.data) + static_cast<std::size_t>(first) * 2;
-    if (tokens == 1) { return Tensor(source, DType::BF16, {rows, 1}); }
-    auto out                = workspace.alloc(DType::BF16, {rows, tokens});
-    const std::size_t width = static_cast<std::size_t>(rows) * 2;
-    const std::size_t pitch = static_cast<std::size_t>(fused.ne[0]) * 2;
-    const cudaError_t status =
-        cudaMemcpy2DAsync(out.data, width, source, pitch, width, static_cast<std::size_t>(tokens),
-                          cudaMemcpyDeviceToDevice, stream);
-    if (status != cudaSuccess) {
-        throw std::runtime_error(std::string("gemma4_layer: fused split: ") +
-                                 cudaGetErrorString(status));
-    }
-    return out;
-}
-
 } // namespace
 
 Weight bf16_matrix(const void* data, int rows, int cols) {
@@ -67,8 +47,8 @@ std::size_t gemma4_layer_workspace_bytes(const Gemma4LayerWeights& weights, int 
     const auto k     = static_cast<std::size_t>(weights.kv_heads) * weights.head_dim;
     const auto h     = static_cast<std::size_t>(weights.hidden);
     const auto inter = static_cast<std::size_t>(weights.intermediate);
-    // qkv (with k and v), qn, attn; hidden_n, projected; gate_up, gate, up, activated.
-    const std::size_t elements = 3 * q + 2 * k + 2 * h + 5 * inter;
+    // qkv (with k and v), qn, attn; hidden_n, projected; gate_up, activated.
+    const std::size_t elements = 3 * q + 2 * k + 2 * h + 3 * inter;
     const std::size_t scratch =
         std::max({projection_bytes(weights.qkv, weights.qkv_policy, tokens),
                   projection_bytes(weights.o_proj, weights.o_policy, tokens),
@@ -127,8 +107,8 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
 
     auto gate_up = workspace.alloc(DType::BF16, {2 * inter, tokens});
     project(hidden_n, weights.gate_up, weights.gate_up_policy, gate_up, gemm, workspace, stream);
-    const Tensor gate = fused_rows(gate_up, 0, inter, workspace, stream);
-    const Tensor up   = fused_rows(gate_up, inter, inter, workspace, stream);
+    const Tensor gate = gate_up.slice(0, 0, inter);
+    const Tensor up   = gate_up.slice(0, inter, inter);
     auto activated    = workspace.alloc(DType::BF16, {inter, tokens});
     ops::geglu(gate, up, activated, stream);
     project(activated, weights.down, weights.down_policy, projected, gemm, workspace, stream);
