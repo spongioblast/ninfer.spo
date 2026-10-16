@@ -19,6 +19,8 @@ struct RequestPlan {
     runtime::RequestPlanSummary summary;
     PreparedContextCache cache;
     std::vector<TokenId> tokens;
+    std::vector<Gemma4PreparedImage> images;
+    std::vector<std::int32_t> image_scatter;
     ResolvedSamplingParameters sampling;
     bool allow_prefix_reuse = false;
 };

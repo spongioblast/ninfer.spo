@@ -53,7 +53,7 @@ struct Gemma4VisionWeights {
     float rms_eps              = 1.0e-6f;
 };
 
-// patches is contiguous BF16 [patch_pixels, T] already scaled as 2*(x-0.5).
+// patches is contiguous BF16 [patch_pixels, T] in [0, 1]; the encoder applies 2*(x-0.5).
 // positions is contiguous I32 [T,2] with -1 on both axes for pad.
 // mask is contiguous I32 [T], nonzero = valid.
 // out is contiguous BF16 [text_hidden, T_out] with T_out = T / (pool*pool).
@@ -61,6 +61,10 @@ void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const 
                           Tensor& out, const Gemma4VisionWeights& weights,
                           ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
                           cudaStream_t stream);
+
+// Pooled bins that received at least one unpadded patch, in encoder column order.
+[[nodiscard]] std::vector<int> gemma4_vision_kept_bins(const std::int32_t* positions, int tokens,
+                                                       int pool, int pooled);
 
 [[nodiscard]] std::size_t gemma4_vision_workspace_bytes(const Gemma4VisionWeights& weights,
                                                         int patches, int pooled);

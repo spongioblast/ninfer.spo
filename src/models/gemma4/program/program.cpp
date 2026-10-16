@@ -5,19 +5,23 @@
 #include "models/gemma4/execution/draft_forward.h"
 #include "models/gemma4/execution/projection.h"
 #include "models/gemma4/execution/text_forward.h"
+#include "models/gemma4/execution/vision.h"
 #include "models/gemma4/program/sliding_ring.h"
 #include "models/gemma4/program/top_tokens.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sampling.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <cuda_runtime.h>
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::gemma4 {
@@ -132,6 +136,9 @@ struct Program::Impl {
     TokenId pending_token = 0;
     std::vector<TokenId> pending_tokens;
     std::vector<std::int32_t> pending_counts;
+    DeviceBuffer vision_embed;
+    bool vision_ready     = false;
+    int vision_columns    = 0;
     std::uint64_t transaction = 1;
     runtime::ExecutionTiming pending_timing;
     SequenceHandle handle;
@@ -162,7 +169,14 @@ struct Program::Impl {
         const std::size_t sampling = ops::sampling_workspace_capacity_bytes(loaded.vocab, 1, 1);
         const std::size_t draft =
             loaded.draft != nullptr ? gemma4_draft_workspace_bytes(*loaded.draft) : 0;
-        return std::max({layers, logits + sampling, draft}) + (64U << 20U);
+        std::size_t vision = 0;
+        if (loaded.vision) {
+            const int pooled  = loaded.vision->default_output_length;
+            const int patches = pooled * loaded.vision->pooling_kernel_size *
+                                loaded.vision->pooling_kernel_size;
+            vision = gemma4_vision_workspace_bytes(*loaded.vision, patches, pooled);
+        }
+        return std::max({layers, logits + sampling, draft, vision}) + (64U << 20U);
     }
 
     Impl(LoadedText& loaded, std::uint32_t token_capacity, std::uint32_t prefill_chunk,
@@ -228,12 +242,68 @@ struct Program::Impl {
     }
 
     void clear_lane() {
-        occupied      = false;
-        fed           = 0;
-        has_next      = false;
-        prefilled     = false;
-        round_pending = false;
+        occupied       = false;
+        fed            = 0;
+        has_next       = false;
+        prefilled      = false;
+        round_pending  = false;
+        vision_ready   = false;
+        vision_columns = 0;
         pending_tokens.clear();
+    }
+
+    void encode_vision(const detail::RequestPlan& request) {
+        vision_ready = true;
+        if (request.images.empty()) { return; }
+        if (!model->vision) {
+            throw std::invalid_argument("gemma4 vision weights are missing");
+        }
+        const Gemma4VisionWeights& vision = *model->vision;
+        int total = 0;
+        for (const Gemma4PreparedImage& image : request.images) { total += image.valid; }
+        if (static_cast<int>(request.image_scatter.size()) != total) {
+            throw std::invalid_argument("gemma4 image scatter does not match the encoder output");
+        }
+        vision_embed   = DeviceBuffer(static_cast<std::size_t>(hidden) * total * 2);
+        vision_columns = total;
+        int written    = 0;
+        for (const Gemma4PreparedImage& image : request.images) {
+            const int pooled = image.tokens / (vision.pooling_kernel_size * vision.pooling_kernel_size);
+            DeviceBuffer patch_buf(image.patches.size() * 2);
+            DeviceBuffer pos_buf(image.positions.size() * 4);
+            DeviceBuffer mask_buf(image.mask.size() * 4);
+            DeviceBuffer encoded_buf(static_cast<std::size_t>(vision.text_hidden) * pooled * 2);
+            patch_buf.copy_from_host(image.patches.data(), patch_buf.bytes);
+            pos_buf.copy_from_host(image.positions.data(), pos_buf.bytes);
+            mask_buf.copy_from_host(image.mask.data(), mask_buf.bytes);
+            Tensor patches(patch_buf.p, DType::BF16, {vision.patch_pixels, image.tokens});
+            Tensor positions(pos_buf.p, DType::I32, {image.tokens, 2});
+            Tensor mask(mask_buf.p, DType::I32, {image.tokens});
+            Tensor encoded(encoded_buf.p, DType::BF16, {vision.text_hidden, pooled});
+            workspace.reset();
+            gemma4_vision_encode(patches, positions, mask, encoded, vision, gemm, workspace, stream);
+            const std::vector<int> kept =
+                gemma4_vision_kept_bins(image.positions.data(), image.tokens,
+                                        vision.pooling_kernel_size, pooled);
+            if (static_cast<int>(kept.size()) != image.valid) {
+                throw std::invalid_argument("gemma4 vision packed fewer tokens than the prompt");
+            }
+            std::vector<std::uint16_t> host(
+                static_cast<std::size_t>(vision.text_hidden) * pooled);
+            encoded_buf.copy_to_host(host.data(), host.size() * 2);
+            std::vector<std::uint16_t> packed(
+                static_cast<std::size_t>(vision.text_hidden) * image.valid);
+            for (int column = 0; column < image.valid; ++column) {
+                const int src = kept[static_cast<std::size_t>(column)];
+                std::memcpy(packed.data() + static_cast<std::size_t>(vision.text_hidden) * column,
+                            host.data() + static_cast<std::size_t>(vision.text_hidden) * src,
+                            static_cast<std::size_t>(vision.text_hidden) * 2);
+            }
+            vision_embed.copy_from_host(
+                packed.data(), packed.size() * 2,
+                static_cast<std::size_t>(written) * vision.text_hidden * 2);
+            written += image.valid;
+        }
     }
 
     // Runs `count` tokens at positions [first, first + count) through every layer. The hidden
@@ -255,8 +325,42 @@ struct Program::Impl {
         Tensor position_tensor(pos_buf.p, DType::I32, {width});
         Tensor hidden_tensor(hidden_buf.p, DType::BF16, {hidden, width});
         workspace.reset();
+        const Tensor* visual_embeddings = nullptr;
+        const Tensor* visual_indices    = nullptr;
+        Tensor visual_src;
+        Tensor visual_idx;
+        std::vector<std::int32_t> local_idx;
+        if (plan && vision_ready && vision_columns > 0) {
+            for (std::size_t i = 0; i < plan->image_scatter.size(); ++i) {
+                const auto pos = static_cast<std::uint32_t>(plan->image_scatter[i]);
+                if (pos >= first && pos < first + count) {
+                    local_idx.push_back(static_cast<std::int32_t>(pos - first));
+                }
+            }
+            if (!local_idx.empty()) {
+                visual_src = workspace.alloc(DType::BF16,
+                                             {hidden, static_cast<std::int32_t>(local_idx.size())});
+                visual_idx = workspace.alloc(DType::I32, {static_cast<std::int32_t>(local_idx.size())});
+                std::size_t packed = 0;
+                for (std::size_t i = 0; i < plan->image_scatter.size(); ++i) {
+                    const auto pos = static_cast<std::uint32_t>(plan->image_scatter[i]);
+                    if (pos < first || pos >= first + count) { continue; }
+                    check(cudaMemcpyAsync(
+                              static_cast<std::uint8_t*>(visual_src.data) + packed * hidden * 2U,
+                              static_cast<std::uint8_t*>(vision_embed.p) + i * hidden * 2U,
+                              static_cast<std::size_t>(hidden) * 2U, cudaMemcpyDeviceToDevice, stream),
+                          "visual column copy");
+                    ++packed;
+                }
+                check(cudaMemcpyAsync(visual_idx.data, local_idx.data(), local_idx.size() * 4,
+                                      cudaMemcpyHostToDevice, stream),
+                      "visual index upload");
+                visual_embeddings = &visual_src;
+                visual_indices    = &visual_idx;
+            }
+        }
         gemma4_layers(id_tensor, hidden_tensor, model->token_embedding, model->layers, caches,
-                      position_tensor, gemm, workspace, stream);
+                      position_tensor, gemm, workspace, stream, visual_embeddings, visual_indices);
         resident.insert(resident.end(), ids, ids + count);
         note_written(first, count);
     }
@@ -269,7 +373,9 @@ struct Program::Impl {
     // Prompt tokens whose K/V can be kept from the resident cache. At least the last prompt
     // token is always recomputed, because its logits pick the first output token.
     [[nodiscard]] std::uint32_t reusable_tokens(const detail::RequestPlan& request) const {
-        if (!request.allow_prefix_reuse || request.tokens.size() < 2) { return 0; }
+        if (!request.images.empty() || !request.allow_prefix_reuse || request.tokens.size() < 2) {
+            return 0;
+        }
         const std::size_t limit = std::min(resident.size(), request.tokens.size() - 1);
         std::size_t length      = 0;
         while (length < limit && resident[length] == request.tokens[length]) { ++length; }
@@ -557,8 +663,10 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
     }
     auto plan                             = std::make_shared<detail::RequestPlan>();
     plan->tokens                          = prompt.tokens();
+    plan->images                          = std::move(prompt.images_);
+    plan->image_scatter                   = std::move(prompt.image_scatter_);
     plan->sampling                        = options.sampling;
-    plan->allow_prefix_reuse              = options.allow_prefix_reuse;
+    plan->allow_prefix_reuse              = options.allow_prefix_reuse && plan->images.empty();
     plan->summary.prompt_tokens           = static_cast<std::uint32_t>(plan->tokens.size());
     plan->summary.requested_output_tokens = options.requested_output_tokens;
     plan->summary.effective_output_tokens = options.requested_output_tokens;
@@ -762,6 +870,7 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     const auto start          = std::chrono::steady_clock::now();
     const auto& tokens        = impl_->plan->tokens;
     const auto total          = static_cast<std::uint32_t>(tokens.size());
+    if (!impl_->vision_ready) { impl_->encode_vision(*impl_->plan); }
     const std::uint32_t width = std::min(impl_->chunk, total - impl_->fed);
     impl_->run_layers(tokens.data() + impl_->fed, impl_->fed, width);
     impl_->fed += width;

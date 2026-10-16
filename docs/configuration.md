@@ -47,6 +47,9 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `NINFER_GEMMA4_HF` | Gemma 4 tokenizer, template, fixture, and France tests | Hugging Face model folder (`tokenizer.json`, `chat_template.jinja`). Unset skips them. |
 | `NINFER_GEMMA4_PARITY` | Gemma 4 parity test, engine test greedy check | Folder of Hugging Face logits and greedy dumps. Unset skips them. |
 | `NINFER_GEMMA4_FIXTURES` | Gemma 4 fixture test | Overrides `tests/models/gemma4/fixtures`. |
+| `NINFER_GEMMA4_MTP_WEIGHTS` | Gemma 4 engine MTP equality | Artifact with the `mtp` component. Unset skips that check. |
+| `NINFER_GEMMA4_VISION_WEIGHTS` | Gemma 4 vision encode and engine image chat | Artifact with the `vision` component. Unset skips those checks. |
+| `NINFER_GEMMA4_VISION_DUMPS` | Gemma 4 vision encode cosine | Folder of `image{0,1,2}.{patches,pos,mask,tokens,json}`. Unset skips the encode test. |
 | `NINFER_TEST_ARTIFACT` | qwen3_5 artifact tests | Artifact for those tests. Unset skips them. |
 | `NINFER_GATE_OUT` | `run.py`, `serve_ctl.py` | Gate output folder. Default `<workspace>/tmp/ninfer`. |
 | `NINFER_TOKENIZER` | `p8_probe.py`, `cross_path.py` | Tokenizer directory. |

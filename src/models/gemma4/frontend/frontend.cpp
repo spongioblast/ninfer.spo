@@ -1,5 +1,6 @@
 #include "models/gemma4/frontend/frontend.h"
 
+#include "models/gemma4/frontend/image.h"
 #include "models/gemma4/frontend/tokenizer.h"
 #include "text/jinja.h"
 
@@ -7,6 +8,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace ninfer::models::gemma4 {
@@ -16,14 +18,32 @@ using Json = nlohmann::ordered_json;
 
 constexpr std::string_view kTurnEnd        = "<turn|>\n";
 constexpr std::string_view kReasoningStart = "<|channel>thought\n";
+constexpr std::string_view kImagePlaceholder = "<|image|>";
+constexpr std::string_view kBoiToken         = "<|image>";
+constexpr std::string_view kEoiToken         = "<image|>";
 
-std::string message_text(const ChatMessage& message) {
+int single_token(const Tokenizer& tokenizer, std::string_view text, const char* name) {
+    const std::vector<int> ids = tokenizer.encode(text);
+    if (ids.size() != 1) {
+        throw std::invalid_argument(std::string("gemma4 ") + name + " is not one tokenizer token");
+    }
+    return ids[0];
+}
+
+std::string message_text(const ChatMessage& message, std::vector<Gemma4PreparedImage>* images) {
     std::string text;
     for (const MessagePart& part : message.parts) {
-        if (part.kind != MessagePartKind::Text) {
-            throw std::invalid_argument("gemma4 image and audio input is not wired");
+        if (part.kind == MessagePartKind::Text) {
+            text += part.text;
+            continue;
         }
-        text += part.text;
+        if (part.kind != MessagePartKind::Media || part.media.kind != MediaKind::Image) {
+            throw std::invalid_argument("gemma4 video and audio input is not wired");
+        }
+        if (images != nullptr) {
+            images->push_back(gemma4_prepare_image(part.media.bytes, part.media));
+        }
+        text += kImagePlaceholder;
     }
     return text;
 }
@@ -54,7 +74,7 @@ Json tool_call_json(const ToolCall& call) {
     return item;
 }
 
-Json template_context(const PromptInput& input) {
+Json template_context(const PromptInput& input, std::vector<Gemma4PreparedImage>* images) {
     const PromptOptions& options = input.options;
     Json context = options.chat_template_kwargs_json.empty()
                        ? Json::object()
@@ -79,7 +99,7 @@ Json template_context(const PromptInput& input) {
     for (const ChatMessage& message : input.messages) {
         Json item;
         item["role"]    = role_name(message.role);
-        item["content"] = message_text(message);
+        item["content"] = message_text(message, images);
         if (!message.reasoning_content.empty()) {
             item["reasoning_content"] = message.reasoning_content;
         }
@@ -118,9 +138,16 @@ Json template_context(const PromptInput& input) {
 struct Frontend::Impl {
     std::shared_ptr<const Tokenizer> tokenizer;
     text::JinjaTemplate chat;
+    int boi_token_id   = 0;
+    int eoi_token_id   = 0;
+    int image_token_id = 0;
     explicit Impl(const std::string& tokenizer_json, std::string chat_template)
         : tokenizer(std::make_shared<const Tokenizer>(tokenizer_json)),
-          chat(std::move(chat_template), "gemma4-chat") {}
+          chat(std::move(chat_template), "gemma4-chat") {
+        boi_token_id   = single_token(*tokenizer, kBoiToken, "boi");
+        eoi_token_id   = single_token(*tokenizer, kEoiToken, "eoi");
+        image_token_id = single_token(*tokenizer, kImagePlaceholder, "image");
+    }
 };
 
 Frontend::Frontend(std::string tokenizer_json, std::string chat_template)
@@ -148,7 +175,7 @@ std::string Frontend::render(const PromptInput& input) const {
     if (continue_final && input.messages.back().role != ChatRole::Assistant) {
         throw std::invalid_argument("continuing a reply needs a final assistant message");
     }
-    std::string rendered = impl_->chat.render(template_context(input)).text;
+    std::string rendered = impl_->chat.render(template_context(input, nullptr)).text;
     if (continue_final && rendered.ends_with(kTurnEnd)) {
         rendered.resize(rendered.size() - kTurnEnd.size());
     }
@@ -156,12 +183,52 @@ std::string Frontend::render(const PromptInput& input) const {
 }
 
 PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl&) const {
-    const std::string rendered = render(input);
+    std::vector<Gemma4PreparedImage> images;
+    const bool continue_final =
+        input.options.continuation == PromptContinuationMode::ContinueFinalAssistant;
+    if (input.messages.empty()) { throw std::invalid_argument("gemma4 prompt has no messages"); }
+    if (continue_final && input.messages.back().role != ChatRole::Assistant) {
+        throw std::invalid_argument("continuing a reply needs a final assistant message");
+    }
+    std::string rendered = impl_->chat.render(template_context(input, &images)).text;
+    if (continue_final && rendered.ends_with(kTurnEnd)) {
+        rendered.resize(rendered.size() - kTurnEnd.size());
+    }
     std::vector<TokenId> tokens = tokenize_text(rendered);
+    std::vector<TokenId> expanded;
+    std::vector<std::int32_t> scatter;
+    expanded.reserve(tokens.size());
+    std::size_t image_index = 0;
+    for (const TokenId id : tokens) {
+        if (id == impl_->image_token_id && image_index < images.size()) {
+            const Gemma4PreparedImage& image = images[image_index++];
+            expanded.push_back(impl_->boi_token_id);
+            for (int token = 0; token < image.valid; ++token) {
+                scatter.push_back(static_cast<std::int32_t>(expanded.size()));
+                expanded.push_back(impl_->image_token_id);
+            }
+            expanded.push_back(impl_->eoi_token_id);
+            continue;
+        }
+        expanded.push_back(id);
+    }
+    if (image_index != images.size()) {
+        throw std::invalid_argument("gemma4 image count does not match the chat template");
+    }
     PromptSummary summary;
-    summary.prompt_tokens       = static_cast<std::uint32_t>(tokens.size());
+    summary.prompt_tokens       = static_cast<std::uint32_t>(expanded.size());
     summary.starts_in_reasoning = rendered.ends_with(kReasoningStart);
-    return PreparedPrompt(std::move(tokens), summary, {});
+    summary.has_media           = !images.empty();
+    PromptPreparationStats stats;
+    stats.media_items     = images.size();
+    stats.vision_tokens   = scatter.size();
+    stats.raw_patches     = 0;
+    for (const Gemma4PreparedImage& image : images) {
+        stats.raw_patches += static_cast<std::uint64_t>(image.tokens);
+        stats.media_bytes += image.patches.size() * 2;
+    }
+    return PreparedPrompt(std::move(expanded), summary, stats, std::move(images),
+                          std::move(scatter));
 }
 
 std::uint32_t Frontend::count_tokens(PromptInput input, const PreparationControl& control) const {

@@ -62,6 +62,20 @@ Tensor heads_view(Tensor& matrix, int tokens) {
     return matrix.view({kHeadDim, kHeads, tokens});
 }
 
+void scale_patches(const Tensor& patches, Tensor& out, cudaStream_t stream) {
+    const int pixels = patches.ne[0];
+    const int tokens = patches.ne[1];
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(pixels) * tokens);
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), patches.data, host.size() * 2, cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::uint16_t& bits : host) {
+        bits = f32_to_bf16(2.0f * (bf16_to_f32(bits) - 0.5f));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(out.data, host.data(), host.size() * 2, cudaMemcpyHostToDevice,
+                               stream));
+}
+
 void pool_and_standardize(const Tensor& hidden, const Tensor& positions, const Tensor& bias,
                           const Tensor& scale, int pool, Tensor& out, cudaStream_t stream) {
     const int width  = hidden.ne[0];
@@ -86,14 +100,17 @@ void pool_and_standardize(const Tensor& hidden, const Tensor& positions, const T
     CUDA_CHECK(cudaStreamSynchronize(stream));
     int max_x = 0;
     for (int t = 0; t < tokens; ++t) {
-        const int x = std::max(0, pos[static_cast<std::size_t>(t)]);
-        max_x       = std::max(max_x, x + 1);
+        const int x = pos[static_cast<std::size_t>(t)];
+        if (x < 0) { continue; }
+        max_x = std::max(max_x, x + 1);
     }
+    if (max_x <= 0) { throw std::invalid_argument("gemma4_vision: no unpadded patches to pool"); }
     const int bins_x = max_x / pool;
     std::vector<double> acc(static_cast<std::size_t>(width) * pooled, 0.0);
     for (int t = 0; t < tokens; ++t) {
-        const int x   = std::max(0, pos[static_cast<std::size_t>(t)]);
-        const int y   = std::max(0, pos[static_cast<std::size_t>(t) + static_cast<std::size_t>(tokens)]);
+        const int x = pos[static_cast<std::size_t>(t)];
+        const int y = pos[static_cast<std::size_t>(t) + static_cast<std::size_t>(tokens)];
+        if (x < 0 || y < 0) { continue; }
         const int bin = (x / pool) + bins_x * (y / pool);
         if (bin < 0 || bin >= pooled) {
             throw std::invalid_argument("gemma4_vision: pooled index is outside T_out");
@@ -118,6 +135,37 @@ void pool_and_standardize(const Tensor& hidden, const Tensor& positions, const T
 }
 
 } // namespace
+
+std::vector<int> gemma4_vision_kept_bins(const std::int32_t* positions, int tokens, int pool,
+                                         int pooled) {
+    if (positions == nullptr || tokens <= 0 || pool <= 0 || pooled <= 0) {
+        throw std::invalid_argument("gemma4_vision: kept-bin geometry is empty");
+    }
+    int max_x = 0;
+    for (int t = 0; t < tokens; ++t) {
+        const int x = positions[t];
+        if (x >= 0) { max_x = std::max(max_x, x + 1); }
+    }
+    if (max_x <= 0) { return {}; }
+    const int bins_x = max_x / pool;
+    std::vector<char> seen(static_cast<std::size_t>(pooled), 0);
+    for (int t = 0; t < tokens; ++t) {
+        const int x = positions[t];
+        const int y = positions[t + tokens];
+        if (x < 0 || y < 0) { continue; }
+        const int bin = (x / pool) + bins_x * (y / pool);
+        if (bin < 0 || bin >= pooled) {
+            throw std::invalid_argument("gemma4_vision: pooled index is outside T_out");
+        }
+        seen[static_cast<std::size_t>(bin)] = 1;
+    }
+    std::vector<int> kept;
+    kept.reserve(static_cast<std::size_t>(pooled));
+    for (int bin = 0; bin < pooled; ++bin) {
+        if (seen[static_cast<std::size_t>(bin)]) { kept.push_back(bin); }
+    }
+    return kept;
+}
 
 std::size_t gemma4_vision_workspace_bytes(const Gemma4VisionWeights& weights, int patches,
                                           int pooled) {
@@ -172,6 +220,7 @@ void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const 
     require_matrix(weights.embedding_projection, weights.text_hidden, hidden,
                    "embedding_projection");
 
+    auto scaled    = workspace.alloc(DType::BF16, {weights.patch_pixels, tokens});
     auto x         = workspace.alloc(DType::BF16, {hidden, tokens});
     auto h         = workspace.alloc(DType::BF16, {hidden, tokens});
     auto qkv       = workspace.alloc(DType::BF16, {3 * hidden, tokens});
@@ -224,7 +273,8 @@ void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const 
     CUDA_CHECK(cudaMemcpyAsync(wts.data, weights_host.data(), weights_host.size() * 4,
                                cudaMemcpyHostToDevice, stream));
 
-    project(patches, weights.patch_projection, ops::LinearPolicy::A16Only, x, gemm, workspace,
+    scale_patches(patches, scaled, stream);
+    project(scaled, weights.patch_projection, ops::LinearPolicy::A16Only, x, gemm, workspace,
             stream);
     Tensor table_view(const_cast<void*>(weights.position_table), DType::BF16,
                       {hidden, 2 * table});

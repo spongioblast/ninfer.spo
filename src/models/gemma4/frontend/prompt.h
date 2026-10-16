@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/gemma4/frontend/image.h"
 #include "ninfer/types.h"
 
 #include <cstdint>
@@ -25,16 +26,26 @@ public:
     [[nodiscard]] PromptPreparationStats preparation_stats() const noexcept { return stats_; }
     [[nodiscard]] explicit operator bool() const noexcept { return !tokens_.empty(); }
     [[nodiscard]] const std::vector<TokenId>& tokens() const noexcept { return tokens_; }
+    [[nodiscard]] const std::vector<Gemma4PreparedImage>& images() const noexcept { return images_; }
+    [[nodiscard]] const std::vector<std::int32_t>& image_scatter() const noexcept {
+        return image_scatter_;
+    }
 
 private:
-    PreparedPrompt(std::vector<TokenId> tokens, PromptSummary summary, PromptPreparationStats stats)
-        : tokens_(std::move(tokens)), summary_(summary), stats_(stats) {}
+    PreparedPrompt(std::vector<TokenId> tokens, PromptSummary summary, PromptPreparationStats stats,
+                   std::vector<Gemma4PreparedImage> images = {},
+                   std::vector<std::int32_t> image_scatter = {})
+        : tokens_(std::move(tokens)), summary_(summary), stats_(stats), images_(std::move(images)),
+          image_scatter_(std::move(image_scatter)) {}
 
     std::vector<TokenId> tokens_;
     PromptSummary summary_;
     PromptPreparationStats stats_;
+    std::vector<Gemma4PreparedImage> images_;
+    std::vector<std::int32_t> image_scatter_;
 
     friend class Frontend;
+    friend class Program;
 };
 
 } // namespace ninfer::models::gemma4

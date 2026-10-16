@@ -3,6 +3,7 @@
 #include "models/gemma4/execution/projection.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gemma4_attention.h"
+#include "ninfer/ops/scatter.h"
 #include "ninfer/ops/gemma4_qkv_prep.h"
 #include "ninfer/ops/geglu.h"
 #include "ninfer/ops/logit_softcap.h"
@@ -137,11 +138,18 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
-                   ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream) {
+                   ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
+                   const Tensor* visual_embeddings, const Tensor* visual_indices) {
     if (layers.size() != caches.size()) {
         throw std::invalid_argument("gemma4_layers: one cache per layer");
     }
     ops::embedding(ids, token_embedding, hidden, stream);
+    if (visual_embeddings != nullptr || visual_indices != nullptr) {
+        if (visual_embeddings == nullptr || visual_indices == nullptr) {
+            throw std::invalid_argument("gemma4_layers: visual embeddings need destination indices");
+        }
+        ops::scatter(*visual_embeddings, *visual_indices, hidden, stream);
+    }
     if (layers.empty()) { return; }
     auto scope    = workspace.scope();
     auto hidden_n = workspace.alloc(DType::BF16, {hidden.ne[0], hidden.ne[1]});

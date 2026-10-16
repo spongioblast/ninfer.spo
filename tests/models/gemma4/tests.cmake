@@ -10,6 +10,14 @@ ninfer_add_op_test(ninfer_gemma4_load_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_load.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
 
+ninfer_add_op_test(ninfer_gemma4_image_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_image.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)
+
+ninfer_add_op_test(ninfer_gemma4_vision_encode_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_encode.cpp"
+  LIBRARIES ninfer_model_runtime ninfer_ops)
+
 ninfer_add_op_test(ninfer_gemma4_france_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_france.cpp"
   LIBRARIES ninfer_model_runtime ninfer_ops)
@@ -31,6 +39,7 @@ set_tests_properties(
   ninfer_gemma4_parity_real_test
   ninfer_gemma4_draft_real_test
   ninfer_gemma4_engine_real_test
+  ninfer_gemma4_vision_encode_real_test
   PROPERTIES RUN_SERIAL TRUE LABELS "gpu;real")
 
 ninfer_add_op_test(ninfer_gemma4_tokenizer_test

@@ -62,10 +62,13 @@ struct Gemma4CacheLayer {
 };
 
 // Embed ids into `hidden` [hidden,T] and run every layer, appending K/V at `positions`.
+// visual_embeddings [hidden,V] and visual_indices [V] overwrite those columns after embed.
 void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
-                   ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream);
+                   ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
+                   const Tensor* visual_embeddings = nullptr,
+                   const Tensor* visual_indices    = nullptr);
 
 // Final norm, output head, and logit softcap for the columns of `hidden` [hidden,C] into
 // `logits` [vocab,C]. `hidden` is not modified.

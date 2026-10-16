@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -375,17 +376,65 @@ bool usable(const char* path) {
 
 } // namespace
 
+std::vector<std::uint8_t> solid_ppm(std::uint8_t r, std::uint8_t g, std::uint8_t b) {
+    std::vector<std::uint8_t> ppm;
+    const std::string header = "P6\n64 64\n255\n";
+    ppm.insert(ppm.end(), header.begin(), header.end());
+    for (int i = 0; i < 64 * 64; ++i) {
+        ppm.push_back(r);
+        ppm.push_back(g);
+        ppm.push_back(b);
+    }
+    return ppm;
+}
+
+void vision_checks(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                     = artifact;
+    options.max_context                       = 4096;
+    options.kv_capacity                       = ninfer::KvCapacityPolicy::automatic();
+    options.enable_vision                     = true;
+    options.use_cuda_graph                    = false;
+    options.speculative.backend               = ninfer::SpeculativeBackend::None;
+    ninfer::Engine engine(options);
+    ninfer::MessagePart image;
+    image.kind              = ninfer::MessagePartKind::Media;
+    image.media.kind        = ninfer::MediaKind::Image;
+    image.media.bytes       = solid_ppm(220, 20, 20);
+    image.media.media_type  = "image/x-portable-pixmap";
+    image.media.source_name = "red.ppm";
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(std::move(image));
+    message.parts.push_back(ninfer::MessagePart{
+        .kind = ninfer::MessagePartKind::Text,
+        .text = "What is the main color of this image? Answer with one word.",
+        .media = {}});
+    ninfer::PromptInput input;
+    input.messages.push_back(std::move(message));
+    input.options.enable_thinking = false;
+    const auto start              = std::chrono::steady_clock::now();
+    const auto result             = engine.generate(engine.prepare(std::move(input)), greedy(16));
+    report("vision", result, since(start));
+    check(result.prompt.has_media, "vision prompt has media");
+    check(result.content.find("red") != std::string::npos ||
+              result.content.find("Red") != std::string::npos,
+          "vision answers red");
+}
+
 int main() {
     const char* artifact = std::getenv("NINFER_GEMMA4_WEIGHTS");
     const char* mtp      = std::getenv("NINFER_GEMMA4_MTP_WEIGHTS");
-    if (!usable(artifact) && !usable(mtp)) {
-        std::cout << "SKIP: neither NINFER_GEMMA4_WEIGHTS nor NINFER_GEMMA4_MTP_WEIGHTS names a "
-                     "gemma4 artifact\n";
+    const char* vision   = std::getenv("NINFER_GEMMA4_VISION_WEIGHTS");
+    if (!usable(artifact) && !usable(mtp) && !usable(vision)) {
+        std::cout << "SKIP: neither NINFER_GEMMA4_WEIGHTS nor NINFER_GEMMA4_MTP_WEIGHTS nor "
+                     "NINFER_GEMMA4_VISION_WEIGHTS names a gemma4 artifact\n";
         return 77;
     }
     try {
         if (usable(artifact)) { bf16_checks(artifact); }
         if (usable(mtp)) { mtp_equality(mtp); }
+        if (usable(vision)) { vision_checks(vision); }
     } catch (const std::exception& error) {
         std::cerr << "EXC " << error.what() << '\n';
         return 1;
