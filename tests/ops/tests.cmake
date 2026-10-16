@@ -4,6 +4,7 @@ set(ninfer_op_tests
   gemma4_attention
   gemma4_qkv_prep
   gemma4_residual_norm
+  gemma4_vision_attention
   geglu
   logit_softcap
   residual_scale
