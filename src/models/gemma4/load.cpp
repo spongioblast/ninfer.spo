@@ -227,6 +227,137 @@ std::unique_ptr<Gemma4DraftWeights> finish_draft(const artifact::MaterializedArt
     return draft;
 }
 
+struct VisionRefs {
+    artifact::Json config;
+    artifact::ParameterReference patch;
+    artifact::ParameterReference table;
+    artifact::ParameterReference std_bias;
+    artifact::ParameterReference std_scale;
+    artifact::ParameterReference projection;
+    InputUse patch_use;
+    InputUse projection_use;
+    std::vector<std::vector<artifact::ParameterReference>> layers;
+    std::vector<std::vector<InputUse>> uses;
+    std::vector<float> scalars;
+};
+
+VisionRefs bind_vision(artifact::Binder& binder, const artifact::Json& config) {
+    VisionRefs refs;
+    refs.config = config;
+    const auto u = [](int value) { return static_cast<std::uint64_t>(value); };
+    const int hidden = config_int(config, "hidden_size");
+    const int text_hidden = config_int(config, "text_hidden_size");
+    const int heads = config_int(config, "num_attention_heads");
+    const int dim = config_int(config, "head_dim");
+    const int inter = config_int(config, "intermediate_size");
+    const int layers = config_int(config, "num_hidden_layers");
+    const int pixels = config_int(config, "patch_pixels");
+    const int positions = config_int(config, "position_embedding_size");
+    const auto q = u(heads * dim);
+    refs.patch = binder.parameter("vision/patch_projection", {u(hidden), u(pixels)});
+    refs.patch_use = read_use(binder, "vision/patch_projection", "vision/patch_input");
+    refs.table = binder.parameter("vision/position_table", {u(2), u(positions), u(hidden)});
+    refs.std_bias = binder.parameter("vision/std_bias", {u(hidden)});
+    refs.std_scale = binder.parameter("vision/std_scale", {u(hidden)});
+    refs.projection =
+        binder.parameter("vision/embedding_projection", {u(text_hidden), u(hidden)});
+    refs.projection_use = read_use(binder, "vision/embedding_projection", "vision/pooled_norm");
+    refs.layers.resize(static_cast<std::size_t>(layers));
+    refs.uses.resize(static_cast<std::size_t>(layers));
+    for (int layer = 0; layer < layers; ++layer) {
+        const auto prefix = "vision/layers/" + std::to_string(layer) + "/";
+        auto& layer_refs = refs.layers[static_cast<std::size_t>(layer)];
+        auto& layer_uses = refs.uses[static_cast<std::size_t>(layer)];
+        auto matrix = [&](const char* name, artifact::Shape shape, const char* input) {
+            layer_refs.push_back(binder.parameter(prefix + name, std::move(shape)));
+            layer_uses.push_back(read_use(binder, prefix + name, prefix + input));
+        };
+        matrix("attention/query", {q, u(hidden)}, "mixer_input");
+        matrix("attention/key", {q, u(hidden)}, "mixer_input");
+        matrix("attention/value", {q, u(hidden)}, "mixer_input");
+        layer_refs.push_back(binder.parameter(prefix + "attention/query_norm", {u(dim)}));
+        layer_refs.push_back(binder.parameter(prefix + "attention/key_norm", {u(dim)}));
+        matrix("attention/output", {u(hidden), q}, "attention_output");
+        matrix("mlp/gate", {u(inter), u(hidden)}, "ffn_input");
+        matrix("mlp/up", {u(inter), u(hidden)}, "ffn_input");
+        matrix("mlp/down", {u(hidden), u(inter)}, "mlp/product");
+        for (const char* name : {"input_norm", "post_attention_norm", "pre_feedforward_norm",
+                                 "post_feedforward_norm"}) {
+            layer_refs.push_back(binder.parameter(prefix + name, {u(hidden)}));
+        }
+        auto scalar = binder.parameter(prefix + "layer_scalar", {1}, artifact::Residency::Host,
+                                       QType::FP32);
+        refs.scalars.push_back(binder.values(scalar.binding, QType::FP32).scalar_f32());
+    }
+    return refs;
+}
+
+Gemma4VisionWeights finish_vision(const artifact::MaterializedArtifact& artifact,
+                                  const VisionRefs& refs) {
+    const auto& config = refs.config;
+    Gemma4VisionWeights out;
+    out.hidden = config_int(config, "hidden_size");
+    out.text_hidden = config_int(config, "text_hidden_size");
+    out.intermediate = config_int(config, "intermediate_size");
+    out.heads = config_int(config, "num_attention_heads");
+    out.head_dim = config_int(config, "head_dim");
+    out.patch_pixels = config_int(config, "patch_pixels");
+    out.pooling_kernel_size = config_int(config, "pooling_kernel_size");
+    out.position_table_size = config_int(config, "position_embedding_size");
+    out.default_output_length = config_int(config, "default_output_length");
+    out.boi_token_id = config_int(config, "boi_token_id");
+    out.eoi_token_id = config_int(config, "eoi_token_id");
+    out.image_token_id = config_int(config, "image_token_id");
+    out.rope_theta = config.at("rope_theta").get<float>();
+    out.rms_eps = config.at("rms_norm_eps").get<float>();
+    const InputUse patch_uses[1] = {refs.patch_use};
+    out.patch_projection = projection(artifact, std::span(&refs.patch, 1),
+                                      std::span(patch_uses, 1)).weight;
+    out.position_table = device_data(artifact, refs.table);
+    out.std_bias = device_data(artifact, refs.std_bias);
+    out.std_scale = device_data(artifact, refs.std_scale);
+    const InputUse proj_uses[1] = {refs.projection_use};
+    out.embedding_projection = projection(artifact, std::span(&refs.projection, 1),
+                                          std::span(proj_uses, 1)).weight;
+    out.layers.resize(refs.layers.size());
+    for (std::size_t layer = 0; layer < refs.layers.size(); ++layer) {
+        const std::span<const artifact::ParameterReference> layer_refs = refs.layers[layer];
+        const std::span<const InputUse> layer_uses = refs.uses[layer];
+        std::size_t cursor = 0;
+        std::size_t use_cursor = 0;
+        auto next = [&]() { return device_data(artifact, layer_refs[cursor++]); };
+        auto take = [&](std::size_t count) {
+            auto result = projection(artifact, layer_refs.subspan(cursor, count),
+                                     layer_uses.subspan(use_cursor, count));
+            cursor += count;
+            use_cursor += count;
+            return result;
+        };
+        Gemma4VisionLayerWeights weights;
+        const auto qkv = take(3);
+        weights.qkv = qkv.weight;
+        weights.qkv_policy = qkv.policy;
+        weights.q_norm = next();
+        weights.k_norm = next();
+        const auto o_proj = take(1);
+        const auto gate_up = take(2);
+        const auto down = take(1);
+        weights.o_proj = o_proj.weight;
+        weights.o_policy = o_proj.policy;
+        weights.gate_up = gate_up.weight;
+        weights.gate_up_policy = gate_up.policy;
+        weights.down = down.weight;
+        weights.down_policy = down.policy;
+        weights.input_norm = next();
+        weights.post_attn_norm = next();
+        weights.pre_ff_norm = next();
+        weights.post_ff_norm = next();
+        weights.layer_scalar = refs.scalars[layer];
+        out.layers[layer] = weights;
+    }
+    return out;
+}
+
 } // namespace
 
 LoadedText::LoadedText() = default;
@@ -310,6 +441,10 @@ LoadedText load_text(const std::string& artifact_path, DeviceContext& device, bo
         }
         draft.emplace(bind_draft(binder, found->second.config, layers));
     }
+    std::optional<VisionRefs> vision;
+    if (reader.directory().components.find("vision") != reader.directory().components.end()) {
+        vision = bind_vision(binder, reader.directory().component("vision").config);
+    }
     auto plan = std::move(binder).finish();
     LoadedText loaded;
     loaded.artifact = std::make_unique<artifact::MaterializedArtifact>(
@@ -389,6 +524,7 @@ LoadedText load_text(const std::string& artifact_path, DeviceContext& device, bo
             }
         }
     }
+    if (vision) { loaded.vision = finish_vision(*loaded.artifact, *vision); }
     return loaded;
 }
 

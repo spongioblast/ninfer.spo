@@ -2,8 +2,10 @@
 
 #include "models/gemma4/execution/draft_forward.h"
 #include "models/gemma4/execution/text_forward.h"
+#include "models/gemma4/execution/vision.h"
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -35,6 +37,7 @@ struct LoadedText {
     float rms_eps               = 1.0e-6f;
     // The MTP assistant when loaded with with_draft.
     std::unique_ptr<Gemma4DraftWeights> draft;
+    std::optional<Gemma4VisionWeights> vision;
 };
 
 [[nodiscard]] LoadedText load_text(const std::string& artifact_path, DeviceContext& device,
