@@ -12,9 +12,9 @@ namespace ninfer::ops {
 /**
  * Dense non-causal attention for the Gemma 4 vision encoder.
  *
- *   score[j]   = fp32(dot(q[:,h,i], k[:,h,j]))      (cuBLAS bf16 GEMM, fp32 store)
+ *   score[j]   = fp32(dot(q[:,h,i], k[:,h,j]))
  *   weight[j] = bf16(softmax(score)[j])             (fp32 softmax, then round)
- *   out[:,h,i] = sum_j weight[j] * v[:,h,j]         (cuBLAS bf16 GEMM)
+ *   out[:,h,i] = sum_j weight[j] * v[:,h,j]
  *
  * q/k/v/out are contiguous BF16 [72,16,T]. scores is contiguous FP32 with at least 16*T*T
  * elements (col-major T×T per head); logits stay fp32 through the softmax. weights is

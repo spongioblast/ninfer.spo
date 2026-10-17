@@ -28,7 +28,7 @@ Scheduling is a fixed set of resident lanes, chosen at startup (`--max-concurren
 - `src/program/execution/graph_family.h` holds the decode CUDA Graph families: one executable per topology class, updated in place to the profile that covers the batch and frontier.
 - `src/program/execution/causal_score.h` is the perplexity path around a family's own prefill and projection: request checks, the scoring lane, tile staging, and target logprobs.
 
-Gemma 4 captures its text prefill for the widths in `src/models/gemma4/program/prefill_graphs.h` (32, 64, 128, 256, 512, 1024). A chunk that carries vision embeddings, or any other width, stays eager.
+Gemma 4 captures its text prefill for the widths in `src/models/gemma4/program/prefill_graphs.h` (32, 64, 128, 256, 512, 1024). A chunk that carries vision embeddings, or any other width, stays eager. Vision attention computes its own fp32 dots and value multiply. The encoder projections that match a registered BF16 shape go through `ops::linear`; gate/up is two 4304-row multiplies.
 
 Model math does not live here. Each family still owns its program transactions under `src/models/<family>/program/`. Flash-Next's program is `src/models/qwen3_8_flash_next/program/v3_program.h`. Qwen3.5's is `src/models/qwen3_5/program/program.h`. Gemma 4's is `src/models/gemma4/program/program.h`. The transaction sets are shaped differently (Qwen3.5 keeps upstream's per-transaction files, Flash-Next its P3–P6 split, Gemma its own round), so they are not hoisted. `tests/program/test_attention_only_core.cpp` drives the shared storage with two KV pools of different geometry and no recurrent state.
 

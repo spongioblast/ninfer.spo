@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Gemma 4 vision attention no longer uses cuBLAS. The dots and the value multiply are ours, and the softmax between them is unchanged. The encoder's registered BF16 projections, including each half of gate/up, run on the BF16 tensor-core kernels.
 - `Bf16GemmContext` takes no cuBLAS workspace unless the caller asks for one. The 64 MiB buffer changed the summation order and moved the Flash-Next greedy prefix and the Gemma bf16 parity.
 - Gemma 4 text prefill of 32, 64, 128, 256, 512, and 1024 tokens runs as one CUDA graph (`prefill_graphs.h`). Vision chunks stay eager.
 - Gemma 4 FP8 A8 uses a 64-token tile at 128 tokens and a 128-row tile up to 512 tokens, where those beat the 128×256 bulk tile.
