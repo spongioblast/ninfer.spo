@@ -384,6 +384,88 @@ double run_margin(Runner& runner, const std::vector<std::int32_t>& prompt, int r
     return accept;
 }
 
+// Teacher-forced drafter ranks along the greedy continuation. One line per start: six ranks of
+// the true next token in the drafter's top 8 (8 means it was not there). chain5 accept is the
+// mean tokens per round of the rank-0 chain, which should match a K=5 MTP run.
+void run_rank(Runner& runner, const std::vector<std::int32_t>& prompt, int generate, int depth,
+              int k, const fs::path& out_path) {
+    if (prompt.size() < 2 || generate < 1) {
+        throw std::runtime_error("rank prompt does not leave room for the draft depth");
+    }
+    const auto& loaded = runner.loaded;
+    const int total    = static_cast<int>(prompt.size()) + generate + depth;
+    Cache growing(loaded, (total + kPage - 1) / kPage);
+    int fed = static_cast<int>(prompt.size());
+    std::int32_t anchor = runner.forward(growing, prompt, 0, fed - 1).back();
+    std::vector<std::int32_t> ids = prompt;
+    for (int index = 0; index < generate + depth; ++index) {
+        ids.push_back(anchor);
+        anchor = runner.forward(growing, {anchor}, fed, 0).back();
+        ++fed;
+    }
+    Cache filled(loaded, (total + kPage - 1) / kPage);
+    runner.forward(filled, ids, 0, -1);
+    const int prompt_len = static_cast<int>(prompt.size());
+    const int hidden = loaded.hidden;
+    ninfer::DeviceBuffer token_buf(4);
+    ninfer::DeviceBuffer pos_buf(4);
+    ninfer::DeviceBuffer top_buf(static_cast<std::size_t>(k) * 4);
+    std::ofstream out(out_path);
+    if (!out) { throw std::runtime_error("cannot write " + out_path.string()); }
+    int starts = 0;
+    int accepted = 0;
+    std::vector<std::int32_t> top(static_cast<std::size_t>(k));
+    for (int start = prompt_len; start + depth < static_cast<int>(ids.size()); ++start) {
+        ninfer::Tensor carry(runner.carry_buf.p, ninfer::DType::BF16, {hidden, 1});
+        ninfer::Tensor column(static_cast<std::byte*>(runner.hidden_buf.p) +
+                                  static_cast<std::size_t>(start - 1) * hidden * 2,
+                              ninfer::DType::BF16, {hidden, 1});
+        ninfer::ops::rmsnorm(column,
+                             ninfer::Tensor(const_cast<void*>(loaded.final_norm),
+                                            ninfer::DType::BF16, {hidden}),
+                             loaded.rms_eps, false, carry, runner.stream);
+        int leading = 0;
+        bool open    = true;
+        for (int step = 0; step < depth; ++step) {
+            const std::int32_t token = ids[static_cast<std::size_t>(start + step)];
+            const std::int32_t position = start - 1;
+            check(cudaMemcpyAsync(token_buf.p, &token, 4, cudaMemcpyHostToDevice, runner.stream),
+                  "rank token");
+            check(cudaMemcpyAsync(pos_buf.p, &position, 4, cudaMemcpyHostToDevice, runner.stream),
+                  "rank position");
+            runner.workspace.reset();
+            const ninfer::Tensor token_tensor(token_buf.p, ninfer::DType::I32, {1});
+            const ninfer::Tensor pos_tensor(pos_buf.p, ninfer::DType::I32, {1});
+            ninfer::Tensor top_tensor(top_buf.p, ninfer::DType::I32, {k, 1});
+            g4::gemma4_draft_steps(token_tensor, pos_tensor, carry, carry, top_tensor, k,
+                                   loaded.token_embedding, *loaded.draft, filled.layers, runner.gemm,
+                                   runner.workspace, runner.stream);
+            check(cudaMemcpyAsync(top.data(), top_buf.p, top.size() * 4, cudaMemcpyDeviceToHost,
+                                  runner.stream),
+                  "rank top");
+            check(cudaStreamSynchronize(runner.stream), "rank");
+            const std::int32_t truth = ids[static_cast<std::size_t>(start + step + 1)];
+            int rank = k;
+            for (int index = 0; index < k; ++index) {
+                if (top[static_cast<std::size_t>(index)] == truth) {
+                    rank = index;
+                    break;
+                }
+            }
+            if (step != 0) { out << ' '; }
+            out << rank;
+            if (open && rank == 0 && step < kDrafts) { ++leading; }
+            else { open = false; }
+        }
+        out << '\n';
+        accepted += leading + 1;
+        ++starts;
+    }
+    std::cout << "rank starts " << starts << " chain5 accept "
+              << (starts == 0 ? 0.0 : static_cast<double>(accepted) / starts) << " file "
+              << out_path << std::endl;
+}
+
 } // namespace
 
 int main() {
@@ -392,6 +474,36 @@ int main() {
     if (artifact == nullptr || !std::ifstream(artifact).good()) {
         std::cout << "SKIP: NINFER_GEMMA4_MTP_WEIGHTS is unset\n";
         return 77;
+    }
+    const char* rank_out = std::getenv("NINFER_GEMMA4_RANK_OUT");
+    const char* rank_ids = std::getenv("NINFER_GEMMA4_RANK_IDS");
+    if (rank_out != nullptr && rank_ids != nullptr) {
+        try {
+            const int prompt = std::max(2, std::atoi(std::getenv("NINFER_GEMMA4_RANK_PROMPT") != nullptr
+                                                         ? std::getenv("NINFER_GEMMA4_RANK_PROMPT")
+                                                         : "512"));
+            const int gen = std::max(8, std::atoi(std::getenv("NINFER_GEMMA4_RANK_GEN") != nullptr
+                                                      ? std::getenv("NINFER_GEMMA4_RANK_GEN")
+                                                      : "64"));
+            constexpr int kDepth = 6;
+            constexpr int kTop   = 8;
+            const auto ids =
+                read_text_ids(rank_ids, static_cast<std::size_t>(prompt));
+            std::cout << "rank load " << artifact << " prompt " << prompt << " gen " << gen
+                      << std::endl;
+            ninfer::DeviceContext device;
+            auto loaded         = g4::load_text(artifact, device, true);
+            cudaStream_t stream = nullptr;
+            check(cudaStreamCreate(&stream), "stream");
+            const int total = prompt + gen + kDepth;
+            Runner runner(loaded, stream, total, workspace_for(loaded, total));
+            run_rank(runner, ids, gen, kDepth, kTop, rank_out);
+            cudaStreamDestroy(stream);
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "EXC " << error.what() << '\n';
+            return 1;
+        }
     }
     if (margin != nullptr) {
         try {
