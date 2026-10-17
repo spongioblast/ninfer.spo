@@ -1,7 +1,11 @@
 #include "ninfer/ops/linear.h"
 
-#include <cublas_v2.h>
+#include "core/device.h"
 
+#include <cublas_v2.h>
+#include <cuda_runtime.h>
+
+#include <cstddef>
 #include <sstream>
 #include <stdexcept>
 
@@ -18,26 +22,37 @@ void check_cublas(cublasStatus_t status, const char* operation) {
 } // namespace
 
 struct Bf16GemmContext::Impl {
-    cublasHandle_t handle = nullptr;
-    cudaStream_t stream   = nullptr;
+    cublasHandle_t handle      = nullptr;
+    cudaStream_t stream        = nullptr;
+    void* workspace            = nullptr;
+    std::size_t workspace_bytes = 0;
 };
 
-Bf16GemmContext::Bf16GemmContext(cudaStream_t stream) : impl_(std::make_unique<Impl>()) {
+Bf16GemmContext::Bf16GemmContext(cudaStream_t stream, std::size_t workspace_bytes)
+    : impl_(std::make_unique<Impl>()) {
     if (stream == nullptr) { throw std::invalid_argument("BF16 GEMM context requires a stream"); }
     check_cublas(cublasCreate(&impl_->handle), "cublasCreate");
     try {
         check_cublas(cublasSetStream(impl_->handle, stream), "cublasSetStream");
         check_cublas(cublasSetMathMode(impl_->handle, CUBLAS_TENSOR_OP_MATH), "cublasSetMathMode");
-        check_cublas(cublasSetWorkspace(impl_->handle, nullptr, 0), "cublasSetWorkspace");
+        if (workspace_bytes > 0) {
+            CUDA_CHECK(cudaMalloc(&impl_->workspace, workspace_bytes));
+            impl_->workspace_bytes = workspace_bytes;
+        }
+        check_cublas(cublasSetWorkspace(impl_->handle, impl_->workspace, impl_->workspace_bytes),
+                     "cublasSetWorkspace");
         impl_->stream = stream;
     } catch (...) {
+        if (impl_->workspace != nullptr) { (void)cudaFree(impl_->workspace); }
         (void)cublasDestroy(impl_->handle);
         throw;
     }
 }
 
 Bf16GemmContext::~Bf16GemmContext() {
-    if (impl_ && impl_->handle != nullptr) { (void)cublasDestroy(impl_->handle); }
+    if (!impl_) { return; }
+    if (impl_->workspace != nullptr) { (void)cudaFree(impl_->workspace); }
+    if (impl_->handle != nullptr) { (void)cublasDestroy(impl_->handle); }
 }
 
 void Bf16GemmContext::launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {

@@ -16,7 +16,10 @@ namespace ninfer::ops {
 // Decode and graph shapes stay on the fixed CUDA kernels. A null pointer selects those kernels.
 class Bf16GemmContext {
 public:
-    explicit Bf16GemmContext(cudaStream_t stream);
+    // workspace_bytes == 0 keeps cuBLAS without a workspace (fixed algorithms, the setting the
+    // decode graphs and the stored greedy prefixes were made with). A positive size lets cuBLAS
+    // pick split-K algorithms, which changes the summation order.
+    explicit Bf16GemmContext(cudaStream_t stream, std::size_t workspace_bytes = 0);
     ~Bf16GemmContext();
 
     Bf16GemmContext(const Bf16GemmContext&)            = delete;
@@ -153,5 +156,11 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 // Same A16 route. A non-null context runs a BF16 weight at T > 16 through cuBLAS.
 void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
             Bf16GemmContext* bf16_gemm);
+
+// FP8 A8 GEMM whose activation codes and per-token scales are already written. Used when the
+// producer (GeGLU) quantized its BF16 output. Only the Gemma down shape 5376x21504.
+void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                     std::uint8_t* codes, float* scales, WorkspaceArena& workspace,
+                     cudaStream_t stream);
 
 } // namespace ninfer::ops
