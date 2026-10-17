@@ -8,7 +8,6 @@
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/residual_scale.h"
 #include "ninfer/ops/rmsnorm.h"
-#include "ninfer/ops/rope.h"
 #include "ninfer/ops/vision_pos_embed.h"
 
 #include <algorithm>
@@ -60,6 +59,60 @@ void copy_rows(void* dst, const void* src, int row_offset, int rows, int src_row
 
 Tensor heads_view(Tensor& matrix, int tokens) {
     return matrix.view({kHeadDim, kHeads, tokens});
+}
+
+// Axial 2-D RoPE: 36-dim rotate-half on x, then on y. HF concatenates [xh,xh,yw,yw].
+void gemma4_vision_axial_rope(const Tensor& positions, Tensor& q, Tensor& k, float theta,
+                              cudaStream_t stream) {
+    const int dim    = q.ne[0];
+    const int heads  = q.ne[1];
+    const int tokens = q.ne[2];
+    if (dim != kHeadDim || heads != kHeads || k.ne[0] != dim || k.ne[1] != heads ||
+        k.ne[2] != tokens) {
+        throw std::invalid_argument("gemma4_vision: RoPE needs [72,16,T] q and k");
+    }
+    const std::size_t elems = static_cast<std::size_t>(dim) * heads * tokens;
+    std::vector<std::uint16_t> q_host(elems);
+    std::vector<std::uint16_t> k_host(elems);
+    std::vector<std::int32_t> pos(static_cast<std::size_t>(tokens) * 2);
+    CUDA_CHECK(cudaMemcpyAsync(q_host.data(), q.data, elems * 2, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(k_host.data(), k.data, elems * 2, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(pos.data(), positions.data, pos.size() * 4, cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    float freq[18];
+    for (int i = 0; i < 18; ++i) {
+        freq[i] = std::pow(theta, -2.0f * static_cast<float>(i) / 36.0f);
+    }
+    auto apply = [&](std::vector<std::uint16_t>& host) {
+        for (int t = 0; t < tokens; ++t) {
+            const float px = static_cast<float>(pos[static_cast<std::size_t>(t)]);
+            const float py =
+                static_cast<float>(pos[static_cast<std::size_t>(t) + static_cast<std::size_t>(tokens)]);
+            for (int head = 0; head < heads; ++head) {
+                const std::size_t base =
+                    static_cast<std::size_t>(t) * heads * dim + static_cast<std::size_t>(head) * dim;
+                auto axis = [&](int offset, float coordinate) {
+                    for (int i = 0; i < 18; ++i) {
+                        const float angle = coordinate * freq[i];
+                        const float c     = std::cos(angle);
+                        const float s     = std::sin(angle);
+                        const float a = bf16_to_f32(host[base + static_cast<std::size_t>(offset + i)]);
+                        const float b =
+                            bf16_to_f32(host[base + static_cast<std::size_t>(offset + 18 + i)]);
+                        host[base + static_cast<std::size_t>(offset + i)]      = f32_to_bf16(a * c - b * s);
+                        host[base + static_cast<std::size_t>(offset + 18 + i)] = f32_to_bf16(b * c + a * s);
+                    }
+                };
+                axis(0, px);
+                axis(36, py);
+            }
+        }
+    };
+    apply(q_host);
+    apply(k_host);
+    CUDA_CHECK(cudaMemcpyAsync(q.data, q_host.data(), elems * 2, cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(k.data, k_host.data(), elems * 2, cudaMemcpyHostToDevice, stream));
 }
 
 void scale_patches(const Tensor& patches, Tensor& out, cudaStream_t stream) {
@@ -174,9 +227,11 @@ std::size_t gemma4_vision_workspace_bytes(const Gemma4VisionWeights& weights, in
     const auto pix   = static_cast<std::size_t>(weights.patch_pixels);
     const auto t     = static_cast<std::size_t>(patches);
     const auto p     = static_cast<std::size_t>(pooled);
-    const std::size_t elements =
-        pix * t + 4 * h * t + 3 * h * t + 2 * inter * t + inter * t + 72 + h * p + h * p +
-        static_cast<std::size_t>(weights.text_hidden) * p;
+    // scaled; x,h; qkv; q,k,v; qn,kn,vn; attn,proj,proj_n; gate,act; ones; pooled; attn scores.
+    const std::size_t bf16 =
+        pix * t + 14 * h * t + 3 * inter * t + 72 + h + 2 * h * p + 16 * t * t;
+    const std::size_t score_fp32 = 16 * t * t * 4;
+    const std::size_t extra = 8 * t * 4; // idx I32 [4,T] and wts FP32 [4,T]
     const std::size_t scratch = std::max({projection_bytes(weights.patch_projection,
                                                            ops::LinearPolicy::A16Only, patches),
                                           projection_bytes(weights.embedding_projection,
@@ -184,7 +239,7 @@ std::size_t gemma4_vision_workspace_bytes(const Gemma4VisionWeights& weights, in
                                           projection_bytes(weights.layers.empty() ? weights.patch_projection
                                                                                   : weights.layers[0].qkv,
                                                            ops::LinearPolicy::A16Only, patches)});
-    return elements * 2 + scratch + 24 * kAlign;
+    return bf16 * 2 + score_fp32 + extra + scratch + 24 * kAlign;
 }
 
 void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const Tensor& mask,
@@ -241,6 +296,8 @@ void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const 
     auto wts       = workspace.alloc(DType::FP32, {4, tokens});
     auto pooled_x  = workspace.alloc(DType::BF16, {hidden, pooled});
     auto pooled_n  = workspace.alloc(DType::BF16, {hidden, pooled});
+    auto scores       = workspace.alloc(DType::FP32, {tokens, tokens, kHeads});
+    auto attn_weights = workspace.alloc(DType::BF16, {tokens, tokens, kHeads});
     std::vector<std::uint16_t> one_head(static_cast<std::size_t>(dim), f32_to_bf16(1.0f));
     std::vector<std::uint16_t> one_hid(static_cast<std::size_t>(hidden), f32_to_bf16(1.0f));
     CUDA_CHECK(cudaMemcpyAsync(ones_head.data, one_head.data(), one_head.size() * 2,
@@ -279,8 +336,6 @@ void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const 
     Tensor table_view(const_cast<void*>(weights.position_table), DType::BF16,
                       {hidden, 2 * table});
     ops::vision_pos_embed_add(table_view, idx, wts, x, stream);
-
-    auto exec = execution_for_stream(stream);
     for (const auto& layer : weights.layers) {
         require_matrix(layer.qkv, 3 * hidden, hidden, "qkv");
         require_matrix(layer.o_proj, hidden, hidden, "o_proj");
@@ -300,9 +355,9 @@ void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const 
         ops::rmsnorm(qh, norm_weight(layer.q_norm, dim), weights.rms_eps, false, qn_h, stream);
         ops::rmsnorm(kh, norm_weight(layer.k_norm, dim), weights.rms_eps, false, kn_h, stream);
         ops::rmsnorm(vh, ones_head, weights.rms_eps, false, vn_h, stream);
-        ops::rope(positions, dim, weights.rope_theta, qn_h, kn_h, exec);
+        gemma4_vision_axial_rope(positions, qn_h, kn_h, weights.rope_theta, stream);
         Tensor ah = heads_view(attn, tokens);
-        ops::gemma4_vision_attention(qn_h, kn_h, vn_h, &mask, ah, stream);
+        ops::gemma4_vision_attention(qn_h, kn_h, vn_h, &mask, scores, attn_weights, ah, stream);
         project(attn, layer.o_proj, layer.o_policy, proj, gemm, workspace, stream);
         ops::rmsnorm(proj, norm_weight(layer.post_attn_norm, hidden), weights.rms_eps, false, proj_n,
                      stream);
@@ -318,7 +373,6 @@ void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const 
         ops::residual_add(proj_n, x, stream);
         if (layer.layer_scalar != 1.0f) { ops::residual_scale(x, layer.layer_scalar, stream); }
     }
-
     Tensor bias(const_cast<void*>(weights.std_bias), DType::BF16, {hidden});
     Tensor scale(const_cast<void*>(weights.std_scale), DType::BF16, {hidden});
     pool_and_standardize(x, positions, bias, scale, pool, pooled_x, stream);

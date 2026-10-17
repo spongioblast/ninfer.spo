@@ -35,41 +35,35 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
     auto valid = [&](int token) {
         return mask == nullptr || (*mask)[static_cast<std::size_t>(token)] != 0;
     };
+    auto score = [&](int token, int head, int key) {
+        double dot = 0.0;
+        for (int dim = 0; dim < kDim; ++dim) {
+            dot += static_cast<double>(q[index(token, head, dim)]) *
+                   static_cast<double>(k[index(key, head, dim)]);
+        }
+        return dot;
+    };
     std::vector<double> expected(count, 0.0);
     for (int token = 0; token < tokens; ++token) {
-        if (!valid(token)) { continue; }
         for (int head = 0; head < kHeads; ++head) {
             double maximum = -1.0e300;
             int seen       = 0;
             for (int key = 0; key < tokens; ++key) {
                 if (!valid(key)) { continue; }
-                double dot = 0.0;
-                for (int dim = 0; dim < kDim; ++dim) {
-                    dot += static_cast<double>(q[index(token, head, dim)]) *
-                           static_cast<double>(k[index(key, head, dim)]);
-                }
-                maximum = std::max(maximum, dot);
+                maximum = std::max(maximum, score(token, head, key));
                 ++seen;
             }
             if (seen == 0) { continue; }
             double sum = 0.0;
             for (int key = 0; key < tokens; ++key) {
                 if (!valid(key)) { continue; }
-                double dot = 0.0;
-                for (int dim = 0; dim < kDim; ++dim) {
-                    dot += static_cast<double>(q[index(token, head, dim)]) *
-                           static_cast<double>(k[index(key, head, dim)]);
-                }
-                sum += std::exp(dot - maximum);
+                sum += std::exp(score(token, head, key) - maximum);
             }
             for (int key = 0; key < tokens; ++key) {
                 if (!valid(key)) { continue; }
-                double dot = 0.0;
-                for (int dim = 0; dim < kDim; ++dim) {
-                    dot += static_cast<double>(q[index(token, head, dim)]) *
-                           static_cast<double>(k[index(key, head, dim)]);
-                }
-                const double weight = std::exp(dot - maximum) / sum;
+                const double weight = static_cast<double>(
+                    bf16_to_f32(f32_to_bf16(static_cast<float>(
+                        std::exp(score(token, head, key) - maximum) / sum))));
                 for (int dim = 0; dim < kDim; ++dim) {
                     expected[index(token, head, dim)] +=
                         weight * static_cast<double>(v[index(key, head, dim)]);
@@ -88,6 +82,9 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
     const auto v_bits = bits(v);
     GuardedDeviceBuffer dq(q_bits.size() * 2), dk(k_bits.size() * 2), dv(v_bits.size() * 2),
         dout(q_bits.size() * 2);
+    const auto cells = static_cast<std::size_t>(kHeads) * tokens * tokens;
+    GuardedDeviceBuffer dscores(cells * 4);
+    GuardedDeviceBuffer dweights(cells * 2);
     dq.copy_from_host(q_bits.data(), dq.bytes());
     dk.copy_from_host(k_bits.data(), dk.bytes());
     dv.copy_from_host(v_bits.data(), dv.bytes());
@@ -95,6 +92,8 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
     Tensor k_tensor(dk.data(), DType::BF16, {kDim, kHeads, tokens});
     Tensor v_tensor(dv.data(), DType::BF16, {kDim, kHeads, tokens});
     Tensor out_tensor(dout.data(), DType::BF16, {kDim, kHeads, tokens});
+    Tensor scores_tensor(dscores.data(), DType::FP32, {tokens, tokens, kHeads});
+    Tensor weights_tensor(dweights.data(), DType::BF16, {tokens, tokens, kHeads});
     GuardedDeviceBuffer dmask(mask == nullptr ? 4 : mask->size() * 4);
     const Tensor* mask_ptr = nullptr;
     Tensor mask_tensor;
@@ -103,7 +102,8 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
         mask_tensor = Tensor(dmask.data(), DType::I32, {tokens});
         mask_ptr    = &mask_tensor;
     }
-    ops::gemma4_vision_attention(q_tensor, k_tensor, v_tensor, mask_ptr, out_tensor, nullptr);
+    ops::gemma4_vision_attention(q_tensor, k_tensor, v_tensor, mask_ptr, scores_tensor,
+                                 weights_tensor, out_tensor, nullptr);
     cuda_synchronize();
     int failures = verify_pointwise(label, from_device_bf16(dout.data(), count), expected,
                                     kCriterion);
@@ -111,6 +111,8 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
     failures += dk.verify_guards("k");
     failures += dv.verify_guards("v");
     failures += dout.verify_guards("out");
+    failures += dscores.verify_guards("scores");
+    failures += dweights.verify_guards("weights");
     return failures;
 }
 

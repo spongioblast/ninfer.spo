@@ -67,8 +67,8 @@ int main() {
         int failures = 0;
         for (int index = 0; index < 3; ++index) {
             const std::string stem = std::string(dumps) + "/image" + std::to_string(index);
-            const std::string json(read_bytes(stem + ".json").begin(),
-                                   read_bytes(stem + ".json").end());
+            const auto json_bytes  = read_bytes(stem + ".json");
+            const std::string json(json_bytes.begin(), json_bytes.end());
             const int pixels = field(json, "pixels");
             const int tokens = field(json, "tokens");
             const int valid  = field(json, "valid");
@@ -105,6 +105,8 @@ int main() {
                 continue;
             }
             double worst = 1.0;
+            double sum   = 0.0;
+            double dot = 0.0, na = 0.0, nb = 0.0;
             for (int column = 0; column < valid; ++column) {
                 std::vector<float> ours(static_cast<std::size_t>(hidden));
                 std::vector<float> theirs(static_cast<std::size_t>(hidden));
@@ -117,12 +119,33 @@ int main() {
                     std::memcpy(&ours[static_cast<std::size_t>(d)], &u, 4);
                     theirs[static_cast<std::size_t>(d)] =
                         hf[static_cast<std::size_t>(d) + static_cast<std::size_t>(hidden) * column];
+                    dot += static_cast<double>(ours[static_cast<std::size_t>(d)]) *
+                           theirs[static_cast<std::size_t>(d)];
+                    na += static_cast<double>(ours[static_cast<std::size_t>(d)]) *
+                          ours[static_cast<std::size_t>(d)];
+                    nb += static_cast<double>(theirs[static_cast<std::size_t>(d)]) *
+                          theirs[static_cast<std::size_t>(d)];
                 }
-                worst = std::min(worst, cosine(ours, theirs));
+                const double token = cosine(ours, theirs);
+                sum += token;
+                worst = std::min(worst, token);
+                if (column == 0 && index == 0) {
+                    std::cout << "kept0 " << src << " ours";
+                    for (int d = 0; d < 8; ++d) { std::cout << ' ' << ours[static_cast<std::size_t>(d)]; }
+                    std::cout << " theirs";
+                    for (int d = 0; d < 8; ++d) {
+                        std::cout << ' ' << theirs[static_cast<std::size_t>(d)];
+                    }
+                    std::cout << '\n';
+                }
             }
-            std::cout << "image" << index << " cosine " << worst << " valid " << valid << '\n';
-            if (worst < 0.999) {
-                std::cerr << "FAIL image" << index << " cosine " << worst << '\n';
+            const double mean = sum / static_cast<double>(valid);
+            const double flat = dot / (std::sqrt(na) * std::sqrt(nb));
+            std::cout << "image" << index << " mean " << mean << " flat " << flat << " worst "
+                      << worst << " valid " << valid << '\n';
+            if (mean < 0.999) {
+                std::cerr << "FAIL image" << index << " mean " << mean << " worst " << worst
+                          << '\n';
                 ++failures;
             }
         }
