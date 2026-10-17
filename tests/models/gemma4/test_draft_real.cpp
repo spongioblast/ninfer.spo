@@ -6,6 +6,9 @@
 // <name>.draft.json, <name>.carry.bin (BF16 [kDrafts+1][hidden], the carried state before every
 // step), <name>.sliding.bin and <name>.global.bin (BF16 K then V as [kv][positions][D] of the
 // assistant's KV source layers, the sliding one over its last window positions).
+// NINFER_GEMMA4_MARGIN_CORPUS names a whitespace token-id file. With the MTP artifact set, the
+// test then skips the fixtures and scores that prompt: for each round it prints the first draft,
+// the target argmax, that draft's rank in the target distribution, and the softcapped logit gap.
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/gemma4/execution/draft_forward.h"
@@ -23,6 +26,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -52,6 +56,28 @@ std::vector<std::int32_t> read_ids(const fs::path& path) {
     in.seekg(0);
     in.read(reinterpret_cast<char*>(ids.data()), static_cast<std::streamsize>(ids.size() * 4));
     return ids;
+}
+
+std::vector<std::int32_t> read_text_ids(const fs::path& path, std::size_t limit) {
+    std::ifstream in(path);
+    if (!in) { throw std::runtime_error("cannot open " + path.string()); }
+    std::vector<std::int32_t> ids;
+    ids.reserve(limit);
+    long long value = 0;
+    while (ids.size() < limit && (in >> value)) {
+        ids.push_back(static_cast<std::int32_t>(value));
+    }
+    if (ids.size() < limit) {
+        throw std::runtime_error("corpus is shorter than the requested prompt");
+    }
+    return ids;
+}
+
+float bf16_to_float(std::uint16_t bits) {
+    const std::uint32_t wide = static_cast<std::uint32_t>(bits) << 16;
+    float value = 0.0f;
+    std::memcpy(&value, &wide, sizeof(value));
+    return value;
 }
 
 void write_raw(const fs::path& path, const void* data, std::size_t bytes) {
@@ -126,15 +152,18 @@ struct Runner {
     ninfer::DeviceBuffer carry_buf;
     ninfer::DeviceBuffer slots_buf;
 
-    Runner(g4::LoadedText& model, cudaStream_t s, int max_tokens)
-        : loaded(model), stream(s), gemm(s), workspace(1024u * 1024u * 1024u),
+    Runner(g4::LoadedText& model, cudaStream_t s, int max_tokens, std::size_t workspace_bytes)
+        : loaded(model), stream(s), gemm(s), workspace(workspace_bytes),
           hidden_buf(static_cast<std::size_t>(model.hidden) * max_tokens * 2),
           carry_buf(static_cast<std::size_t>(model.hidden) * 2), slots_buf((2 + kDrafts) * 4) {}
 
-    // Runs `ids` at positions first.. and returns the argmax of every column. With `carry_column`
-    // the final-normed hidden state of that column lands in carry_buf.
+    // Runs `ids` at positions first.. and returns the argmax of every scored column. With
+    // `carry_column` the final-normed hidden state of that column lands in carry_buf. When
+    // `first_column` is set and the forward is at most kDrafts+1 tokens, it receives the
+    // softcapped logits of column 0 (the anchor).
     std::vector<std::int32_t> forward(Cache& cache, const std::vector<std::int32_t>& ids,
-                                      int first, int carry_column) {
+                                      int first, int carry_column,
+                                      std::vector<float>* first_column = nullptr) {
         const int count = static_cast<int>(ids.size());
         std::vector<std::int32_t> positions(ids.size());
         for (int i = 0; i < count; ++i) { positions[static_cast<std::size_t>(i)] = first + i; }
@@ -163,10 +192,26 @@ struct Runner {
                                                 ninfer::DType::BF16, {loaded.hidden}),
                                  loaded.rms_eps, false, carry, stream);
         }
+        std::vector<std::uint16_t> raw_column;
+        if (first_column != nullptr) {
+            if (count != scored) {
+                throw std::logic_error("first-column logits are the anchor only for a short forward");
+            }
+            raw_column.resize(static_cast<std::size_t>(loaded.vocab));
+            check(cudaMemcpyAsync(raw_column.data(), logits.data, raw_column.size() * 2,
+                                  cudaMemcpyDeviceToHost, stream),
+                  "column logits");
+        }
         std::vector<std::int32_t> tokens(static_cast<std::size_t>(scored));
         check(cudaMemcpyAsync(tokens.data(), out.data, tokens.size() * 4, cudaMemcpyDeviceToHost,
                               stream), "argmax");
         check(cudaStreamSynchronize(stream), "forward");
+        if (first_column != nullptr) {
+            first_column->resize(raw_column.size());
+            for (std::size_t i = 0; i < raw_column.size(); ++i) {
+                (*first_column)[i] = bf16_to_float(raw_column[i]);
+            }
+        }
         return tokens;
     }
 
@@ -265,12 +310,135 @@ int run_prompt(Runner& runner, const std::vector<std::int32_t>& prompt, const st
     return agreed_total;
 }
 
+std::size_t workspace_for(const g4::LoadedText& loaded, int tokens) {
+    std::size_t bytes = 0;
+    for (const g4::Gemma4LayerWeights& layer : loaded.layers) {
+        bytes = std::max(bytes, g4::gemma4_layer_workspace_bytes(layer, tokens));
+    }
+    if (loaded.draft != nullptr) {
+        bytes = std::max(bytes, g4::gemma4_draft_workspace_bytes(*loaded.draft));
+    }
+    bytes += static_cast<std::size_t>(loaded.hidden) * static_cast<std::size_t>(tokens) * 2U;
+    bytes += static_cast<std::size_t>(loaded.vocab) * static_cast<std::size_t>(kDrafts + 1) * 2U;
+    return bytes + 64U * 1024U * 1024U;
+}
+
+// One prompt, printing the target-distribution gap of every first draft. Stops after `rounds`
+// or once `token_budget` generated tokens have been emitted (0 means no token cap).
+double run_margin(Runner& runner, const std::vector<std::int32_t>& prompt, int rounds,
+                  int token_budget) {
+    const int total = static_cast<int>(prompt.size()) + rounds * (kDrafts + 1);
+    Cache cache(runner.loaded, (total + kPage - 1) / kPage);
+    int fed = static_cast<int>(prompt.size());
+    std::cout << "prefill " << prompt.size() << std::endl;
+    std::int32_t anchor = runner.forward(cache, prompt, 0, fed - 1).back();
+    std::cout << "anchor " << anchor << std::endl;
+    int agreed_total    = 0;
+    int first_hits      = 0;
+    int generated       = 0;
+    int per_pos[kDrafts]{};
+    std::vector<float> column;
+    const int vocab = runner.loaded.vocab;
+    int round       = 0;
+    for (; round < rounds && (token_budget <= 0 || generated < token_budget); ++round) {
+        const auto drafts = runner.draft(cache, anchor, fed - 1, nullptr);
+        std::vector<std::int32_t> verify{anchor};
+        verify.insert(verify.end(), drafts.begin(), drafts.end());
+        const auto targets = runner.forward(cache, verify, fed, -1, &column);
+        int agreed = 0;
+        while (agreed < kDrafts && drafts[static_cast<std::size_t>(agreed)] ==
+                                       targets[static_cast<std::size_t>(agreed)]) {
+            ++agreed;
+        }
+        const int draft0  = drafts[0];
+        const int target0 = targets[0];
+        if (draft0 < 0 || draft0 >= vocab || target0 < 0 || target0 >= vocab) {
+            throw std::runtime_error("draft or target id is outside the vocab");
+        }
+        const float draft_logit  = column[static_cast<std::size_t>(draft0)];
+        const float target_logit = column[static_cast<std::size_t>(target0)];
+        int rank = 1;
+        for (const float value : column) {
+            if (value > draft_logit) { ++rank; }
+        }
+        std::cout << "round " << round << " pos " << (fed - 1) << " draft0 " << draft0
+                  << " target0 " << target0 << " rank " << rank << " logit_draft " << draft_logit
+                  << " logit_target " << target_logit                   << " gap " << (target_logit - draft_logit) << " agreed " << agreed << std::endl;
+        if (draft0 == target0) { ++first_hits; }
+        agreed_total += agreed;
+        generated += agreed + 1;
+        for (int index = 0; index < agreed; ++index) { ++per_pos[index]; }
+        runner.forward(cache,
+                       std::vector<std::int32_t>(verify.begin(), verify.begin() + agreed + 1), fed,
+                       agreed);
+        fed += agreed + 1;
+        anchor = targets[static_cast<std::size_t>(agreed)];
+    }
+    const double accept = round == 0 ? 0.0 : static_cast<double>(generated) / round;
+    std::cout << "margin: " << prompt.size() << " prompt tokens, " << round << " rounds, generated "
+              << generated << ", first " << first_hits << '/' << round << ", agreed " << agreed_total
+              << " of " << round * kDrafts << " (" << static_cast<double>(agreed_total) / round
+              << " per round, accept " << accept << ") positions";
+    for (const int count : per_pos) { std::cout << ' ' << count; }
+    std::cout << std::endl;
+    return accept;
+}
+
 } // namespace
 
 int main() {
-    const char* fixtures = std::getenv("NINFER_GEMMA4_PARITY");
     const char* artifact = std::getenv("NINFER_GEMMA4_MTP_WEIGHTS");
-    if (fixtures == nullptr || artifact == nullptr || !std::ifstream(artifact).good()) {
+    const char* margin   = std::getenv("NINFER_GEMMA4_MARGIN_CORPUS");
+    if (artifact == nullptr || !std::ifstream(artifact).good()) {
+        std::cout << "SKIP: NINFER_GEMMA4_MTP_WEIGHTS is unset\n";
+        return 77;
+    }
+    if (margin != nullptr) {
+        try {
+            const int length = std::atoi(
+                std::getenv("NINFER_GEMMA4_MARGIN_LEN") != nullptr
+                    ? std::getenv("NINFER_GEMMA4_MARGIN_LEN")
+                    : "4096");
+            const int rounds = std::atoi(
+                std::getenv("NINFER_GEMMA4_MARGIN_ROUNDS") != nullptr
+                    ? std::getenv("NINFER_GEMMA4_MARGIN_ROUNDS")
+                    : "32");
+            if (length < 2 || rounds < 1) {
+                throw std::runtime_error("margin length and rounds must be positive");
+            }
+            const int prompt_count = std::max(
+                1, std::atoi(std::getenv("NINFER_GEMMA4_MARGIN_PROMPTS") != nullptr
+                                 ? std::getenv("NINFER_GEMMA4_MARGIN_PROMPTS")
+                                 : "1"));
+            const int token_budget = std::atoi(
+                std::getenv("NINFER_GEMMA4_MARGIN_TOKENS") != nullptr
+                    ? std::getenv("NINFER_GEMMA4_MARGIN_TOKENS")
+                    : "0");
+            std::cout << "margin load " << artifact << " length " << length << " rounds " << rounds
+                      << " prompts " << prompt_count << " tokens " << token_budget << std::endl;
+            const auto all = read_text_ids(margin, static_cast<std::size_t>(length) * prompt_count);
+            ninfer::DeviceContext device;
+            auto loaded         = g4::load_text(artifact, device, true);
+            cudaStream_t stream = nullptr;
+            check(cudaStreamCreate(&stream), "stream");
+            Runner runner(loaded, stream, length + rounds * (kDrafts + 1),
+                          workspace_for(loaded, length));
+            double accept_sum = 0.0;
+            for (int index = 0; index < prompt_count; ++index) {
+                const auto begin = all.begin() + static_cast<std::ptrdiff_t>(index) * length;
+                std::cout << "prompt " << index << std::endl;
+                accept_sum += run_margin(runner, {begin, begin + length}, rounds, token_budget);
+            }
+            std::cout << "mean accept " << accept_sum / prompt_count << std::endl;
+            cudaStreamDestroy(stream);
+            return 0;
+        } catch (const std::exception& error) {
+            std::cerr << "EXC " << error.what() << '\n';
+            return 1;
+        }
+    }
+    const char* fixtures = std::getenv("NINFER_GEMMA4_PARITY");
+    if (fixtures == nullptr) {
         std::cout << "SKIP: NINFER_GEMMA4_PARITY or NINFER_GEMMA4_MTP_WEIGHTS is unset\n";
         return 77;
     }
@@ -301,7 +469,7 @@ int main() {
             for (const auto& prompt : prompts) {
                 widest = std::max(widest, static_cast<int>(prompt.second.size()));
             }
-            Runner runner(loaded, stream, widest);
+            Runner runner(loaded, stream, widest, 1024ull * 1024ull * 1024ull);
             for (const auto& [name, ids] : prompts) {
                 agreed += run_prompt(runner, ids, name, dump);
                 rounds += kRounds;

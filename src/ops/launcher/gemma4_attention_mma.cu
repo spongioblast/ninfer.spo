@@ -370,6 +370,9 @@ void launch(const Tensor& q, const Tensor& k_pages, const Tensor& v_pages,
                                         static_cast<int>(shared)));
         configured = true;
     }
+    // One CTA per query head. Packing a GQA group onto one CTA would reload Q on every key
+    // tile (one Q tile is already 32 KB, and K plus V fill the rest of the 99 KB), which costs
+    // as much traffic as the shared K/V it would save. The grid stays one head.
     const int tokens = q.ne[2];
     const dim3 grid(static_cast<unsigned>((tokens + kRows - 1) / kRows),
                     static_cast<unsigned>(q.ne[1]), static_cast<unsigned>(D / kSlice));

@@ -15,6 +15,8 @@ struct Gemma4DraftWeights {
     Weight output_projection; // [backbone, hidden]
     Weight output_head;       // [vocab, hidden]; FP8 when the registered 262144x1024 GEMV exists
     DeviceBuffer quantized_head; // owns the FP8 payload if the artifact stored the head as BF16
+    // Owns the FP8 payloads of the assistant projections quantized at load.
+    std::vector<DeviceBuffer> quantized_weights;
     const void* final_norm = nullptr;
     std::vector<Gemma4LayerWeights> layers;
     std::vector<int> kv_source;
@@ -39,6 +41,19 @@ void gemma4_draft_step(const Tensor& token, const Tensor& position, Tensor& carr
                        ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
                        cudaStream_t stream);
 
-[[nodiscard]] std::size_t gemma4_draft_workspace_bytes(const Gemma4DraftWeights& draft);
+/**
+ * w draft steps in one pass, one per column. tokens and positions are I32 [w]; every position is
+ * the last target position. carry_in and carry_out are BF16 [backbone,w] and may alias. top_ids
+ * is I32 [k,w], the top-k draft tokens of each column. k == 1 is the argmax.
+ */
+void gemma4_draft_steps(const Tensor& tokens, const Tensor& positions, const Tensor& carry_in,
+                        Tensor& carry_out, Tensor& top_ids, int k, const Weight& token_embedding,
+                        const Gemma4DraftWeights& draft,
+                        std::span<const Gemma4CacheLayer> target_caches,
+                        ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
+                        cudaStream_t stream);
+
+[[nodiscard]] std::size_t gemma4_draft_workspace_bytes(const Gemma4DraftWeights& draft,
+                                                       int columns = 1);
 
 } // namespace ninfer::models::gemma4

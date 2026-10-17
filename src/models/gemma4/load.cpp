@@ -180,6 +180,15 @@ std::unique_ptr<Gemma4DraftWeights> finish_draft(const artifact::MaterializedArt
         draft->output_head.k == 1024) {
         ops::quantize_fp8_row_bf16(draft->output_head, draft->quantized_head, stream);
     }
+    // The assistant's projections are small BF16 GEMMs. Quantizing them onto the FP8 GEMV
+    // cuts the draft step's weight traffic. The head above is already handled.
+    auto quantize = [&](Weight& weight) {
+        if (weight.qtype != QType::BF16) { return; }
+        draft->quantized_weights.emplace_back();
+        ops::quantize_fp8_row_bf16(weight, draft->quantized_weights.back(), stream);
+    };
+    quantize(draft->input_projection);
+    quantize(draft->output_projection);
     draft->final_norm = device_data(artifact, refs.outer[3]);
     const auto& kinds = config.at("layer_types");
     for (std::size_t layer = 0; layer < refs.layers.size(); ++layer) {
@@ -221,6 +230,10 @@ std::unique_ptr<Gemma4DraftWeights> finish_draft(const artifact::MaterializedArt
                                     : config.at("rope_sliding_theta").get<float>();
         weights.rms_eps = draft->rms_eps;
         weights.global_layer = global;
+        quantize(weights.qkv);
+        quantize(weights.o_proj);
+        quantize(weights.gate_up);
+        quantize(weights.down);
         draft->layers.push_back(weights);
         draft->kv_source.push_back(config.at("kv_source_layers")[layer].get<int>());
     }

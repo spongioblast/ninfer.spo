@@ -21,6 +21,7 @@ set(ninfer_op_tests
   layer_norm
   embedding
   argmax
+  topk_columns
   gdn_gating
   gdn_gating_proj
   rope

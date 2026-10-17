@@ -24,4 +24,10 @@ const Fp8LinearShape kFp8N5376K16384  = trunk<5376, 16384>();
 const Fp8LinearShape kFp8N5376K21504  = trunk<5376, 21504>();
 const Fp8LinearShape kFp8N262144K5376 = fp8_dense::shape<262144, 5376>();
 const Fp8LinearShape kFp8N262144K1024 = fp8_dense::shape<262144, 1024>();
+const Fp8LinearShape kFp8N1024K10752  = fp8_dense::shape<1024, 10752>();
+const Fp8LinearShape kFp8N5376K1024   = fp8_dense::shape<5376, 1024>();
+const Fp8LinearShape kFp8N8192K1024   = fp8_dense::shape<8192, 1024>();
+const Fp8LinearShape kFp8N16384K1024  = fp8_dense::shape<16384, 1024>();
+const Fp8LinearShape kFp8N1024K8192   = fp8_dense::shape<1024, 8192>();
+const Fp8LinearShape kFp8N1024K16384  = fp8_dense::shape<1024, 16384>();
 } // namespace ninfer::ops::detail

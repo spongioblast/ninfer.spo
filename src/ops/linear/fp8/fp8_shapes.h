@@ -34,4 +34,11 @@ extern const Fp8LinearShape kFp8N5376K16384;
 extern const Fp8LinearShape kFp8N5376K21504;
 extern const Fp8LinearShape kFp8N262144K5376;
 extern const Fp8LinearShape kFp8N262144K1024;
+// Gemma 4 assistant (draft) projections. T=1 only on the serving path.
+extern const Fp8LinearShape kFp8N1024K10752;
+extern const Fp8LinearShape kFp8N5376K1024;
+extern const Fp8LinearShape kFp8N8192K1024;
+extern const Fp8LinearShape kFp8N16384K1024;
+extern const Fp8LinearShape kFp8N1024K8192;
+extern const Fp8LinearShape kFp8N1024K16384;
 } // namespace ninfer::ops::detail
