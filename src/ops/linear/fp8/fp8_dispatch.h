@@ -21,4 +21,9 @@ namespace ninfer::ops::detail {
 void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
                   WorkspaceArena* workspace, cudaStream_t stream);
 
+// codes and scales already hold the A8 activation. Only Gemma's 5376x21504 down projection.
+void fp8_dispatch_ready(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
+                        std::uint8_t* codes, float* scales, WorkspaceArena* workspace,
+                        cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

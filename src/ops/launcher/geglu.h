@@ -6,6 +6,7 @@
 
 namespace ninfer::ops::detail {
 
-void geglu_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream);
+void geglu_launch(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream,
+                  std::uint8_t* fp8_codes = nullptr, float* fp8_scales = nullptr);
 
 } // namespace ninfer::ops::detail

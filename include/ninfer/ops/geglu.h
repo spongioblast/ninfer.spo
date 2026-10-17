@@ -18,6 +18,10 @@ namespace ninfer::ops {
  * output is promoted and compared directly with that result; output storage rounding belongs to
  * the Op's numerical criterion, not the oracle. The Op writes all of out and uses no workspace.
  */
-void geglu(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream);
+// fp8_codes and fp8_scales, when both set, receive the per-token E4M3 row quantize of `out`
+// (scale = absmax/448) from the same BF16 values this call stores. Both are null, or both are
+// set to one column of `out.ne[0]` codes and one float scale per column.
+void geglu(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream,
+           std::uint8_t* fp8_codes = nullptr, float* fp8_scales = nullptr);
 
 } // namespace ninfer::ops

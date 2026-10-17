@@ -1,6 +1,7 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/fp8/fp8_shapes.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/fp8/shapes/gemma4_a8.h"
 #include <array>
 #include <stdexcept>
 
@@ -13,7 +14,9 @@ const std::array kShapes{&kFp8N14336K5120, &kFp8N16384K5120, &kFp8N34816K5120,
                          &kFp8N320K10240,  &kFp8N2560K2560,  &kFp8N248320K2560,
                          &kFp8N16384K5376, &kFp8N18432K5376, &kFp8N43008K5376,
                          &kFp8N5376K8192,  &kFp8N5376K16384, &kFp8N5376K21504,
-                         &kFp8N262144K5376, &kFp8N262144K1024};
+                         &kFp8N262144K5376, &kFp8N262144K1024, &kFp8N1024K10752,
+                         &kFp8N5376K1024,   &kFp8N8192K1024,   &kFp8N16384K1024,
+                         &kFp8N1024K8192,   &kFp8N1024K16384};
 
 const Fp8LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {
     if (!valid_linear_policy(policy)) throw std::invalid_argument("fp8 linear: unsupported policy");
@@ -49,5 +52,27 @@ void fp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPoli
         *workspace, x.ne[1], weight.k,
         shape.partial_capacity_bytes ? shape.partial_capacity_bytes(x.ne[1]) : 0);
     shape.a8(x, weight, out, scratch, stream);
+}
+
+void fp8_dispatch_ready(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy,
+                        std::uint8_t* codes, float* scales, WorkspaceArena* workspace,
+                        cudaStream_t stream) {
+    validate_fp8_weight(weight, "fp8 linear");
+    if (codes == nullptr || scales == nullptr || workspace == nullptr) {
+        throw std::invalid_argument("fp8 ready: codes, scales, and workspace are required");
+    }
+    if (weight.n != 5376 || weight.k != 21504) {
+        throw std::invalid_argument("fp8 ready: only the gemma down projection is prequantized");
+    }
+    const auto& shape = resolve_shape(weight.n, weight.k, policy);
+    if (!allows_a8(policy) || !shape.uses_a8(x.ne[1], x.ne[1])) {
+        throw std::invalid_argument("fp8 ready: this call is not on the A8 route");
+    }
+    auto scope          = workspace->scope();
+    const auto partial  = shape.partial_capacity_bytes ? shape.partial_capacity_bytes(x.ne[1]) : 0;
+    float* partials     = partial != 0 ? static_cast<float*>(workspace->alloc_bytes(partial, 256).data)
+                                       : nullptr;
+    Fp8A8Workspace scratch{codes, scales, partials};
+    gemma4_fp8::launch_down_ready(x, weight, out, scratch, stream);
 }
 } // namespace ninfer::ops::detail

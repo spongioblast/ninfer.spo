@@ -170,4 +170,11 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
     dispatch_linear(x, w, out, LinearPolicy::A16Only, nullptr, stream);
 }
 
+void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                     std::uint8_t* codes, float* scales, WorkspaceArena& workspace,
+                     cudaStream_t stream) {
+    validate_linear_semantics(x, w, out, policy);
+    detail::fp8_dispatch_ready(x, w, out, policy, codes, scales, &workspace, stream);
+}
+
 } // namespace ninfer::ops

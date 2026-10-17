@@ -21,7 +21,8 @@ bool same_shape(const Tensor& a, const Tensor& b) {
 
 } // namespace
 
-void geglu(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream) {
+void geglu(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t stream,
+           std::uint8_t* fp8_codes, float* fp8_scales) {
     if (gate.dtype != DType::BF16 || up.dtype != DType::BF16 || out.dtype != DType::BF16) {
         throw std::invalid_argument("geglu: gate/up/out must be BF16");
     }
@@ -33,6 +34,9 @@ void geglu(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t strea
     if (n == 0) { return; }
     if (gate.data == nullptr || up.data == nullptr || out.data == nullptr) {
         throw std::invalid_argument("geglu: gate/up/out data must be non-null");
+    }
+    if ((fp8_codes == nullptr) != (fp8_scales == nullptr)) {
+        throw std::invalid_argument("geglu: fp8 codes and scales are set together");
     }
     if (gate.is_contiguous() && up.is_contiguous()) {
         const auto* gate_bytes = static_cast<const char*>(gate.data);
@@ -46,7 +50,7 @@ void geglu(const Tensor& gate, const Tensor& up, Tensor& out, cudaStream_t strea
             throw std::invalid_argument("geglu: out must not overlap gate or up");
         }
     }
-    detail::geglu_launch(gate, up, out, stream);
+    detail::geglu_launch(gate, up, out, stream, fp8_codes, fp8_scales);
 }
 
 } // namespace ninfer::ops

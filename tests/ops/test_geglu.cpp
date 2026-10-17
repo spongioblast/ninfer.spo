@@ -1,4 +1,5 @@
 #include "ninfer/ops/geglu.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 #include "ops/op_tester.h"
 
 #include <algorithm>
@@ -97,6 +98,63 @@ int run_strided_gate_up_case(const char* label, std::int32_t rows, std::int32_t 
 
 } // namespace
 
+int fp8_codes_match_quantize(std::int32_t rows, std::int32_t columns) {
+    const std::size_t count = static_cast<std::size_t>(rows) * columns;
+    const std::size_t wide  = static_cast<std::size_t>(rows) * 2 * columns;
+    std::vector<float> gate(wide / 2), up(wide / 2);
+    fill_uniform(gate, 7u, -4.0f, 4.0f);
+    fill_uniform(up, 8u, -4.0f, 4.0f);
+    round_to_bf16(gate);
+    round_to_bf16(up);
+    std::vector<std::uint16_t> bits(wide);
+    for (std::size_t col = 0; col < static_cast<std::size_t>(columns); ++col) {
+        for (std::int32_t row = 0; row < rows; ++row) {
+            bits[col * rows * 2 + row]            = f32_to_bf16(gate[col * rows + row]);
+            bits[col * rows * 2 + rows + row]     = f32_to_bf16(up[col * rows + row]);
+        }
+    }
+    GuardedDeviceBuffer packed(bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out_fused(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer out_plain(count * sizeof(std::uint16_t));
+    GuardedDeviceBuffer codes_fused(count);
+    GuardedDeviceBuffer codes_ref(count);
+    GuardedDeviceBuffer scales_fused(static_cast<std::size_t>(columns) * sizeof(float));
+    GuardedDeviceBuffer scales_ref(static_cast<std::size_t>(columns) * sizeof(float));
+    packed.copy_from_host(bits.data(), packed.bytes());
+    Tensor wide_tensor(packed.data(), DType::BF16, {2 * rows, columns});
+    Tensor gate_tensor = wide_tensor.slice(0, 0, rows);
+    Tensor up_tensor   = wide_tensor.slice(0, rows, rows);
+    Tensor fused(out_fused.data(), DType::BF16, {rows, columns});
+    Tensor plain(out_plain.data(), DType::BF16, {rows, columns});
+    ops::geglu(gate_tensor, up_tensor, fused, nullptr, static_cast<std::uint8_t*>(codes_fused.data()),
+               static_cast<float*>(scales_fused.data()));
+    ops::geglu(gate_tensor, up_tensor, plain, nullptr);
+    Weight weight;
+    weight.k = rows;
+    ninfer::ops::detail::Fp8A8Workspace scratch{
+        static_cast<std::uint8_t*>(codes_ref.data()), static_cast<float*>(scales_ref.data()),
+        nullptr};
+    ninfer::ops::detail::launch_fp8_a8_quantize(plain, weight, scratch, nullptr);
+    cuda_synchronize();
+    const auto fused_bf16 = from_device<std::uint16_t>(out_fused.data(), count);
+    const auto plain_bf16 = from_device<std::uint16_t>(out_plain.data(), count);
+    int failures          = fused_bf16 == plain_bf16 ? 0 : 1;
+    if (failures != 0) { std::cout << "FAIL geglu fp8 changed the bf16 output\n"; }
+    const auto a = from_device<std::uint8_t>(codes_fused.data(), count);
+    const auto b = from_device<std::uint8_t>(codes_ref.data(), count);
+    if (a != b) {
+        std::cout << "FAIL geglu fp8 codes differ from the quantize kernel\n";
+        failures += 1;
+    }
+    const auto sa = from_device<float>(scales_fused.data(), static_cast<std::size_t>(columns));
+    const auto sb = from_device<float>(scales_ref.data(), static_cast<std::size_t>(columns));
+    if (sa != sb) {
+        std::cout << "FAIL geglu fp8 scales differ from the quantize kernel\n";
+        failures += 1;
+    }
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -106,6 +164,7 @@ int main() {
     failures += run_case("geglu odd", 1, 7, 42u);
     failures += run_strided_gate_up_case("geglu strided [21504,8]", 21504, 8, 43u);
     failures += run_strided_gate_up_case("geglu strided odd", 7, 3, 44u);
+    failures += fp8_codes_match_quantize(21504, 4);
     std::cout << (failures ? "FAIL" : "OK") << " geglu\n";
     return failures ? 1 : 0;
 }

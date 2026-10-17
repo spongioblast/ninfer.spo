@@ -111,8 +111,18 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
     const Tensor gate = gate_up.slice(0, 0, inter);
     const Tensor up   = gate_up.slice(0, inter, inter);
     auto activated    = workspace.alloc(DType::BF16, {inter, tokens});
-    ops::geglu(gate, up, activated, stream);
-    project(activated, weights.down, weights.down_policy, projected, gemm, workspace, stream);
+    const bool fused_down = tokens >= 128 && weights.down.qtype == ninfer::QType::FP8_E4M3FN_ROW_BF16 &&
+                            ops::allows_a8(weights.down_policy) && weights.down.k == inter &&
+                            weights.down.n == hidden;
+    const DownA8 down_codes =
+        fused_down ? prepare_down_a8(workspace, inter, tokens) : DownA8{};
+    ops::geglu(gate, up, activated, stream, down_codes.codes, down_codes.scales);
+    if (fused_down) {
+        project_down_ready(activated, weights.down, weights.down_policy, projected, down_codes,
+                           gemm, workspace, stream);
+    } else {
+        project(activated, weights.down, weights.down_policy, projected, gemm, workspace, stream);
+    }
     const Tensor next_norm = norm_weight(next_input_norm, hidden);
     ops::gemma4_residual_norm(projected, norm_weight(weights.post_ff_norm, hidden),
                               weights.layer_scalar,

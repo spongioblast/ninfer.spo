@@ -1,6 +1,7 @@
 #include "models/gemma4/execution/projection.h"
 
 #include "ninfer/ops/fp8_row_cublas.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include <algorithm>
 
@@ -27,6 +28,19 @@ void project(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Te
     } else {
         ops::linear(x, weight, out, policy, workspace, stream);
     }
+}
+
+DownA8 prepare_down_a8(WorkspaceArena& workspace, int rows, int tokens) {
+    namespace detail = ninfer::ops::detail;
+    const auto codes  = workspace.alloc_bytes(detail::fp8_a8_checked_bytes(tokens, static_cast<std::size_t>(rows)), 256);
+    const auto scales = workspace.alloc_bytes(detail::fp8_a8_checked_bytes(tokens, sizeof(float)), 256);
+    return {static_cast<std::uint8_t*>(codes.data), static_cast<float*>(scales.data)};
+}
+
+void project_down_ready(const Tensor& x, const Weight& weight, ops::LinearPolicy policy, Tensor& out,
+                        DownA8 ready, ops::Bf16GemmContext&, WorkspaceArena& workspace,
+                        cudaStream_t stream) {
+    ops::linear_a8_ready(x, weight, out, policy, ready.codes, ready.scales, workspace, stream);
 }
 
 std::size_t projection_bytes(const Weight& weight, ops::LinearPolicy policy, int tokens) {
