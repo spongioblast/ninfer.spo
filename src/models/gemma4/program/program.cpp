@@ -6,6 +6,7 @@
 #include "models/gemma4/execution/projection.h"
 #include "models/gemma4/execution/text_forward.h"
 #include "models/gemma4/execution/vision.h"
+#include "models/gemma4/program/prefill_graphs.h"
 #include "models/gemma4/program/sliding_ring.h"
 #include "models/gemma4/program/top_tokens.h"
 #include "ninfer/ops/argmax.h"
@@ -105,6 +106,7 @@ struct Program::Impl {
     PinnedHostBuffer step_host{4 * sizeof(std::int32_t)};
     DecodeGraphDefinition decode_definition;
     DecodeGraphExecutable decode_graph;
+    PrefillGraphs prefill_graphs;
     std::vector<DeviceBuffer> k_store;
     std::vector<DeviceBuffer> v_store;
     std::vector<Tensor> k_pages;
@@ -306,6 +308,16 @@ struct Program::Impl {
         }
     }
 
+    // Layers only, reading id_buf, pos_buf and the caches. Captured for the bucket widths.
+    void prefill_layers_body(std::int32_t width) {
+        workspace.reset();
+        Tensor id_tensor(id_buf.p, DType::I32, {width});
+        Tensor position_tensor(pos_buf.p, DType::I32, {width});
+        Tensor hidden_tensor(hidden_buf.p, DType::BF16, {hidden, width});
+        gemma4_layers(id_tensor, hidden_tensor, model->token_embedding, model->layers, caches,
+                      position_tensor, gemm, workspace, stream);
+    }
+
     // Runs `count` tokens at positions [first, first + count) through every layer. The hidden
     // states land in hidden_buf columns [0, count). Earlier positions must already be in the KV.
     void run_layers(const TokenId* ids, std::uint32_t first, std::uint32_t count) {
@@ -359,8 +371,14 @@ struct Program::Impl {
                 visual_indices    = &visual_idx;
             }
         }
-        gemma4_layers(id_tensor, hidden_tensor, model->token_embedding, model->layers, caches,
-                      position_tensor, gemm, workspace, stream, visual_embeddings, visual_indices);
+        const bool graphed =
+            visual_embeddings == nullptr &&
+            prefill_graphs.run(count, stream, [this, width] { prefill_layers_body(width); });
+        if (!graphed) {
+            gemma4_layers(id_tensor, hidden_tensor, model->token_embedding, model->layers, caches,
+                          position_tensor, gemm, workspace, stream, visual_embeddings,
+                          visual_indices);
+        }
         resident.insert(resident.end(), ids, ids + count);
         note_written(first, count);
     }
