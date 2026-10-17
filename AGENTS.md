@@ -1,6 +1,6 @@
 # AGENTS.md
 
-ninfer.spo is a Windows and Linux CUDA inference engine for Qwen3.8 Flash-Next and Qwen3.5 on Blackwell (`sm_120`). One process serves one GPU and one resident model. The product artifact is a V3 `.ninfer` file. Generation, scoring, the CLI, and serving go through the Engine.
+ninfer.spo is a Windows and Linux CUDA inference engine for Qwen3.8 Flash-Next, Qwen3.5, and Gemma 4 31B on Blackwell (`sm_120`). One process serves one GPU and one resident model. The product artifact is a V3 `.ninfer` file. Generation, scoring, the CLI, and serving go through the Engine.
 
 ## Layers
 
@@ -11,7 +11,7 @@ ninfer.spo is a Windows and Linux CUDA inference engine for Qwen3.8 Flash-Next a
 - `src/core` does not include ops, program, models, or the runtime, serve, product, text, and artifact layers.
 - `src/ops` does not include program or a model.
 - `src/program` does not include a model family.
-- `src/models/qwen3_5` and `src/models/qwen3_8_flash_next` do not include each other.
+- `src/models/qwen3_5`, `src/models/qwen3_8_flash_next`, and `src/models/gemma4` do not include each other.
 - `src/runtime/engine` does not include a model family, except the registry and model-instance files.
 
 `getenv` is read only in `src/core/runtime_options.cpp`. Windows-only code stays in `src/core` or a `platform` directory.

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- `Bf16GemmContext` takes no cuBLAS workspace unless the caller asks for one. The 64 MiB buffer changed the summation order and moved the Flash-Next greedy prefix and the Gemma bf16 parity.
+- Gemma 4 text prefill of 32, 64, 128, 256, 512, and 1024 tokens runs as one CUDA graph (`prefill_graphs.h`). Vision chunks stay eager.
+- Gemma 4 FP8 A8 uses a 64-token tile at 128 tokens and a 128-row tile up to 512 tokens, where those beat the 128×256 bulk tile.
+- Gemma 4 GeGLU can write the down projection's E4M3 codes in the same kernel, and the down GEMM then skips its own quantize (`ops::linear_a8_ready`).
+- The Gemma 4 MTP assistant projections are quantized to FP8 at load and run on the dense GEMV.
+- Gemma 4 31B-it is a third family (`Gemma4ForCausalLM`): text, the MTP assistant, and the vision tower. The converter is `tools/convert/gemma4.py`. The sliding window stays in the Gemma program ring.
 - Flash-Next sizes its checkpoint catalog and KV address stores from the device state slots instead of a fixed 8 records. With `--device-state-slots` above 6 the catalog used to fill first: captures were skipped and finished continuations dropped, while the resource manager saw free slots and reclaimed nothing, so every later request resumed from one old checkpoint. New real test `--many-checkpoints`.
 - `scripts/serve.cmd` passes `--device-state-slots 16`. With the default two, Pi sessions fell back to old checkpoints after pi-lens rewrites (TTFT up to 3.4 s), and two chats fell back to the system prompt on every request (`docs/serving.md`, "Flash-Next checkpoint slots").
 

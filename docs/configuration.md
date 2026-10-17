@@ -45,7 +45,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `NINFER_QWEN38_FLASH_NEXT_WEIGHTS` | Flash-Next real tests | Artifact for the real tests. Unset skips them. |
 | `NINFER_GEMMA4_WEIGHTS` | Gemma 4 real tests | bf16 artifact. Unset skips them. |
 | `NINFER_GEMMA4_HF` | Gemma 4 tokenizer, template, fixture, and France tests | Hugging Face model folder (`tokenizer.json`, `chat_template.jinja`). Unset skips them. |
-| `NINFER_GEMMA4_PARITY` | Gemma 4 parity test, engine test greedy check | Folder of Hugging Face logits and greedy dumps. Unset skips them. |
+| `NINFER_GEMMA4_PARITY` | Gemma 4 parity test, engine test greedy check | Folder of Hugging Face logits and greedy dumps. Each prompt needs `<name>.logits_bf16` and `<name>.greedy_bf16` (the bf16 references). Without them the test uses the looser fp32 floors. Unset skips them. |
 | `NINFER_GEMMA4_FIXTURES` | Gemma 4 fixture test | Overrides `tests/models/gemma4/fixtures`. |
 | `NINFER_GEMMA4_MTP_WEIGHTS` | Gemma 4 engine MTP equality | Artifact with the `mtp` component. Unset skips that check. |
 | `NINFER_GEMMA4_VISION_WEIGHTS` | Gemma 4 vision encode and engine image chat | Artifact with the `vision` component. Unset skips those checks. |

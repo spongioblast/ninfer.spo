@@ -5,10 +5,11 @@ Each directory owns one layer. The gate names are `python tools/gates/run.py` le
 | Directory | Owns | Entry | Tests | Gate |
 |---|---|---|---|---|
 | `src/core` | Device, tensors, paged KV, process tuning, `NINFER_*` switches | `src/core/runtime_options.cpp` | `tests/test_device.cpp`, `test_arena.cpp`, `test_tensor.cpp`, `test_kv_cache.cpp` (`tests/cmake/CoreTests.cmake`) | `quick` |
-| `src/ops` | CUDA kernels and their launches | the wrapper next to each kernel family | `tests/ops` | `quick`; `full` for Flash-Next and QSA |
+| `src/ops` | CUDA kernels and their launches. `ops::linear_a8_ready` (`include/ninfer/ops/linear.h`) runs an FP8 A8 GEMM from codes the caller already quantized. | the wrapper next to each kernel family | `tests/ops` | `quick`; `full` for Flash-Next and QSA |
 | `src/program` | Shared KV storage, program value types, MTP alignment, vision scatter | `src/program/program_types.h` | through the model program tests | `full` |
 | `src/models/qwen3_5` | Qwen3.5 frontend, execution, and program | `src/models/qwen3_5/program/program.h` | `tests/models` names containing `qwen3_5` | `full` (`frontend`, `grammar`) |
 | `src/models/qwen3_8_flash_next` | Flash-Next frontend, execution, and V3 program | `src/models/qwen3_8_flash_next/program/v3_program.h` | `tests/models` names containing `qwen3_8_flash_next` or `flash_next` | `full` |
+| `src/models/gemma4` | Gemma 4 31B frontend, execution, MTP assistant, vision, and program. Text prefill buckets live in `program/prefill_graphs.h`. | `src/models/gemma4/program/program.h` | `tests/models` names containing `gemma4` | `full` |
 | `src/models` | Architecture registry | `src/models/registry.h` | load-plan tests | `full` |
 | `src/runtime/engine` | The generation loop, scheduler, context cache | `src/runtime/engine/engine_core.h` | `tests/runtime` | `quick`; real tests in `full` |
 | `src/runtime` | Engine contracts and model construction | `src/runtime/engine/model_instance.h` | `tests/runtime` | `quick` |

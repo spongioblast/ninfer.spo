@@ -1,6 +1,6 @@
 # Architecture
 
-One process loads one V3 `.ninfer` artifact onto one GPU. The registry (`src/models/registry.h`) picks Qwen3.5, Qwen3.5 MoE, or Qwen3.8 Flash-Next. `construct_model` in `src/runtime/engine/model_instance.h` builds either a `ModelInstance` or a `FlashNextInstance`. Each instance owns a frontend, the loaded weights, and a `Program`.
+One process loads one V3 `.ninfer` artifact onto one GPU. The registry (`src/models/registry.h`) picks Qwen3.5, Qwen3.5 MoE, Qwen3.8 Flash-Next, or Gemma 4. `construct_model` in `src/runtime/engine/model_instance.h` builds a `ModelInstance`, a `FlashNextInstance`, or a `Gemma4Instance`. Each instance owns a frontend, the loaded weights, and a `Program`.
 
 ## Engine
 
@@ -18,9 +18,9 @@ Scheduling is a fixed set of resident lanes, chosen at startup (`--max-concurren
 
 `src/program` holds the storage every family shares:
 
-- `src/program/storage/kv_address_space.h` and `logical_kv_store.h` address KV pages for both families.
+- `src/program/storage/kv_address_space.h` and `logical_kv_store.h` address KV pages for every family.
 - `src/program/storage/host_kv_store.h` is the host copy.
-- `src/program/storage/kv_pools.h` describes a model's pools. Retention is full-page only. Sliding-window retention is not implemented.
+- `src/program/storage/kv_pools.h` describes a model's pools. Retention is full-page only. Sliding-window retention is not in the shared pools. Gemma 4 keeps that window in `src/models/gemma4/program/sliding_ring.h`.
 - `src/program/program_types.h` is the engine-facing values: sequence handle, checkpoint handle, source candidate.
 - `src/program/program_methods.inc` and `program_names.inc` declare the engine-facing `Program` methods and the shared names once. Each family includes them in its own `Program` class and namespace.
 - `src/program/speculative/mtp_alignment.h` is the shared MTP alignment.
@@ -28,7 +28,9 @@ Scheduling is a fixed set of resident lanes, chosen at startup (`--max-concurren
 - `src/program/execution/graph_family.h` holds the decode CUDA Graph families: one executable per topology class, updated in place to the profile that covers the batch and frontier.
 - `src/program/execution/causal_score.h` is the perplexity path around a family's own prefill and projection: request checks, the scoring lane, tile staging, and target logprobs.
 
-Model math does not live here. Each family still owns its program transactions under `src/models/<family>/program/`. Flash-Next's program is `src/models/qwen3_8_flash_next/program/v3_program.h`. Qwen3.5's is `src/models/qwen3_5/program/program.h`. The two transaction sets are shaped differently (Qwen3.5 keeps upstream's per-transaction files, Flash-Next its P3–P6 split), so they are not hoisted. `tests/program/test_attention_only_core.cpp` drives the shared storage with two KV pools of different geometry and no recurrent state.
+Gemma 4 captures its text prefill for the widths in `src/models/gemma4/program/prefill_graphs.h` (32, 64, 128, 256, 512, 1024). A chunk that carries vision embeddings, or any other width, stays eager.
+
+Model math does not live here. Each family still owns its program transactions under `src/models/<family>/program/`. Flash-Next's program is `src/models/qwen3_8_flash_next/program/v3_program.h`. Qwen3.5's is `src/models/qwen3_5/program/program.h`. Gemma 4's is `src/models/gemma4/program/program.h`. The transaction sets are shaped differently (Qwen3.5 keeps upstream's per-transaction files, Flash-Next its P3–P6 split, Gemma its own round), so they are not hoisted. `tests/program/test_attention_only_core.cpp` drives the shared storage with two KV pools of different geometry and no recurrent state.
 
 ## Checkpoints and replay
 
@@ -47,5 +49,5 @@ Constrained output (grammar, JSON schema, JSON object, regex, choice) is applied
 - The public surface is the Engine. There is no second inference loop.
 - `getenv` for `NINFER_*` is read in `src/core/runtime_options.cpp`. Serve flags override those switches.
 - Kernels stay as they are unless an op oracle passes and, when tokens move, perplexity is unchanged.
-- Qwen3.5 and Flash-Next do not include each other.
+- Qwen3.5, Flash-Next, and Gemma 4 do not include each other.
 - The build compiles only `sm_120a`.
