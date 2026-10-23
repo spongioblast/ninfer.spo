@@ -18,7 +18,7 @@ constexpr std::array kTrunk{std::pair{16384, 5376}, std::pair{18432, 5376}, std:
 std::vector<Invocation> a16_calls() {
     std::vector<Invocation> calls;
     for (int t : {1,  2,  3,  4,  5,  8,  9,  16,  17,  24,  25,   32,  33,
-                  40, 48, 49, 64, 65, 96, 97, 128, 129, 512, 1024, 1600})
+                  40, 48, 49, 56, 57, 64, 65, 96, 97, 127, 128, 129, 512, 1024, 1600})
         calls.push_back({t});
     for (int t : {1, 7, 33, 129})
         calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true});

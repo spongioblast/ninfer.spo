@@ -4,6 +4,7 @@
 #include "models/gemma4/load.h"
 #include "ninfer/ops/linear.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -92,10 +93,24 @@ int main() {
             const std::size_t work = ninfer::models::gemma4::gemma4_vision_workspace_bytes(
                 vision, tokens, pooled);
             ninfer::DeviceArena workspace(work);
-            ninfer::models::gemma4::gemma4_vision_encode(patch_t, pos_t, mask_t, out_t, vision, gemm,
-                                                         workspace, device.stream);
+            // The first call warms kernels and the GEMM routes; the second is timed end to end.
+            double encode_ms = 0.0;
+            for (int pass = 0; pass < 2; ++pass) {
+                workspace.reset();
+                const auto start = std::chrono::steady_clock::now();
+                ninfer::models::gemma4::gemma4_vision_encode(patch_t, pos_t, mask_t, out_t, vision,
+                                                             gemm, workspace, device.stream);
+                CUDA_CHECK(cudaStreamSynchronize(device.stream));
+                encode_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - start)
+                                .count();
+            }
             std::vector<std::uint16_t> encoded(static_cast<std::size_t>(hidden) * pooled);
             out_buf.copy_to_host(encoded.data(), encoded.size() * 2);
+            std::uint64_t hash = 1469598103934665603ULL;
+            for (const std::uint16_t bits : encoded) { hash = (hash ^ bits) * 1099511628211ULL; }
+            std::cout << "image" << index << " encode " << encode_ms << " ms, hash " << std::hex
+                      << hash << std::dec << '\n';
             const auto kept = ninfer::models::gemma4::gemma4_vision_kept_bins(
                 positions.data(), tokens, vision.pooling_kernel_size, pooled);
             if (static_cast<int>(kept.size()) != valid) {

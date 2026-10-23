@@ -14,7 +14,7 @@ namespace {
 
 constexpr int kDim   = 72;
 constexpr int kHeads = 16;
-constexpr PointwiseCriterion kCriterion{2.0e-5, 8.0e-3};
+constexpr PointwiseCriterion kCriterion{2.0e-5, 4.0e-3};
 
 std::size_t index(int token, int head, int dim) {
     return static_cast<std::size_t>(dim) +
@@ -22,11 +22,13 @@ std::size_t index(int token, int head, int dim) {
                (static_cast<std::size_t>(head) + static_cast<std::size_t>(kHeads) * token);
 }
 
-int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mask) {
+// Large T checks a strided sample of queries against the FP64 oracle; small T checks all.
+int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mask,
+             float spread = 1.0f) {
     const std::size_t count = static_cast<std::size_t>(kDim) * kHeads * tokens;
     std::vector<float> q(count), k(count), v(count);
-    fill_uniform(q, 11u, -1.0f, 1.0f);
-    fill_uniform(k, 12u, -1.0f, 1.0f);
+    fill_uniform(q, 11u, -spread, spread);
+    fill_uniform(k, 12u, -spread, spread);
     fill_uniform(v, 13u, -1.0f, 1.0f);
     round_to_bf16(q);
     round_to_bf16(k);
@@ -35,37 +37,40 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
     auto valid = [&](int token) {
         return mask == nullptr || (*mask)[static_cast<std::size_t>(token)] != 0;
     };
-    auto score = [&](int token, int head, int key) {
-        double dot = 0.0;
-        for (int dim = 0; dim < kDim; ++dim) {
-            dot += static_cast<double>(q[index(token, head, dim)]) *
-                   static_cast<double>(k[index(key, head, dim)]);
-        }
-        return dot;
-    };
-    std::vector<double> expected(count, 0.0);
-    for (int token = 0; token < tokens; ++token) {
+    const int step = tokens > 300 ? 37 : 1;
+    std::vector<int> queries;
+    for (int token = 0; token < tokens; token += step) { queries.push_back(token); }
+    if (queries.back() != tokens - 1) { queries.push_back(tokens - 1); }
+
+    std::vector<double> expected(queries.size() * kHeads * kDim, 0.0);
+    std::vector<double> scores(static_cast<std::size_t>(tokens));
+    for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+        const int token = queries[qi];
         for (int head = 0; head < kHeads; ++head) {
             double maximum = -1.0e300;
             int seen       = 0;
             for (int key = 0; key < tokens; ++key) {
+                double dot = 0.0;
+                for (int dim = 0; dim < kDim; ++dim) {
+                    dot += static_cast<double>(q[index(token, head, dim)]) *
+                           static_cast<double>(k[index(key, head, dim)]);
+                }
+                scores[static_cast<std::size_t>(key)] = dot;
                 if (!valid(key)) { continue; }
-                maximum = std::max(maximum, score(token, head, key));
+                maximum = std::max(maximum, dot);
                 ++seen;
             }
             if (seen == 0) { continue; }
             double sum = 0.0;
             for (int key = 0; key < tokens; ++key) {
-                if (!valid(key)) { continue; }
-                sum += std::exp(score(token, head, key) - maximum);
+                if (valid(key)) { sum += std::exp(scores[static_cast<std::size_t>(key)] - maximum); }
             }
             for (int key = 0; key < tokens; ++key) {
                 if (!valid(key)) { continue; }
-                const double weight = static_cast<double>(
-                    bf16_to_f32(f32_to_bf16(static_cast<float>(
-                        std::exp(score(token, head, key) - maximum) / sum))));
+                const double weight =
+                    std::exp(scores[static_cast<std::size_t>(key)] - maximum) / sum;
                 for (int dim = 0; dim < kDim; ++dim) {
-                    expected[index(token, head, dim)] +=
+                    expected[(qi * kHeads + head) * kDim + dim] +=
                         weight * static_cast<double>(v[index(key, head, dim)]);
                 }
             }
@@ -82,9 +87,6 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
     const auto v_bits = bits(v);
     GuardedDeviceBuffer dq(q_bits.size() * 2), dk(k_bits.size() * 2), dv(v_bits.size() * 2),
         dout(q_bits.size() * 2);
-    const auto cells = static_cast<std::size_t>(kHeads) * tokens * tokens;
-    GuardedDeviceBuffer dscores(cells * 4);
-    GuardedDeviceBuffer dweights(cells * 2);
     dq.copy_from_host(q_bits.data(), dq.bytes());
     dk.copy_from_host(k_bits.data(), dk.bytes());
     dv.copy_from_host(v_bits.data(), dv.bytes());
@@ -92,8 +94,6 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
     Tensor k_tensor(dk.data(), DType::BF16, {kDim, kHeads, tokens});
     Tensor v_tensor(dv.data(), DType::BF16, {kDim, kHeads, tokens});
     Tensor out_tensor(dout.data(), DType::BF16, {kDim, kHeads, tokens});
-    Tensor scores_tensor(dscores.data(), DType::FP32, {tokens, tokens, kHeads});
-    Tensor weights_tensor(dweights.data(), DType::BF16, {tokens, tokens, kHeads});
     GuardedDeviceBuffer dmask(mask == nullptr ? 4 : mask->size() * 4);
     const Tensor* mask_ptr = nullptr;
     Tensor mask_tensor;
@@ -102,17 +102,37 @@ int run_case(const char* label, int tokens, const std::vector<std::int32_t>* mas
         mask_tensor = Tensor(dmask.data(), DType::I32, {tokens});
         mask_ptr    = &mask_tensor;
     }
-    ops::gemma4_vision_attention(q_tensor, k_tensor, v_tensor, mask_ptr, scores_tensor,
-                                 weights_tensor, out_tensor, nullptr);
+    ops::gemma4_vision_attention(q_tensor, k_tensor, v_tensor, mask_ptr, out_tensor, nullptr);
     cuda_synchronize();
-    int failures = verify_pointwise(label, from_device_bf16(dout.data(), count), expected,
-                                    kCriterion);
+    const auto all = from_device_bf16(dout.data(), count);
+    std::vector<double> actual(expected.size());
+    for (std::size_t qi = 0; qi < queries.size(); ++qi) {
+        for (int head = 0; head < kHeads; ++head) {
+            for (int dim = 0; dim < kDim; ++dim) {
+                actual[(qi * kHeads + head) * kDim + dim] = all[index(queries[qi], head, dim)];
+            }
+        }
+    }
+    int failures   = 0;
+    double excess  = 0.0;
+    std::size_t at = 0;
+    for (std::size_t i = 0; i < actual.size(); ++i) {
+        const double allowed = kCriterion.absolute + kCriterion.relative * std::abs(expected[i]);
+        const double over = std::abs(actual[i] - expected[i]) - allowed;
+        if (!std::isfinite(actual[i]) || over > excess) {
+            excess = std::isfinite(actual[i]) ? over : 1.0e30;
+            at     = i;
+        }
+    }
+    if (excess > 0.0) {
+        std::cout << label << ": mismatch at " << at << " actual=" << actual[at]
+                  << " reference=" << expected[at] << " excess=" << excess << "\n";
+        failures = 1;
+    }
     failures += dq.verify_guards("q");
     failures += dk.verify_guards("k");
     failures += dv.verify_guards("v");
     failures += dout.verify_guards("out");
-    failures += dscores.verify_guards("scores");
-    failures += dweights.verify_guards("weights");
     return failures;
 }
 
@@ -131,6 +151,14 @@ int main() {
     mask[3] = 0;
     mask[7] = 0;
     failures += run_case("vision attn T=8 masked", 8, &mask);
+    failures += run_case("vision attn T=256", 256, nullptr, 3.0f);
+    failures += run_case("vision attn T=1000", 1000, nullptr, 3.0f);
+    // An image's padding sits at the end: 2340 real patches, 180 pad.
+    std::vector<std::int32_t> tail(2520, 1);
+    std::fill(tail.begin() + 2340, tail.end(), 0);
+    failures += run_case("vision attn T=2520 tail pad", 2520, &tail, 3.0f);
+    std::vector<std::int32_t> none(70, 0);
+    failures += run_case("vision attn T=70 all masked", 70, &none);
     std::cout << (failures ? "FAIL" : "OK") << " gemma4_vision_attention\n";
     return failures ? 1 : 0;
 }

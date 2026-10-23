@@ -316,7 +316,7 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
         throw std::invalid_argument("gemma4 KV cache is bf16 only");
     }
     // MTP drafts a fixed count per round; `auto` takes the count that measured best.
-    constexpr std::uint32_t kGemma4AutoDraftTokens = 5;
+    constexpr std::uint32_t kGemma4AutoDraftTokens = 6;
     const SpeculativeOptions& speculative = options.speculative;
     if (speculative.backend != SpeculativeBackend::None &&
         speculative.backend != SpeculativeBackend::Mtp) {

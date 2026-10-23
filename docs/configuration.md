@@ -93,7 +93,7 @@ The engine does not read these. The scripts, tests, and probes that do are named
 | `--device` | 0 | CUDA device. |
 | `--kv-dtype` | bf16 | KV storage: `bf16`, `int8`, `fp8`, `nvfp4`, or `k8v4`. Flash-Next accepts `bf16`, `fp8`, and `int8`. |
 | `--spec` | | Speculative backend: `mtp`, `dflash`, or `dflash2`. Flash-Next accepts only `mtp`, which `scripts/serve.cmd` uses. |
-| `--draft-tokens` | | Draft length: `auto` or digits. Flash-Next MTP takes `auto` or 1..7. |
+| `--draft-tokens` | | Draft length: `auto` or digits. Flash-Next MTP takes `auto` or 1..7. Gemma 4 MTP takes the same; its `auto` is a fixed 6 drafts per round. |
 | `--default-max-tokens` | 8192 | Used when the client omits `max_tokens`. |
 | `--default-thinking-budget` | | Thinking token budget. |
 | `--vision` | off | Enable vision. |

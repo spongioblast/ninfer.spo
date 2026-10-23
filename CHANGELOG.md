@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Gemma 4 vision attention is one tensor-core flash kernel with FP32 softmax weights and no T² buffers. A 2,520-token image encodes in about 40 ms instead of about 500 ms. The encoder no longer syncs per padded GEMM, and patch scaling, RoPE tables, and pooling run on the GPU. `gemma4_vision_encode` returns before the embeddings are ready; `Program::encode_vision` syncs the stream first. Without that sync a red image was described as white.
+- Gemma 4 FP8 trunk projections at 17 to 127 tokens have their own routes (`shapes/gemma4_a16.cu`). The new `fp8_a16_wide_gemv` kernel gives each CTA 32 or 64 rows and is 23–35% faster at 32 tokens and 34–60% faster at 48 than the generic route. A 32-token prompt's TTFT on `gemma4_31b_fp8_a8` drops from 33.9 to 25.4 ms. Decode and MTP verify (at most 16 tokens) are unchanged.
+- Gemma 4 `--draft-tokens auto` drafts 6 tokens per round instead of 5: +4.9% decode on a code and docs corpus and +11.6% on ShareGPT at 4k context.
+- `ops::topk_columns` merges with 1024 threads per column (about 13 µs instead of 650–745 µs on a 262,144-row column). It has a total order for NaN (a NaN at row 0 first, other NaNs after every number) and writes -1 for ranks past `valid_rows`.
 - Gemma 4 vision attention no longer uses cuBLAS. The dots and the value multiply are ours, and the softmax between them is unchanged. The encoder's registered BF16 projections, including each half of gate/up, run on the BF16 tensor-core kernels.
 - `Bf16GemmContext` takes no cuBLAS workspace unless the caller asks for one. The 64 MiB buffer changed the summation order and moved the Flash-Next greedy prefix and the Gemma bf16 parity.
 - Gemma 4 text prefill of 32, 64, 128, 256, 512, and 1024 tokens runs as one CUDA graph (`prefill_graphs.h`). Vision chunks stay eager.

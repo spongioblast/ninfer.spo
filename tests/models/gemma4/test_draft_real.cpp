@@ -1,7 +1,8 @@
 // MTP assistant on real weights. NINFER_GEMMA4_MTP_WEIGHTS names an artifact with the mtp
 // component and NINFER_GEMMA4_PARITY the prompt fixtures (<name>.ids per index.json entry); the
 // test skips without them. After each prompt it runs greedy rounds of kDrafts drafts verified by
-// one target forward and reports how many drafts the target agrees with. With
+// one target forward and reports how many drafts the target agrees with. Before that it checks
+// that one three-column draft step gives the same draft tokens as three single-column steps. With
 // NINFER_GEMMA4_DRAFT_DUMP it also writes the first round's drafter inputs and outputs:
 // <name>.draft.json, <name>.carry.bin (BF16 [kDrafts+1][hidden], the carried state before every
 // step), <name>.sliding.bin and <name>.global.bin (BF16 K then V as [kv][positions][D] of the
@@ -9,6 +10,8 @@
 // NINFER_GEMMA4_MARGIN_CORPUS names a whitespace token-id file. With the MTP artifact set, the
 // test then skips the fixtures and scores that prompt: for each round it prints the first draft,
 // the target argmax, that draft's rank in the target distribution, and the softcapped logit gap.
+// NINFER_GEMMA4_RANK_OUT with NINFER_GEMMA4_RANK_IDS writes the draft-tree rank dump (run_rank)
+// and times one draft step at widths 1..6 (time_drafts).
 #include "core/arena.h"
 #include "core/device.h"
 #include "models/gemma4/execution/draft_forward.h"
@@ -24,6 +27,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -310,13 +314,112 @@ int run_prompt(Runner& runner, const std::vector<std::int32_t>& prompt, const st
     return agreed_total;
 }
 
+// gemma4_draft_steps over three columns (different tokens and carries, one position) against
+// three single-column calls.
+int batch_equality(Runner& runner, const std::vector<std::int32_t>& prompt) {
+    constexpr int kWidth = 3;
+    constexpr int kTop   = 4;
+    const auto& loaded   = runner.loaded;
+    const int fed        = static_cast<int>(prompt.size());
+    if (fed < kWidth) { throw std::runtime_error("batch prompt is shorter than the width"); }
+    Cache cache(loaded, (fed + kPage - 1) / kPage);
+    runner.forward(cache, prompt, 0, -1);
+    const int hidden          = loaded.hidden;
+    const std::size_t column  = static_cast<std::size_t>(hidden) * 2;
+    ninfer::DeviceBuffer carry_buf(column * kWidth);
+    ninfer::DeviceBuffer batched_buf(column * kWidth);
+    ninfer::DeviceBuffer single_buf(column * kWidth);
+    ninfer::DeviceBuffer slots_buf(2 * kWidth * 4);
+    ninfer::DeviceBuffer top_buf(2 * kTop * kWidth * 4);
+    const ninfer::Tensor final_norm(const_cast<void*>(loaded.final_norm), ninfer::DType::BF16,
+                                    {hidden});
+    std::vector<std::int32_t> slots(2 * kWidth);
+    for (int c = 0; c < kWidth; ++c) {
+        ninfer::Tensor out(static_cast<std::byte*>(carry_buf.p) + column * c, ninfer::DType::BF16,
+                           {hidden, 1});
+        const ninfer::Tensor source(static_cast<std::byte*>(runner.hidden_buf.p) +
+                                        column * static_cast<std::size_t>(fed - 1 - c),
+                                    ninfer::DType::BF16, {hidden, 1});
+        ninfer::ops::rmsnorm(source, final_norm, loaded.rms_eps, false, out, runner.stream);
+        slots[static_cast<std::size_t>(c)]          = prompt[static_cast<std::size_t>(fed - 1 - c)];
+        slots[static_cast<std::size_t>(kWidth + c)] = fed - 1;
+    }
+    slots_buf.copy_from_host(slots.data(), slots.size() * 4);
+    auto* ids = static_cast<std::int32_t*>(slots_buf.p);
+    auto* top = static_cast<std::int32_t*>(top_buf.p);
+    {
+        runner.workspace.reset();
+        const ninfer::Tensor tokens(ids, ninfer::DType::I32, {kWidth});
+        const ninfer::Tensor positions(ids + kWidth, ninfer::DType::I32, {kWidth});
+        const ninfer::Tensor carry_in(carry_buf.p, ninfer::DType::BF16, {hidden, kWidth});
+        ninfer::Tensor carry_out(batched_buf.p, ninfer::DType::BF16, {hidden, kWidth});
+        ninfer::Tensor top_ids(top, ninfer::DType::I32, {kTop, kWidth});
+        g4::gemma4_draft_steps(tokens, positions, carry_in, carry_out, top_ids, kTop,
+                               loaded.token_embedding, *loaded.draft, cache.layers, runner.gemm,
+                               runner.workspace, runner.stream);
+    }
+    // One [kTop,1] block per single call after the batched [kTop,kWidth] block.
+    for (int c = 0; c < kWidth; ++c) {
+        runner.workspace.reset();
+        const ninfer::Tensor token(ids + c, ninfer::DType::I32, {1});
+        const ninfer::Tensor position(ids + kWidth + c, ninfer::DType::I32, {1});
+        const ninfer::Tensor carry_in(static_cast<std::byte*>(carry_buf.p) + column * c,
+                                      ninfer::DType::BF16, {hidden, 1});
+        ninfer::Tensor carry_out(static_cast<std::byte*>(single_buf.p) + column * c,
+                                 ninfer::DType::BF16, {hidden, 1});
+        ninfer::Tensor top_ids(top + kTop * kWidth + kTop * c, ninfer::DType::I32, {kTop, 1});
+        g4::gemma4_draft_steps(token, position, carry_in, carry_out, top_ids, kTop,
+                               loaded.token_embedding, *loaded.draft, cache.layers, runner.gemm,
+                               runner.workspace, runner.stream);
+    }
+    check(cudaStreamSynchronize(runner.stream), "batch draft");
+    std::vector<std::uint16_t> batched(static_cast<std::size_t>(hidden) * kWidth);
+    std::vector<std::uint16_t> single(batched.size());
+    std::vector<std::int32_t> tops(2 * kTop * kWidth);
+    batched_buf.copy_to_host(batched.data(), batched.size() * 2);
+    single_buf.copy_to_host(single.data(), single.size() * 2);
+    top_buf.copy_to_host(tops.data(), tops.size() * 4);
+    // The FP8 A16 GEMV sums T=1 (launch_gemv) and T=3 (launch_ksplit) in different orders, so
+    // the gate is the draft token (rank 0). The other ranks and the carry gap are reported.
+    int failures = 0;
+    int differ   = 0;
+    for (int c = 0; c < kWidth; ++c) {
+        double worst      = 0.0;
+        double largest    = 0.0;
+        int column_differ = 0;
+        for (int d = 0; d < hidden; ++d) {
+            const std::size_t at = static_cast<std::size_t>(c) * hidden + d;
+            const float a        = bf16_to_float(batched[at]);
+            const float b        = bf16_to_float(single[at]);
+            largest              = std::max(largest, static_cast<double>(std::abs(b)));
+            if (batched[at] == single[at]) { continue; }
+            ++column_differ;
+            worst = std::max(worst, static_cast<double>(std::abs(a - b)));
+        }
+        differ += column_differ;
+        int same_ranks = 0;
+        while (same_ranks < kTop &&
+               tops[static_cast<std::size_t>(kTop * c + same_ranks)] ==
+                   tops[static_cast<std::size_t>(kTop * kWidth + kTop * c + same_ranks)]) {
+            ++same_ranks;
+        }
+        std::cout << "batch column " << c << " leading equal ranks " << same_ranks << " of "
+                  << kTop << ", carry " << column_differ << " of " << hidden
+                  << " differ (max abs " << worst << ", column max abs " << largest << ")\n";
+        if (same_ranks == 0) { ++failures; }
+    }
+    std::cout << (failures ? "FAIL" : "ok  ") << " batched draft w=3 matches three w=1 calls"
+              << (differ == 0 ? " byte for byte" : " on the draft token") << '\n';
+    return failures;
+}
+
 std::size_t workspace_for(const g4::LoadedText& loaded, int tokens) {
     std::size_t bytes = 0;
     for (const g4::Gemma4LayerWeights& layer : loaded.layers) {
         bytes = std::max(bytes, g4::gemma4_layer_workspace_bytes(layer, tokens));
     }
     if (loaded.draft != nullptr) {
-        bytes = std::max(bytes, g4::gemma4_draft_workspace_bytes(*loaded.draft));
+        bytes = std::max(bytes, g4::gemma4_draft_workspace_bytes(*loaded.draft, kDrafts + 1));
     }
     bytes += static_cast<std::size_t>(loaded.hidden) * static_cast<std::size_t>(tokens) * 2U;
     bytes += static_cast<std::size_t>(loaded.vocab) * static_cast<std::size_t>(kDrafts + 1) * 2U;
@@ -384,11 +487,12 @@ double run_margin(Runner& runner, const std::vector<std::int32_t>& prompt, int r
     return accept;
 }
 
-// Teacher-forced drafter ranks along the greedy continuation. One line per start: six ranks of
-// the true next token in the drafter's top 8 (8 means it was not there). chain5 accept is the
-// mean tokens per round of the rank-0 chain, which should match a K=5 MTP run.
-void run_rank(Runner& runner, const std::vector<std::int32_t>& prompt, int generate, int depth,
-              int k, const fs::path& out_path) {
+// Teacher-forced drafter ranks along the greedy continuation of `generate` tokens, for the first
+// `limit` starts. One line per start: six ranks of the true next token in the drafter's top 8
+// (8 means it was not there). chain5 accept is the mean tokens per round of the rank-0 chain,
+// which should match a K=5 MTP run.
+void run_rank(Runner& runner, const std::vector<std::int32_t>& prompt, int generate, int limit,
+              int depth, int k, std::ostream& out) {
     if (prompt.size() < 2 || generate < 1) {
         throw std::runtime_error("rank prompt does not leave room for the draft depth");
     }
@@ -410,12 +514,11 @@ void run_rank(Runner& runner, const std::vector<std::int32_t>& prompt, int gener
     ninfer::DeviceBuffer token_buf(4);
     ninfer::DeviceBuffer pos_buf(4);
     ninfer::DeviceBuffer top_buf(static_cast<std::size_t>(k) * 4);
-    std::ofstream out(out_path);
-    if (!out) { throw std::runtime_error("cannot write " + out_path.string()); }
     int starts = 0;
     int accepted = 0;
     std::vector<std::int32_t> top(static_cast<std::size_t>(k));
-    for (int start = prompt_len; start + depth < static_cast<int>(ids.size()); ++start) {
+    const int end = std::min(static_cast<int>(ids.size()) - depth, prompt_len + limit);
+    for (int start = prompt_len; start < end; ++start) {
         ninfer::Tensor carry(runner.carry_buf.p, ninfer::DType::BF16, {hidden, 1});
         ninfer::Tensor column(static_cast<std::byte*>(runner.hidden_buf.p) +
                                   static_cast<std::size_t>(start - 1) * hidden * 2,
@@ -461,9 +564,71 @@ void run_rank(Runner& runner, const std::vector<std::int32_t>& prompt, int gener
         accepted += leading + 1;
         ++starts;
     }
-    std::cout << "rank starts " << starts << " chain5 accept "
-              << (starts == 0 ? 0.0 : static_cast<double>(accepted) / starts) << " file "
-              << out_path << std::endl;
+    std::cout << "rank prompt " << prompt_len << " starts " << starts << " chain5 accept "
+              << (starts == 0 ? 0.0 : static_cast<double>(accepted) / starts) << std::endl;
+}
+
+// Median time of one graph-captured gemma4_draft_steps call (k top ids) at widths
+// 1..max_width, after `prompt` filled the target cache. Every column reads the same position,
+// as in a tree level. The serving round replays its draft steps from a CUDA graph too.
+void time_drafts(Runner& runner, const std::vector<std::int32_t>& prompt, int max_width, int k) {
+    constexpr int kReps = 20;
+    const auto& loaded  = runner.loaded;
+    const int fed       = static_cast<int>(prompt.size());
+    Cache cache(loaded, (fed + kPage - 1) / kPage);
+    runner.forward(cache, prompt, 0, fed - 1);
+    const int hidden = loaded.hidden;
+    const std::size_t column = static_cast<std::size_t>(hidden) * 2;
+    ninfer::DeviceBuffer carry_buf(column * max_width);
+    ninfer::DeviceBuffer slots_buf(2 * static_cast<std::size_t>(max_width) * 4);
+    ninfer::DeviceBuffer top_buf(static_cast<std::size_t>(k) * max_width * 4);
+    std::vector<std::int32_t> slots(2 * static_cast<std::size_t>(max_width));
+    for (int c = 0; c < max_width; ++c) {
+        check(cudaMemcpyAsync(static_cast<std::byte*>(carry_buf.p) + column * c, runner.carry_buf.p,
+                              column, cudaMemcpyDeviceToDevice, runner.stream),
+              "time carry");
+        slots[static_cast<std::size_t>(c)]             = prompt[static_cast<std::size_t>(fed - 1 - c)];
+        slots[static_cast<std::size_t>(max_width + c)] = fed - 1;
+    }
+    check(cudaStreamSynchronize(runner.stream), "time setup");
+    slots_buf.copy_from_host(slots.data(), slots.size() * 4);
+    auto* ids = static_cast<std::int32_t*>(slots_buf.p);
+    cudaEvent_t begin = nullptr;
+    cudaEvent_t done  = nullptr;
+    check(cudaEventCreate(&begin), "event");
+    check(cudaEventCreate(&done), "event");
+    for (int width = 1; width <= max_width; ++width) {
+        const ninfer::Tensor tokens(ids, ninfer::DType::I32, {width});
+        const ninfer::Tensor positions(ids + max_width, ninfer::DType::I32, {width});
+        ninfer::Tensor carry(carry_buf.p, ninfer::DType::BF16, {hidden, width});
+        ninfer::Tensor top(top_buf.p, ninfer::DType::I32, {k, width});
+        runner.workspace.reset();
+        cudaGraph_t graph    = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        check(cudaStreamBeginCapture(runner.stream, cudaStreamCaptureModeThreadLocal), "capture");
+        g4::gemma4_draft_steps(tokens, positions, carry, carry, top, k, loaded.token_embedding,
+                               *loaded.draft, cache.layers, runner.gemm, runner.workspace,
+                               runner.stream);
+        check(cudaStreamEndCapture(runner.stream, &graph), "capture");
+        check(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        std::vector<float> times;
+        for (int rep = 0; rep < kReps + 2; ++rep) {
+            check(cudaEventRecord(begin, runner.stream), "event");
+            check(cudaGraphLaunch(exec, runner.stream), "replay");
+            check(cudaEventRecord(done, runner.stream), "event");
+            check(cudaEventSynchronize(done), "event");
+            float ms = 0.0f;
+            check(cudaEventElapsedTime(&ms, begin, done), "event");
+            if (rep >= 2) { times.push_back(ms); }
+        }
+        cudaGraphExecDestroy(exec);
+        cudaGraphDestroy(graph);
+        std::sort(times.begin(), times.end());
+        std::cout << "draft width " << width << " k " << k << " median "
+                  << times[times.size() / 2] << " ms" << std::endl;
+    }
+    cudaEventDestroy(begin);
+    cudaEventDestroy(done);
 }
 
 } // namespace
@@ -485,19 +650,41 @@ int main() {
             const int gen = std::max(8, std::atoi(std::getenv("NINFER_GEMMA4_RANK_GEN") != nullptr
                                                       ? std::getenv("NINFER_GEMMA4_RANK_GEN")
                                                       : "64"));
+            const int limit = std::max(1, std::atoi(std::getenv("NINFER_GEMMA4_RANK_STARTS") != nullptr
+                                                        ? std::getenv("NINFER_GEMMA4_RANK_STARTS")
+                                                        : "250"));
             constexpr int kDepth = 6;
             constexpr int kTop   = 8;
-            const auto ids =
-                read_text_ids(rank_ids, static_cast<std::size_t>(prompt));
-            std::cout << "rank load " << artifact << " prompt " << prompt << " gen " << gen
-                      << std::endl;
+            // NINFER_GEMMA4_RANK_IDS is a ';' list of token files, each optionally path@offset to
+            // start that many tokens in. Every prompt's lines go into one rank file.
+            std::vector<std::vector<std::int32_t>> prompts;
+            const std::string list(rank_ids);
+            for (std::size_t from = 0; from <= list.size();) {
+                const std::size_t to   = std::min(list.find(';', from), list.size());
+                const std::string item = list.substr(from, to - from);
+                from                   = to + 1;
+                if (item.empty()) { continue; }
+                const std::size_t at = item.rfind('@');
+                const std::size_t offset =
+                    at == std::string::npos ? 0 : std::stoul(item.substr(at + 1));
+                auto ids = read_text_ids(item.substr(0, at),
+                                         offset + static_cast<std::size_t>(prompt));
+                ids.erase(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(offset));
+                prompts.push_back(std::move(ids));
+            }
+            std::cout << "rank load " << artifact << " prompts " << prompts.size() << " prompt "
+                      << prompt << " gen " << gen << " starts " << limit << std::endl;
             ninfer::DeviceContext device;
             auto loaded         = g4::load_text(artifact, device, true);
             cudaStream_t stream = nullptr;
             check(cudaStreamCreate(&stream), "stream");
             const int total = prompt + gen + kDepth;
             Runner runner(loaded, stream, total, workspace_for(loaded, total));
-            run_rank(runner, ids, gen, kDepth, kTop, rank_out);
+            std::ofstream out(rank_out);
+            if (!out) { throw std::runtime_error(std::string("cannot write ") + rank_out); }
+            for (const auto& ids : prompts) { run_rank(runner, ids, gen, limit, kDepth, kTop, out); }
+            time_drafts(runner, prompts.front(), kDrafts + 1, 1);
+            time_drafts(runner, prompts.front(), kDrafts + 1, kTop);
             cudaStreamDestroy(stream);
             return 0;
         } catch (const std::exception& error) {
@@ -563,7 +750,7 @@ int main() {
         auto loaded = g4::load_text(artifact, device, true);
         cudaStream_t stream = nullptr;
         check(cudaStreamCreate(&stream), "stream");
-        int agreed = 0, rounds = 0;
+        int agreed = 0, rounds = 0, batch_failures = 0;
         {
             std::vector<std::pair<std::string, std::vector<std::int32_t>>> prompts;
             std::vector<std::int32_t> joined;
@@ -582,6 +769,7 @@ int main() {
                 widest = std::max(widest, static_cast<int>(prompt.second.size()));
             }
             Runner runner(loaded, stream, widest, 1024ull * 1024ull * 1024ull);
+            batch_failures = batch_equality(runner, prompts.front().second);
             for (const auto& [name, ids] : prompts) {
                 agreed += run_prompt(runner, ids, name, dump);
                 rounds += kRounds;
@@ -591,7 +779,7 @@ int main() {
         const double per_round = static_cast<double>(agreed) / rounds;
         // A broken drafter agrees with almost nothing; the published assistant averages well
         // above one accepted draft per round on prose and code.
-        const bool ok = per_round >= 1.0;
+        const bool ok = per_round >= 1.0 && batch_failures == 0;
         std::cout << (ok ? "OK" : "FAIL") << " gemma4 draft: " << per_round
                   << " agreed drafts per round\n";
         return ok ? 0 : 1;

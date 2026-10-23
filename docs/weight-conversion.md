@@ -71,6 +71,12 @@ projection and stores the divisor `448*6/amax` for each projection input. It rea
 `--source calibration=FILE`, a Safetensors file with one F32 activation amax per input name, such
 as `text/layers/0/mixer_input`, `attention_output`, `ffn_input` and `mlp/product`.
 `gemma4_nvfp4_a4_mlp` does the same for the NVFP4 MLP projections only and leaves attention at A16.
+`gemma4_fp8_a8` is an override for `gemma4_31b_fp8`: it permits A8 (per-token FP8 activations) on
+every FP8 text-layer projection, so prefills of 128 tokens and more run on the FP8 A8 kernels. The
+embedding and the output head stay A16. Without it the text trunk is A16 only, and a prefill of 512
+tokens or more goes through cuBLAS, about twice the time at 512 and 2048 tokens. An artifact
+that serves images needs it as well: add `--override gemma4_fp8_a8` to the `--components
+text,vision` (or `text,vision,mtp`) conversion.
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;

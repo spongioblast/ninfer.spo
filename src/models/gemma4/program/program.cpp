@@ -284,6 +284,7 @@ struct Program::Impl {
             Tensor encoded(encoded_buf.p, DType::BF16, {vision.text_hidden, pooled});
             workspace.reset();
             gemma4_vision_encode(patches, positions, mask, encoded, vision, gemm, workspace, stream);
+            check(cudaStreamSynchronize(stream), "vision sync");
             const std::vector<int> kept =
                 gemma4_vision_kept_bins(image.positions.data(), image.tokens,
                                         vision.pooling_kernel_size, pooled);

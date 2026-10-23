@@ -57,6 +57,7 @@ struct Gemma4VisionWeights {
 // positions is contiguous I32 [T,2] with -1 on both axes for pad.
 // mask is contiguous I32 [T], nonzero = valid.
 // out is contiguous BF16 [text_hidden, T_out] with T_out = T / (pool*pool).
+// Reads positions back once, then queues the rest on stream: out is ready after a stream sync.
 void gemma4_vision_encode(const Tensor& patches, const Tensor& positions, const Tensor& mask,
                           Tensor& out, const Gemma4VisionWeights& weights,
                           ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
