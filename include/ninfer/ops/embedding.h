@@ -25,4 +25,17 @@ namespace ninfer::ops {
  */
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
 
+/**
+ * The same gather with every row multiplied by `scale` rounded to BF16:
+ *
+ *   out[d,t] = bf16(bf16(dequantize(table)[ids[t],d]) * bf16(scale)),
+ *
+ * the product of a BF16 table and a BF16 scalar. This lets a model whose embedding is its output
+ * head times a constant (Gemma's sqrt(hidden)) store the table once. `scale` is positive and
+ * finite; a scale other than 1 needs an FP8_E4M3FN_ROW_BF16 or Q4_G32_FP16 table. A scale of 1 is
+ * the overload above.
+ */
+void embedding(const Tensor& ids, const Weight& table, float scale, Tensor& out,
+               cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -20,10 +20,12 @@ inline constexpr std::int32_t kEmbedGatherQ6GroupsPerBlock = 2;
 inline constexpr std::int32_t kEmbedGatherQ8Group          = 32;
 inline constexpr std::int32_t kEmbedGatherQ8D              = 2048;
 inline constexpr std::int32_t kEmbedGatherQ8Groups         = kEmbedGatherQ8D / kEmbedGatherQ8Group;
+// The factor is a BF16 value: each decoded value is rounded to BF16, multiplied by it, and
+// rounded again, like a BF16 table times a BF16 scalar. A factor of 1 leaves the rows unchanged.
 template <int D, int BlocksPerToken, int Threads>
 __launch_bounds__(Threads) __global__
     void embed_gather_fp8_kernel(const std::int32_t* ids, const std::uint8_t* codes,
-                                 const __nv_bfloat16* scales, __nv_bfloat16* out) {
+                                 const __nv_bfloat16* scales, float factor, __nv_bfloat16* out) {
     static_assert(D % BlocksPerToken == 0);
     constexpr int kValuesPerBlock = D / BlocksPerToken;
     static_assert(kValuesPerBlock % 4 == 0);
@@ -46,8 +48,9 @@ __launch_bounds__(Threads) __global__
             __nv_fp8x2_e4m3 values;
             values.__x           = static_cast<std::uint16_t>(word >> (pair * 16));
             const float2 decoded = static_cast<float2>(values);
+            const __nv_bfloat162 row = __floats2bfloat162_rn(decoded.x * scale, decoded.y * scale);
             reinterpret_cast<__nv_bfloat162*>(output_column + offset + pair * 2)[0] =
-                __floats2bfloat162_rn(decoded.x * scale, decoded.y * scale);
+                __floats2bfloat162_rn(__low2float(row) * factor, __high2float(row) * factor);
         }
     }
 }
@@ -152,6 +155,40 @@ __global__ void embed_gather_q8_kernel(const std::int32_t* ids, const std::uint8
         const float scale = __half2float(__ushort_as_half(scale_bits));
         const auto code = static_cast<std::int8_t>(codes[group_index * kEmbedGatherQ8Group + lane]);
         out[i]          = __float2bfloat16(static_cast<float>(code) * scale);
+    }
+}
+
+// One thread per (token, group of 32): 16 code bytes, one binary16 scale, 32 BF16 outputs.
+// Even lanes are the low nibble, odd lanes the high nibble, both two's complement. The BF16
+// factor applies as in embed_gather_fp8_kernel.
+__global__ void embed_gather_q4g32_kernel(const std::int32_t* ids, const std::uint8_t* codes,
+                                          const std::uint8_t* scales, float factor,
+                                          __nv_bfloat16* out, std::int32_t d, std::int32_t T,
+                                          std::int32_t padded_d) {
+    constexpr std::int32_t kGroup = 32;
+    const std::int32_t kg         = padded_d / kGroup;
+    const std::int32_t live       = (d + kGroup - 1) / kGroup;
+    const std::int64_t n          = static_cast<std::int64_t>(live) * T;
+    const std::int64_t start  = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) {
+        const std::int32_t t = static_cast<std::int32_t>(i / live);
+        const std::int32_t g = static_cast<std::int32_t>(i - static_cast<std::int64_t>(t) * live);
+        const std::int64_t group_index = static_cast<std::int64_t>(ids[t]) * kg + g;
+        const std::uint16_t scale_bits =
+            static_cast<std::uint16_t>(scales[group_index * 2]) |
+            static_cast<std::uint16_t>(static_cast<std::uint16_t>(scales[group_index * 2 + 1])
+                                       << 8);
+        const float scale = __half2float(__ushort_as_half(scale_bits));
+        const std::uint8_t* code = codes + group_index * (kGroup / 2);
+        __nv_bfloat16* column    = out + static_cast<std::int64_t>(t) * d + g * kGroup;
+        const std::int32_t lanes = min(kGroup, d - g * kGroup);
+        for (std::int32_t lane = 0; lane < lanes; ++lane) {
+            const std::int32_t nibble = (code[lane >> 1] >> ((lane & 1) * 4)) & 0xf;
+            const std::int32_t value  = nibble >= 8 ? nibble - 16 : nibble;
+            const float row = __bfloat162float(__float2bfloat16(static_cast<float>(value) * scale));
+            column[lane]    = __float2bfloat16(row * factor);
+        }
     }
 }
 

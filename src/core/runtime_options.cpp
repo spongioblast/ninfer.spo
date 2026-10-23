@@ -108,6 +108,7 @@ void log_if_set(const RuntimeSwitches& switches) {
         std::fprintf(stderr, " wake_margin_us=%d", *switches.wake_margin_us);
     }
     if (switches.round_stats != 0) { std::fprintf(stderr, " round_stats=%d", switches.round_stats); }
+    if (switches.q4_exact_prefill) { std::fprintf(stderr, " q4_exact_prefill=1"); }
     std::fprintf(stderr, "\n");
 }
 
@@ -144,6 +145,7 @@ RuntimeSwitches& mutable_switches() {
         }
         const int stats = env_int("NINFER_DEBUG_ROUND_STATS", 0);
         out.round_stats = stats < 0 ? 0 : (stats > 10000 ? 10000 : stats);
+        out.q4_exact_prefill = env_present("NINFER_Q4_EXACT");
         return out;
     }();
     return switches;

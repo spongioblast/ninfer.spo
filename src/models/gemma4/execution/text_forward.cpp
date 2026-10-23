@@ -111,9 +111,8 @@ void layer_body(Tensor& x, Tensor& hidden_n, const Gemma4LayerWeights& weights,
     const Tensor gate = gate_up.slice(0, 0, inter);
     const Tensor up   = gate_up.slice(0, inter, inter);
     auto activated    = workspace.alloc(DType::BF16, {inter, tokens});
-    const bool fused_down = tokens >= 128 && weights.down.qtype == ninfer::QType::FP8_E4M3FN_ROW_BF16 &&
-                            ops::allows_a8(weights.down_policy) && weights.down.k == inter &&
-                            weights.down.n == hidden;
+    const bool fused_down = weights.down.k == inter && weights.down.n == hidden &&
+                            ops::linear_takes_a8_ready(weights.down, tokens, weights.down_policy);
     const DownA8 down_codes =
         fused_down ? prepare_down_a8(workspace, inter, tokens) : DownA8{};
     ops::geglu(gate, up, activated, stream, down_codes.codes, down_codes.scales);
@@ -145,7 +144,7 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
                workspace, stream);
 }
 
-void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedding,
+void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
                    ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
@@ -153,7 +152,7 @@ void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedd
     if (layers.size() != caches.size()) {
         throw std::invalid_argument("gemma4_layers: one cache per layer");
     }
-    ops::embedding(ids, token_embedding, hidden, stream);
+    ops::embedding(ids, token_embedding.table, token_embedding.scale, hidden, stream);
     if (visual_embeddings != nullptr || visual_indices != nullptr) {
         if (visual_embeddings == nullptr || visual_indices == nullptr) {
             throw std::invalid_argument("gemma4_layers: visual embeddings need destination indices");
@@ -190,7 +189,7 @@ void gemma4_logits(const Tensor& hidden, Tensor& logits, const void* final_norm,
 }
 
 void gemma4_prefill(const Tensor& ids, Tensor& hidden, Tensor& logits,
-                    const Weight& token_embedding, const void* final_norm,
+                    const Gemma4Embedding& token_embedding, const void* final_norm,
                     const Weight& output_head, float softcap, float rms_eps,
                     std::span<const Gemma4LayerWeights> layers,
                     std::span<const Gemma4CacheLayer> caches, const Tensor& positions,

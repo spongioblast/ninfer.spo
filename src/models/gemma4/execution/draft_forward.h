@@ -33,10 +33,10 @@ struct Gemma4DraftWeights {
  * written, and every step of a round uses the same one. carry is BF16 [backbone,1]: on entry the
  * target's final-normed hidden state at `position` (first step) or the previous step's
  * projection, on exit this step's projection. next receives the argmax draft token. The token
- * embedding is the target's, already scaled by sqrt(backbone).
+ * embedding is the target's; its gather scales the rows by sqrt(backbone).
  */
 void gemma4_draft_step(const Tensor& token, const Tensor& position, Tensor& carry, Tensor& next,
-                       const Weight& token_embedding, const Gemma4DraftWeights& draft,
+                       const Gemma4Embedding& token_embedding, const Gemma4DraftWeights& draft,
                        std::span<const Gemma4CacheLayer> target_caches,
                        ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
                        cudaStream_t stream);
@@ -47,7 +47,7 @@ void gemma4_draft_step(const Tensor& token, const Tensor& position, Tensor& carr
  * is I32 [k,w], the top-k draft tokens of each column. k == 1 is the argmax.
  */
 void gemma4_draft_steps(const Tensor& tokens, const Tensor& positions, const Tensor& carry_in,
-                        Tensor& carry_out, Tensor& top_ids, int k, const Weight& token_embedding,
+                        Tensor& carry_out, Tensor& top_ids, int k, const Gemma4Embedding& token_embedding,
                         const Gemma4DraftWeights& draft,
                         std::span<const Gemma4CacheLayer> target_caches,
                         ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,

@@ -8,7 +8,11 @@ namespace {
 using Narrow = Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>;
 using Mid    = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 128, 128, 2, 4, 2, 1>, 170, 4, 8>;
 using Bulk   = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<128, 256, 128, 2, 4, 2, 1>, 170, 4, 8>;
-constexpr std::int32_t kA8MinTokens = 128;
+using NarrowSplit = Fp8A8TmaSplitKSchedule<Fp8A8TmaMmaSchedule<64, 128, 128, 2, 4, 2, 1>, 188, 8, 8>;
+using Thin   = Fp8A8TmaMmaSchedule<32, 64, 128, 1, 2, 3, 2>;
+// Up to 32 tokens the A16 kernels read the weights at full bandwidth; from 33 they slow down
+// and A8 is at least as fast on every trunk shape.
+constexpr std::int32_t kA8MinTokens = 33;
 } // namespace
 
 template <int N, int K>
@@ -16,6 +20,20 @@ void launch_a8_impl(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Wor
                     cudaStream_t stream, bool quantize) {
     using Geometry = Fp8Geometry<N, K>;
     const int tokens = x.ne[1];
+    // Below 128 tokens (tmp/ninfer/gemma4/fp8short/sweep.csv): the 64-token tile on the wide
+    // shapes; on the 5376-row shapes too few CTAs fill the GPU, so the 32x64 tile up to 64
+    // tokens and the 64-token tile split over K above that.
+    if (tokens < 128) {
+        if constexpr (N == 5376) {
+            if (tokens <= 64) {
+                return launch_fp8_a8_tma<Geometry, Thin>(x, weight, out, scratch, stream, quantize);
+            }
+            return launch_fp8_a8_tma<Geometry, NarrowSplit>(x, weight, out, scratch, stream,
+                                                            quantize);
+        } else {
+            return launch_fp8_a8_tma<Geometry, Narrow>(x, weight, out, scratch, stream, quantize);
+        }
+    }
     // Cold-bench on this GPU (tmp/ninfer/gemma4/nsys/speed/linear_a8_split.txt): the 64-token
     // tile wins at 128 tokens except on 43008x5376 and 5376x21504, and the 128-row tile wins
     // at 512 tokens when N is below 18000. The 256-row bulk stays fastest everywhere else,
@@ -45,6 +63,7 @@ bool uses_a8(std::int32_t, std::int32_t max_tokens) { return max_tokens >= kA8Mi
 
 std::size_t partial_capacity_bytes(std::int32_t max_tokens) {
     // Sized for the bulk tile, which is the largest partial any of these schedules writes.
+    static_assert(Bulk::kPartialBytes >= NarrowSplit::kPartialBytes);
     return max_tokens >= kA8MinTokens ? Bulk::kPartialBytes : 0;
 }
 

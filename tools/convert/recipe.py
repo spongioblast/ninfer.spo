@@ -21,6 +21,7 @@ from .methods import (
     grouped_absmax,
     fp8_row_maxabs,
     import_encoded,
+    q4_g32_qat,
     nvfp4_absmax,
     nvfp4_mse46,
 )
@@ -386,6 +387,7 @@ class Recipe:
             grouped_absmax,
             fp8_row_maxabs,
             import_encoded,
+            q4_g32_qat,
             nvfp4_mse46,
             nvfp4_absmax,
         )

@@ -55,6 +55,14 @@ void gemma4_layer(Tensor& x, const Gemma4LayerWeights& weights, const Tensor& po
                                                        int tokens);
 [[nodiscard]] std::size_t gemma4_logits_workspace_bytes(const Weight& output_head, int tokens);
 
+// The token table and the factor the gather multiplies its rows by (as a BF16 value, like the
+// Hugging Face embedding scale). 1 when the artifact stores the rows already scaled; sqrt(hidden)
+// when the output head shares the unscaled table.
+struct Gemma4Embedding {
+    Weight table;
+    float scale = 1.0f;
+};
+
 struct Gemma4CacheLayer {
     Tensor* k_pages           = nullptr;
     Tensor* v_pages           = nullptr;
@@ -63,7 +71,7 @@ struct Gemma4CacheLayer {
 
 // Embed ids into `hidden` [hidden,T] and run every layer, appending K/V at `positions`.
 // visual_embeddings [hidden,V] and visual_indices [V] overwrite those columns after embed.
-void gemma4_layers(const Tensor& ids, Tensor& hidden, const Weight& token_embedding,
+void gemma4_layers(const Tensor& ids, Tensor& hidden, const Gemma4Embedding& token_embedding,
                    std::span<const Gemma4LayerWeights> layers,
                    std::span<const Gemma4CacheLayer> caches, const Tensor& positions,
                    ops::Bf16GemmContext& gemm, WorkspaceArena& workspace, cudaStream_t stream,
@@ -79,7 +87,7 @@ void gemma4_logits(const Tensor& hidden, Tensor& logits, const void* final_norm,
 // Embed, run every layer, final norm, output head, then logit softcap.
 // `hidden` and `logits` are caller storage, [hidden,T] and [vocab,T].
 void gemma4_prefill(const Tensor& ids, Tensor& hidden, Tensor& logits,
-                    const Weight& token_embedding, const void* final_norm,
+                    const Gemma4Embedding& token_embedding, const void* final_norm,
                     const Weight& output_head, float softcap, float rms_eps,
                     std::span<const Gemma4LayerWeights> layers,
                     std::span<const Gemma4CacheLayer> caches, const Tensor& positions,

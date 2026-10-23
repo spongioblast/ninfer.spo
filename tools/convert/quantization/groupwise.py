@@ -67,6 +67,55 @@ def pick_device(preferred: str | torch.device = "cuda") -> torch.device:
     return device
 
 
+def quantize_q4_g32_qat(
+    weight: torch.Tensor,
+    *,
+    device: str | torch.device | None = None,
+) -> QuantizedMatrix:
+    """Recover the 4-bit group-32 grid already present in a QAT bf16 matrix.
+
+    Each group of 32 values is an integer code in [-8, 7] times one binary16
+    scale. The scale is the group's absolute maximum divided by the largest
+    code it uses (8 when code -8 is present, otherwise 7 or less). Picking
+    that divisor keeps the stored values; dividing by 7 for every group
+    quantizes them a second time.
+    """
+
+    if weight.dim() != 2 or not weight.dtype.is_floating_point:
+        raise ValueError("q4_g32_qat requires a floating-point rank-2 matrix")
+    geometry = row_split_geometry(Q4_G32_NAME, weight.shape)
+    target = pick_device() if device is None else pick_device(device)
+    logical = weight.detach().to(device=target, dtype=torch.float32)
+    if geometry.k_pad != geometry.k:
+        physical = torch.zeros(
+            (geometry.n, geometry.k_pad), dtype=torch.float32, device=target
+        )
+        physical[:, : geometry.k].copy_(logical)
+        logical = physical
+    grouped = logical.reshape(geometry.n, geometry.groups_per_row, 32)
+    amax = grouped.abs().amax(dim=2)
+    best_codes = best_scales = best_error = None
+    for divisor in range(1, 9):
+        host_scales, host_reciprocal = _canonical_scale_words(amax / divisor, 1)
+        scales = host_scales.to(target)
+        reciprocal = host_reciprocal.to(target)
+        codes = torch.clamp(
+            torch.round(grouped * reciprocal.unsqueeze(-1)), -8, 7
+        ).to(torch.int8)
+        error = (codes.float() * scales.unsqueeze(-1) - grouped).square().sum(dim=2)
+        if best_error is None:
+            best_codes, best_scales, best_error = codes, scales, error
+        else:
+            take = error < best_error
+            best_codes = torch.where(take.unsqueeze(-1), codes, best_codes)
+            best_scales = torch.where(take, scales, best_scales)
+            best_error = torch.where(take, error, best_error)
+    return QuantizedMatrix(codes=best_codes, scales=best_scales)
+
+
+Q4_G32_NAME = "q4_g32_fp16"
+
+
 def quantize_matrix(
     weight: torch.Tensor,
     format: str | QuantFormat,

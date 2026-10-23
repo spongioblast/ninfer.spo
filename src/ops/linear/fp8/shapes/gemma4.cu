@@ -1,5 +1,5 @@
 // Gemma 4 31B projections and output heads in the row-scaled FP8 profile. The trunk projections
-// take their own A16 routes for 17..127 tokens (gemma4_a16.h) and admit A8 from 128 tokens
+// take their own A16 routes for 17..32 tokens (gemma4_a16.h) and admit A8 from 33 tokens
 // (gemma4_a8.h). Both vocabulary heads and the drafter run the dense A16 routes.
 #include "ops/linear/fp8/fp8_dense_a16.cuh"
 #include "ops/linear/fp8/shapes/gemma4_a16.h"

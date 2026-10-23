@@ -33,6 +33,9 @@ struct RuntimeSwitches {
     std::string decode_wait;
     std::optional<int> wake_margin_us;
     int round_stats = 0;
+
+    // q4_g32 prefill keeps one FP32 scale per group instead of the baked E4M3 weights.
+    bool q4_exact_prefill = false;
 };
 
 struct RuntimeSwitchFlags {

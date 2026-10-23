@@ -25,7 +25,7 @@ from tools.artifact.schema import TensorSpec
 from tools.artifact.tensor_output import TensorOutput
 
 from .quantization.fp8_row import quantize_bf16_rows
-from .quantization.groupwise import quantize_matrix
+from .quantization.groupwise import quantize_matrix, quantize_q4_g32_qat
 from .quantization.nvfp4 import nvfp4_divisor, quantize_nvfp4_rows
 from .sources.logical import EncodedRows, LogicalSource
 
@@ -215,6 +215,25 @@ def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
             encoded = quantize_matrix(
                 values, request.target.format, device=request.device
             )
+            output.write_codes(begin, encoded.codes, encoded.scales)
+
+    return request.job(produce=produce)
+
+
+def q4_g32_qat(request: PrepareRequest) -> PreparedMethod:
+    """Recover the QAT 4-bit group-32 grid instead of quantizing the matrix again."""
+    if request.target.format != "q4_g32_fp16" or len(request.target.shape) != 2:
+        raise ValueError("q4_g32_qat requires the q4_g32_fp16 matrix format")
+    _preflight(request)
+    n, k = request.target.shape
+
+    def produce(output):
+        for begin in range(0, n, request.rows_per_chunk):
+            end = min(n, begin + request.rows_per_chunk)
+            values = request.values(begin * k, end * k).reshape(end - begin, k)
+            if not values.dtype.is_floating_point:
+                raise TypeError("q4_g32_qat source must provide floating-point values")
+            encoded = quantize_q4_g32_qat(values, device=request.device)
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)

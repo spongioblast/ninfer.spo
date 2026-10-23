@@ -6,6 +6,7 @@
 #include "artifact/views.h"
 #include "core/device.h"
 #include "ninfer/ops/fp8_row_quantize.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/weight_input.h"
 
 #include <optional>
@@ -74,7 +75,8 @@ ops::SingleProjectionWeight projection(const artifact::MaterializedArtifact& art
     }
     auto result = ops::prepare_linear_weight(std::span<const ops::WeightInput>(inputs));
     const QType format = result.weight.qtype;
-    if (format != QType::BF16 && format != QType::NVFP4 && format != QType::FP8_E4M3FN_ROW_BF16) {
+    if (format != QType::BF16 && format != QType::NVFP4 && format != QType::FP8_E4M3FN_ROW_BF16 &&
+        format != QType::Q4_G32_FP16) {
         throw std::invalid_argument("gemma4 load: " + blocks.front().name +
                                     " has an unsupported format");
     }
@@ -85,6 +87,11 @@ Weight single_weight(const artifact::MaterializedArtifact& artifact,
                      const artifact::ParameterReference& reference) {
     const InputUse use;
     return projection(artifact, std::span(&reference, 1), std::span(&use, 1)).weight;
+}
+
+bool same_object(const artifact::Binding& a, const artifact::Binding& b) {
+    return a.parts.size() == 1 && b.parts.size() == 1 && a.parts[0].object == b.parts[0].object &&
+           a.parts[0].begin == b.parts[0].begin && a.parts[0].end == b.parts[0].end;
 }
 
 int config_int(const artifact::Json& config, const char* key) {
@@ -466,10 +473,15 @@ LoadedText load_text(const std::string& artifact_path, DeviceContext& device, bo
     loaded.hidden = hidden;
     loaded.softcap = config.at("final_logit_softcapping").get<float>();
     loaded.rms_eps = config.at("rms_norm_eps").get<float>();
-    loaded.token_embedding = single_weight(*loaded.artifact, embedding[0]);
+    loaded.token_embedding.table = single_weight(*loaded.artifact, embedding[0]);
     loaded.final_norm = device_data(*loaded.artifact, final_norm[0]);
     loaded.output_head = single_weight(*loaded.artifact, head[0]);
+    // A table the head shares is the unscaled one, so the gather applies the normalizer.
+    if (same_object(embedding[0].binding, head[0].binding)) {
+        loaded.token_embedding.scale = config.at("embed_normalizer").get<float>();
+    }
     loaded.layers.resize(static_cast<std::size_t>(layers));
+    loaded.a8_rows.reserve(static_cast<std::size_t>(layers) * 4);
     for (int layer = 0; layer < layers; ++layer) {
         const bool global = kinds[layer] == "full_attention";
         const int dim = global ? global_dim : sliding_dim;
@@ -520,6 +532,9 @@ LoadedText load_text(const std::string& artifact_path, DeviceContext& device, bo
                                     : config.at("rope_sliding_theta").get<float>();
         weights.rms_eps = loaded.rms_eps;
         weights.global_layer = global;
+        for (Weight* projection : {&weights.qkv, &weights.o_proj, &weights.gate_up, &weights.down}) {
+            ops::linear_prepare_a8_rows(*projection, loaded.a8_rows.emplace_back(), device.stream);
+        }
         loaded.layers[static_cast<std::size_t>(layer)] = weights;
     }
     if (draft) {

@@ -158,9 +158,18 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream,
             Bf16GemmContext* bf16_gemm);
 
 // FP8 A8 GEMM whose activation codes and per-token scales are already written. Used when the
-// producer (GeGLU) quantized its BF16 output. Only the Gemma down shape 5376x21504.
+// producer (GeGLU) quantized its BF16 output. Only the Gemma down shape 5376x21504, FP8 weights
+// or q4_g32 weights on the baked prefill route.
 void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      std::uint8_t* codes, float* scales, WorkspaceArena& workspace,
                      cudaStream_t stream);
+
+// Whether linear_a8_ready accepts this weight at this token count.
+[[nodiscard]] bool linear_takes_a8_ready(const Weight& w, std::int32_t tokens, LinearPolicy policy);
+
+// For a Q4_G32_FP16 weight the fused A8 prefill serves, derive its row multipliers once into
+// `storage` and point w.row_scales at them; every other weight is left unchanged. `storage` must
+// outlive `w`. Finishes before return.
+void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t stream);
 
 } // namespace ninfer::ops

@@ -1,10 +1,15 @@
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
+#include "core/device.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
+#include "ops/linear/fp8/fp8_a8_plan.h"
+#include "ops/linear/fp8/shapes/gemma4_a8.h"
+#include "ops/linear/q4/q4_g32_gemv.cuh"
+#include "ops/linear/q4/q4_g32_w4a8.cuh"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
@@ -13,6 +18,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::ops {
 namespace {
@@ -98,6 +104,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     case QType::FP8_E4M3FN_ROW_BF16:
         detail::fp8_dispatch(x, w, out, policy, workspace, stream);
         return;
+    case QType::Q4_G32_FP16:
+        detail::q4_g32_dispatch(x, w, out, policy, workspace, stream);
+        return;
     case QType::FP32:
     case QType::INT32:
         break;
@@ -142,9 +151,9 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     case QType::FP8_E4M3FN_ROW_BF16:
         return detail::fp8_linear_workspace_capacity_bytes(output_rows, input_rows, policy,
                                                            min_tokens, max_tokens);
-    case QType::FP32:
-    case QType::INT32:
-        break;
+    case QType::Q4_G32_FP16:
+        if (policy == LinearPolicy::A16Only) { return 0; }
+        return detail::q4_g32_w4a8_workspace_bytes(output_rows, input_rows, max_tokens);
     }
     throw std::invalid_argument("linear workspace: unsupported weight qtype");
 }
@@ -174,7 +183,37 @@ void linear_a8_ready(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
                      std::uint8_t* codes, float* scales, WorkspaceArena& workspace,
                      cudaStream_t stream) {
     validate_linear_semantics(x, w, out, policy);
+    if (w.qtype == QType::Q4_G32_FP16) {
+        if (!allows_a8(policy) || codes == nullptr || scales == nullptr) {
+            throw std::invalid_argument("q4_g32 ready: needs the A8 policy, codes, and scales");
+        }
+        const detail::Q4LinearOperands operands = detail::q4_linear_operands(x, w);
+        detail::q4_g32_w4a8_ready(operands, static_cast<__nv_bfloat16*>(out.data), codes, scales, workspace,
+                                  stream);
+        return;
+    }
     detail::fp8_dispatch_ready(x, w, out, policy, codes, scales, &workspace, stream);
+}
+
+bool linear_takes_a8_ready(const Weight& w, std::int32_t tokens, LinearPolicy policy) {
+    if (!allows_a8(policy)) { return false; }
+    if (w.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+        return w.n == 5376 && w.k == 21504 && detail::gemma4_fp8::uses_a8(tokens, tokens);
+    }
+    if (w.qtype == QType::Q4_G32_FP16) { return detail::q4_g32_takes_ready_codes(w.n, w.k, tokens); }
+    return false;
+}
+
+void linear_prepare_a8_rows(Weight& w, DeviceBuffer& storage, cudaStream_t stream) {
+    if (w.qtype != QType::Q4_G32_FP16 || w.layout != QuantLayout::RowSplit || w.scales == nullptr ||
+        w.padded_shape[1] != w.k || !detail::q4_trunk_shape(w.n, w.k)) {
+        return;
+    }
+    DeviceBuffer rows(static_cast<std::size_t>(w.n) * 2);
+    detail::q4_g32_row_multipliers(static_cast<const std::uint8_t*>(w.scales), rows.p, w.n, w.k, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    storage      = std::move(rows);
+    w.row_scales = storage.p;
 }
 
 } // namespace ninfer::ops

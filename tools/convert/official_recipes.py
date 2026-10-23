@@ -10,7 +10,10 @@ from .methods import (
     grouped_absmax,
     import_encoded,
     nvfp4_mse46,
+    q4_g32_qat,
 )
+
+Q4_G32 = "q4_g32_fp16"
 
 Q4 = "q4_g64_fp16"
 Q5 = "q5_g64_fp16"
@@ -207,8 +210,15 @@ def gemma4_attention(config, name):
     return "/attention/" in name
 
 
+def _share_gemma4_vocabulary(recipe):
+    """One stored vocabulary table: the embedding binds the head's unscaled object, and the
+    runtime gather multiplies its rows by the BF16 sqrt(hidden) normalizer."""
+    recipe.share("text/token_embedding", "text/output_head")
+
+
 def _gemma4_quantized(model, recipe, trunk, *, values=None, mlp=None, fp8=None):
-    """FP8 embedding and heads; every text-layer projection gets `trunk(name)`.
+    """One FP8 vocabulary table for the embedding and the head, an FP8 MTP head; every text-layer
+    projection gets `trunk(name)`.
 
     `values` replaces the base checkpoint for every text parameter. `mlp` imports the MLP's
     encoded NVFP4 words from that checkpoint instead of quantizing them. `fp8(config, name)`
@@ -237,6 +247,7 @@ def _gemma4_quantized(model, recipe, trunk, *, values=None, mlp=None, fp8=None):
             recipe.assign(
                 name, format=parameter.direct_format, method=cast_direct, source=source
             )
+    _share_gemma4_vocabulary(recipe)
 
 
 def gemma4_31b_fp8(model, recipe, sources):
@@ -252,6 +263,35 @@ def gemma4_31b_nvfp4_base(model, recipe, sources):
 def gemma4_31b_nvfp4_qat(model, recipe, sources):
     _require_gemma4(model, "gemma4_31b_nvfp4_qat")
     _gemma4_quantized(model, recipe, ("nvfp4", nvfp4_mse46), values=sources["qat"])
+
+
+def gemma4_31b_q4_qat(model, recipe, sources):
+    """QAT text projections, embedding, and head on their stored 4-bit grid.
+
+    Text and vision values come from `--source qat`. The MTP assistant stays on its own
+    component source: the QAT checkpoint does not contain it, and its head stays FP8.
+    The embedding table is stored after the BF16 sqrt(hidden) normalizer; its groups are
+    still one scale times codes in [-8, 7] up to that BF16 rounding, so `q4_g32_qat`
+    recovers them.
+    """
+    _require_gemma4(model, "gemma4_31b_q4_qat")
+    qat = sources["qat"]
+    for name, parameter in model.parameters.items():
+        source = (
+            model.source(name, qat)
+            if name.startswith("text/") or name.startswith("vision/")
+            else None
+        )
+        if name == "mtp/output_head":
+            recipe.assign(name, format=FP8, method=fp8_row_maxabs, source=source)
+        elif name in ("text/token_embedding", "text/output_head"):
+            recipe.assign(name, format=Q4_G32, method=q4_g32_qat, source=source)
+        elif name.startswith("text/layers/") and parameter.projection:
+            recipe.assign(name, format=Q4_G32, method=q4_g32_qat, source=source)
+        else:
+            recipe.assign(
+                name, format=parameter.direct_format, method=cast_direct, source=source
+            )
 
 
 def gemma4_31b_nvfp4_mixed(model, recipe, sources):
@@ -310,6 +350,21 @@ def gemma4_nvfp4_a4_mlp(model, recipe, sources):
     _gemma4_a4(model, recipe, sources, "gemma4_nvfp4_a4_mlp", mlp_only=True)
 
 
+def gemma4_q4_a8(model, recipe, sources):
+    """Override: allow A8 on every q4_g32 text-layer projection.
+
+    The embedding and the output head stay A16Only.
+    """
+    _require_gemma4(model, "gemma4_q4_a8")
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/layers/") or not parameter.projection:
+            continue
+        if not all(s.format == Q4_G32 for s in recipe.selections[name]):
+            continue
+        for input_name in parameter.inputs:
+            recipe.use(name, input_name, activation_policy="AllowA8")
+
+
 def gemma4_fp8_a8(model, recipe, sources):
     """Override: allow A8 (per-token FP8 activations) on every FP8 text-layer projection.
 
@@ -335,6 +390,8 @@ RECIPES = {
     "gemma4_31b_fp8": gemma4_31b_fp8,
     "gemma4_31b_nvfp4_base": gemma4_31b_nvfp4_base,
     "gemma4_31b_nvfp4_qat": gemma4_31b_nvfp4_qat,
+    "gemma4_31b_q4_qat": gemma4_31b_q4_qat,
+    "gemma4_q4_a8": gemma4_q4_a8,
     "gemma4_31b_nvfp4_nvidia": gemma4_31b_nvfp4_nvidia,
     "gemma4_31b_nvfp4_mixed": gemma4_31b_nvfp4_mixed,
     "gemma4_31b_nvfp4_mlp": gemma4_31b_nvfp4_mlp,

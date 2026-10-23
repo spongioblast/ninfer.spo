@@ -30,7 +30,19 @@ Scheduling is a fixed set of resident lanes, chosen at startup (`--max-concurren
 
 Gemma 4 captures its text prefill for the widths in `src/models/gemma4/program/prefill_graphs.h` (32, 64, 128, 256, 512, 1024). A chunk that carries vision embeddings, or any other width, stays eager. Vision attention is one tensor-core flash kernel (`src/ops/kernel/gemma4_vision_attention.cuh`): two sweeps over the keys, the first for the row max and sum, the second for FP32 softmax weights split into two BF16 parts, so nothing of size T² is stored. The encoder projections that match a registered BF16 shape go through `ops::linear`; gate/up is two 4304-row multiplies. `gemma4_vision_encode` reads the patch positions back once and queues the rest on the stream, so callers sync the stream before they read the embeddings (`Program::encode_vision` does).
 
-The Gemma FP8 trunk projections route 17 to 127 tokens in `src/ops/linear/fp8/shapes/gemma4_a16.cu`. From 17 to 64 tokens most shapes use `fp8_a16_wide_gemv.cuh`: a CTA owns 32 or 64 output rows and all tokens, so each activation fragment feeds two or four MMAs. Decode and MTP verify (at most 16 tokens) keep the generic routes and their bits.
+The Gemma FP8 trunk projections route 17 to 127 tokens in `src/ops/linear/fp8/shapes/gemma4_a16.cu`. From 17 to 64 tokens most shapes use `fp8_a16_wide_gemv.cuh`: a CTA owns 32 or 64 output rows and all tokens, so each activation fragment feeds two or four MMAs. Decode and MTP verify (at most 16 tokens) keep the generic routes and their bits. With A8 allowed (`gemma4_fp8_a8`), the trunk switches to the A8 GEMM from 33 tokens, where the A16 kernels stop reading the weights at full bandwidth: a 32×64 tile up to 64 tokens and a split-K 64×128 tile up to 127 on the 5376-row shapes, and 64×128 on the wide ones.
+
+Gemma QAT `q4_g32_fp16` projections route by token count in `src/ops/linear/q4/`:
+
+| Tokens | Route | File |
+|---|---|---|
+| 1 | bandwidth GEMV | `q4_g32_gemv.cu` |
+| 2–8 | 8-token tensor-core GEMV (two passes for 9–16 without A8) | `q4_g32_tc.cu` |
+| 9–384, A8 | fused W4A8: converter warps widen the codes to E4M3 in shared memory for the FP8 tiles | `q4_g32_fused_a8.cuh` |
+| 385+, A8 | bake: codes widened to E4M3 once per call, then the FP8 A8 kernels | `q4_g32_w4a8.cu` |
+| 17+, A16 only | wide GEMV | `q4_g32_wide.cu` |
+
+Other shapes with A8 take the exact W4A8 GEMM from 128 tokens. Both W4A8 routes on the trunk shapes round `code * scale_g / s_row` to E4M3 with one BF16 multiplier `s_row` per row, so they produce the same weight bytes; only the split-K summation order differs. The loader stores `s_row` next to each projection (`Weight::row_scales`, `ops::linear_prepare_a8_rows`). `NINFER_Q4_EXACT=1` keeps the codes exact (one FP32 scale per group) and prefills slower; use it as the quality reference.
 
 Model math does not live here. Each family still owns its program transactions under `src/models/<family>/program/`. Flash-Next's program is `src/models/qwen3_8_flash_next/program/v3_program.h`. Qwen3.5's is `src/models/qwen3_5/program/program.h`. Gemma 4's is `src/models/gemma4/program/program.h`. The transaction sets are shaped differently (Qwen3.5 keeps upstream's per-transaction files, Flash-Next its P3–P6 split, Gemma its own round), so they are not hoisted. `tests/program/test_attention_only_core.cpp` drives the shared storage with two KV pools of different geometry and no recurrent state.
 

@@ -1,7 +1,7 @@
 #pragma once
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
-// A8 routes of the Gemma 4 trunk projections (gemma4_a8.cu): from 128 tokens, per-token FP8
+// A8 routes of the Gemma 4 trunk projections (gemma4_a8.cu): from 33 tokens, per-token FP8
 // activations on the TMA tensor-core GEMM. Instantiated for the six trunk geometries only.
 namespace ninfer::ops::detail::gemma4_fp8 {
 template <int N, int K>

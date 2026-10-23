@@ -1,6 +1,6 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the ten persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly nine persistent numeric tensor formats in four categories.
+NInfer has exactly ten persistent numeric tensor formats in four categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -23,6 +23,7 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 | Canonical name | Code width | Group size | Legal signed codes | Scale | Full-group logical bits/weight |
 |---|---:|---:|---:|---|---:|
 | `q4_g64_fp16` | 4 | 64 | `[-8, 7]` | one binary16 scale/group | 4.25 |
+| `q4_g32_fp16` | 4 | 32 | `[-8, 7]` | one binary16 scale/group | 4.50 |
 | `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `q8_g32_fp16` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
@@ -121,7 +122,7 @@ exactly the same direct words or logical codes and scales. The currently registe
 `contiguous_le_v1` for direct words, `row_split_k128_v1` for grouped signed-integer formats, and
 `block_scale_k16_m128x4_v1` for `nvfp4`, and `row_scale_v1` for
 `fp8_e4m3fn_row_bf16`. Their byte order, plane packing, padding, swizzle, divisor placement, and
-alignment rules belong to the layout registry, not to these nine numeric formats.
+alignment rules belong to the layout registry, not to these ten numeric formats.
 
 ### 2.7 Compute profile and kernel support
 
@@ -216,8 +217,8 @@ logical parameter role.
 ### 3.2 Grouped signed-integer weight identities
 
 The identifiers record code width, group size and scale type. For example, `q4_g64_fp16` uses
-4-bit signed codes and one IEEE-754 binary16 scale per group of 64 weights. `q5_g64_fp16`,
-`q6_g64_fp16`, and `q8_g32_fp16` follow the same naming convention.
+4-bit signed codes and one IEEE-754 binary16 scale per group of 64 weights. `q4_g32_fp16`,
+`q5_g64_fp16`, `q6_g64_fp16`, and `q8_g32_fp16` follow the same naming convention.
 
 The parser resolves names through the format registry. `Q4`, `Q5`, `Q6`, and `Q8` are prose
 abbreviations; artifacts store the complete canonical names.
@@ -356,7 +357,7 @@ them at its own boundary. A logical encoder produces no physical padding.
 
 ## 5. Grouped signed-integer code domains
 
-All four schemes are zero-point-free, weight-only signed-integer schemes. “Symmetric” in this
+All five schemes are zero-point-free, weight-only signed-integer schemes. “Symmetric” in this
 document means that reconstruction is `scale * signed_code` with zero point zero. It does not mean
 that every legal interval has equal positive and negative magnitude.
 
@@ -367,6 +368,7 @@ The logical code is a two's-complement signed integer of the stated width:
 | Scheme | Width | Sign bit | Legal code interval | `qmax` used by reference encoder |
 |---|---:|---:|---:|---:|
 | `q4_g64_fp16` | 4 | `0x8` | `[-8, 7]` | 7 |
+| `q4_g32_fp16` | 4 | `0x8` | `[-8, 7]` | 7 |
 | `q5_g64_fp16` | 5 | `0x10` | `[-16, 15]` | 15 |
 | `q6_g64_fp16` | 6 | `0x20` | `[-32, 31]` | 31 |
 
@@ -533,10 +535,15 @@ reciprocal and always produces positive-zero scale and zero codes.
 
 The scheme identity is determined by the persistent representation and reconstruction contract,
 not by how a converter found its codes. A documented upstream, calibrated, or error-optimized
-encoder may emit the same four schemes if all output codes and scales satisfy Sections 4 through 6.
+encoder may emit the same five schemes if all output codes and scales satisfy Sections 4 through 6.
 
 User recipes select these methods explicitly and record their provenance. An alternative method
 need not match `grouped_absmax` bit for bit. It must produce valid words of the selected format.
+
+`q4_g32_qat` is one such method for `q4_g32_fp16`. A QAT matrix is already `code * scale` per group
+of 32, and its largest magnitude may be `8 * scale` (code `-8`) or `7 * scale`, so `amax / qmax`
+would requantize it. The method tries `amax / k` for `k` from 1 to 8 and keeps the binary16 scale
+whose round-trip error is smallest, so code `-8` survives.
 A change to group geometry, scale type, code domain or reconstruction equation requires a different
 numeric format, with its own codec and consumer support.
 

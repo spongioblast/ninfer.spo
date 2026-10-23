@@ -52,6 +52,8 @@ quantized_weight::PackedWeight make_bf16_weight(std::int32_t n, std::int32_t k, 
 
 quantized_weight::PackedWeight make_q4_g64_fp16_weight(std::int32_t n, std::int32_t k,
                                                        std::uint32_t seed);
+quantized_weight::PackedWeight make_q4_g32_fp16_weight(std::int32_t n, std::int32_t k,
+                                                       std::uint32_t seed);
 quantized_weight::PackedWeight make_q5_g64_fp16_weight(std::int32_t n, std::int32_t k,
                                                        std::uint32_t seed);
 quantized_weight::PackedWeight make_q6_g64_fp16_weight(std::int32_t n, std::int32_t k,

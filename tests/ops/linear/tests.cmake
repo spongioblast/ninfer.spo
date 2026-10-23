@@ -4,6 +4,10 @@ ninfer_test_includes(ninfer_linear_test_support)
 ninfer_op_oracle_options(ninfer_linear_test_support)
 target_link_libraries(ninfer_linear_test_support PUBLIC ninfer_ops)
 
+ninfer_add_op_test(ninfer_linear_q4_g32_a16_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_g32_a16.cpp"
+  LIBRARIES ninfer_linear_test_support)
+
 ninfer_add_op_test(ninfer_linear_q4_a16_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_q4_a16.cpp"
   LIBRARIES ninfer_linear_test_support)

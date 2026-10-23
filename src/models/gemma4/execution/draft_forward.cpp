@@ -107,7 +107,7 @@ std::size_t gemma4_draft_workspace_bytes(const Gemma4DraftWeights& draft, int co
 }
 
 void gemma4_draft_steps(const Tensor& tokens, const Tensor& positions, const Tensor& carry_in,
-                        Tensor& carry_out, Tensor& top_ids, int k, const Weight& token_embedding,
+                        Tensor& carry_out, Tensor& top_ids, int k, const Gemma4Embedding& token_embedding,
                         const Gemma4DraftWeights& draft,
                         std::span<const Gemma4CacheLayer> target_caches,
                         ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
@@ -124,7 +124,7 @@ void gemma4_draft_steps(const Tensor& tokens, const Tensor& positions, const Ten
     auto scope = workspace.scope();
     auto stem  = workspace.alloc(DType::BF16, {2 * backbone, width});
     auto embedded = workspace.alloc(DType::BF16, {backbone, width});
-    ops::embedding(tokens, token_embedding, embedded, stream);
+    ops::embedding(tokens, token_embedding.table, token_embedding.scale, embedded, stream);
     const std::size_t half = static_cast<std::size_t>(backbone) * 2;
     check(cudaMemcpy2DAsync(stem.data, 2 * half, embedded.data, half, half,
                             static_cast<std::size_t>(width), cudaMemcpyDeviceToDevice, stream),
@@ -161,7 +161,7 @@ void gemma4_draft_steps(const Tensor& tokens, const Tensor& positions, const Ten
 }
 
 void gemma4_draft_step(const Tensor& token, const Tensor& position, Tensor& carry, Tensor& next,
-                       const Weight& token_embedding, const Gemma4DraftWeights& draft,
+                       const Gemma4Embedding& token_embedding, const Gemma4DraftWeights& draft,
                        std::span<const Gemma4CacheLayer> target_caches,
                        ops::Bf16GemmContext& gemm, WorkspaceArena& workspace,
                        cudaStream_t stream) {

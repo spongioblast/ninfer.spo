@@ -114,9 +114,14 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     out.padded_columns = k;
     if (layout == QuantLayout::RowSplit) {
         std::uint64_t high_per_group = 0;
+        std::uint64_t code_per_group = 32;
         switch (format) {
         case QType::Q4_G64_FP16:
             out.group_size = 64;
+            break;
+        case QType::Q4_G32_FP16:
+            out.group_size   = 32;
+            code_per_group   = 16;
             break;
         case QType::Q5_G64_FP16:
             out.group_size = 64;
@@ -134,7 +139,7 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         }
         out.padded_columns      = aligned(k, 128);
         const auto groups       = out.padded_columns / out.group_size;
-        out.code_bytes_per_row  = mul(groups, 32);
+        out.code_bytes_per_row  = mul(groups, code_per_group);
         out.high_bytes_per_row  = mul(groups, high_per_group);
         out.scale_bytes_per_row = mul(groups, 2);
         out.code_bytes          = mul(n, out.code_bytes_per_row);

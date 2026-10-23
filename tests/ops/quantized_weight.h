@@ -153,6 +153,8 @@ inline QuantSpec quant_spec(QType qtype) {
     switch (qtype) {
     case QType::Q4_G64_FP16:
         return {4, 64, 7, -8};
+    case QType::Q4_G32_FP16:
+        return {4, 32, 7, -8};
     case QType::Q5_G64_FP16:
         return {5, 64, 15, -16};
     case QType::Q6_G64_FP16:

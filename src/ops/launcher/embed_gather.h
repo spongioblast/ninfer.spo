@@ -21,7 +21,9 @@ void embed_gather_q6_launch(const Tensor& ids, const Weight& table, Tensor& out,
                             cudaStream_t stream);
 void embed_gather_q8_launch(const Tensor& ids, const Weight& table, Tensor& out,
                             cudaStream_t stream);
-void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out,
+void embed_gather_q4g32_launch(const Tensor& ids, const Weight& table, float factor, Tensor& out,
+                               cudaStream_t stream);
+void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, float factor, Tensor& out,
                              cudaStream_t stream);
 void embed_gather_q8_2048_launch(const Tensor& ids, const Weight& table, Tensor& out,
                                  Q8EmbedRoute route, cudaStream_t stream);

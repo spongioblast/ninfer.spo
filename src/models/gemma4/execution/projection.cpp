@@ -13,6 +13,7 @@ namespace {
 constexpr int kFp8CublasMinTokens = 512;
 
 bool fp8_through_cublas(const Weight& weight, ops::LinearPolicy policy, int tokens) {
+    // q4_g32 stays in ops::linear (GEMV, wide GEMV, or W4A8). It must not widen through cuBLAS.
     return weight.qtype == QType::FP8_E4M3FN_ROW_BF16 && policy == ops::LinearPolicy::A16Only &&
            tokens >= kFp8CublasMinTokens;
 }

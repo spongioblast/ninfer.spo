@@ -92,8 +92,8 @@ int main() {
     models::gemma4::Gemma4CacheLayer cache{&k_pages, &v_pages, &block};
     const models::gemma4::Gemma4LayerWeights layers[] = {layer};
     const models::gemma4::Gemma4CacheLayer caches[]   = {cache};
-    models::gemma4::gemma4_prefill(ids, hidden, logits, bf16_matrix(dembed.data(), kVocab, kHidden),
-                                   done.data(), bf16_matrix(dhead.data(), kVocab, kHidden), 30.0f,
+    const models::gemma4::Gemma4Embedding embedding{bf16_matrix(dembed.data(), kVocab, kHidden)};
+    models::gemma4::gemma4_prefill(ids, hidden, logits, embedding, done.data(), bf16_matrix(dhead.data(), kVocab, kHidden), 30.0f,
                                    1.0e-6f, layers, caches, pos, gemm, workspace, stream);
     if (cudaStreamSynchronize(stream) != cudaSuccess) {
         cudaStreamDestroy(stream);

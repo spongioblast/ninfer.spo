@@ -332,7 +332,7 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
         models::gemma4::load_text(options.artifact_path.string(), device, mtp));
     device.synchronize();
     std::set<std::string> formats;
-    for (const Weight* weight : {&loaded->token_embedding, &loaded->output_head}) {
+    for (const Weight* weight : {&loaded->token_embedding.table, &loaded->output_head}) {
         formats.emplace(artifact::format_name(weight->qtype));
     }
     for (const auto& layer : loaded->layers) {

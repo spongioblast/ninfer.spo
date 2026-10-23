@@ -28,13 +28,15 @@ struct LoadedText {
 
     std::unique_ptr<artifact::MaterializedArtifact> artifact;
     std::vector<Gemma4LayerWeights> layers;
-    Weight token_embedding;
+    Gemma4Embedding token_embedding;
     const void* final_norm      = nullptr;
     Weight output_head;
     int vocab                   = 0;
     int hidden                  = 0;
     float softcap               = 30.0f;
     float rms_eps               = 1.0e-6f;
+    // Row multipliers of the q4 trunk projections (ops::linear_prepare_a8_rows).
+    std::vector<DeviceBuffer> a8_rows;
     // The MTP assistant when loaded with with_draft.
     std::unique_ptr<Gemma4DraftWeights> draft;
     std::optional<Gemma4VisionWeights> vision;

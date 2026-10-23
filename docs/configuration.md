@@ -16,6 +16,7 @@ Serve flags win over the environment for the switches in `src/core/runtime_optio
 | `NINFER_FLASH_NEXT_PREFILL_GRAPH_MAX_TOKENS` | Largest prefill graph, clamped to 0..512. Default 64. |
 | `NINFER_FLASH_NEXT_PREFILL_GRAPH_CACHE` | How many prefill graphs to keep, at least 1. Default 64. |
 | `NINFER_FLASH_NEXT_PREFILL_GRAPHS` | `0` turns prefill graphs off. |
+| `NINFER_Q4_EXACT` | Present means `q4_g32_fp16` trunk projections never round their codes to E4M3: 128 tokens and more take the exact W4A8 GEMM (one FP32 scale per group), shorter prefills the A16 routes. Lower KL, slower prefill. |
 | `NINFER_DEBUG_PLANNER_TRACE` | Present means trace the planner. |
 | `NINFER_DEBUG_LOGITS_DIR` | Directory for logit dumps. |
 | `NINFER_DEBUG_STATE_DIR` | Directory for state dumps. Setting it also turns prefill graphs off. |

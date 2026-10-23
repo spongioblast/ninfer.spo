@@ -36,19 +36,21 @@ std::vector<Invocation> a4_calls() {
     return calls;
 }
 
-// AllowA8 below 128 tokens keeps A16.
+// AllowA8 up to 32 tokens keeps A16.
 std::vector<Invocation> a8_small_calls() {
     std::vector<Invocation> calls;
-    for (int t : {1, 4, 17, 64, 127})
+    for (int t : {1, 4, 9, 17, 32})
         calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
     return calls;
 }
 
+// From 33 tokens: the short-band tiles below 128, then the 128-token and bulk tiles.
 std::vector<Invocation> a8_calls() {
     std::vector<Invocation> calls;
-    for (int t : {128, 129, 192, 255, 256, 257, 384, 511, 512, 513, 1023, 1024, 1025, 2048})
+    for (int t : {33,  40,  48,  63,  64,  65,  96,  127, 128,  129,  192,  255,
+                  256, 257, 384, 511, 512, 513, 1023, 1024, 1025, 2048})
         calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8});
-    for (int t : {129, 1025})
+    for (int t : {33, 65, 129, 1025})
         calls.push_back({t, CallForm::Policy, ops::LinearPolicy::AllowA8, true});
     return calls;
 }

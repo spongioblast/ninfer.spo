@@ -15,10 +15,19 @@ int main(int argc, char** argv) {
     try {
         ninfer::DeviceContext device;
         const auto loaded = ninfer::models::gemma4::load_text(path, device);
-        if (loaded.layers.empty() || loaded.token_embedding.qdata == nullptr ||
+        if (loaded.layers.empty() || loaded.token_embedding.table.qdata == nullptr ||
             loaded.output_head.qdata == nullptr || loaded.final_norm == nullptr ||
             !loaded.layers.back().global_layer) {
             std::cerr << "FAIL pointers\n";
+            return 1;
+        }
+        // A shared vocabulary table is one device object and the gather applies sqrt(hidden).
+        const bool shared = loaded.token_embedding.table.qdata == loaded.output_head.qdata;
+        const float normalizer = std::sqrt(static_cast<float>(loaded.hidden));
+        if (shared ? std::fabs(loaded.token_embedding.scale - normalizer) > 0.01f * normalizer
+                   : loaded.token_embedding.scale != 1.0f) {
+            std::cerr << "FAIL embedding scale " << loaded.token_embedding.scale << " shared "
+                      << shared << '\n';
             return 1;
         }
         // Sliding qkv carries query, key and value rows; global qkv has no value rows.

@@ -385,6 +385,8 @@ def test_quantized_recipes_pack_qkv_and_gate_up(tmp_path, recipe_name, trunk):
             assert down.format == trunk
         for edge in ("text/token_embedding", "text/output_head"):
             assert artifact.by_id[_objects(artifact, edge)[0][0]].format == "fp8_e4m3fn_row_bf16"
+        # One vocabulary table: the embedding binds the head's object.
+        assert _objects(artifact, "text/token_embedding") == _objects(artifact, "text/output_head")
         norm = artifact.by_id[_objects(artifact, "text/final_norm")[0][0]]
         assert norm.format == "bf16"
 

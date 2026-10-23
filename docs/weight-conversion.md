@@ -58,25 +58,35 @@ The built-in recipes are ordinary Python functions in
 | `qwen3_6_27b_nvfp4` | Imported NVFP4, selected BF16 projections, Q8 vocabulary weights | `quantized` |
 | `qwen3_8_27b_nvfp4` | Imported NVFP4/FP8, FP8 embedding generated from BF16 | `quantized` |
 | `gemma4_31b_bf16` | Gemma 4 31B text, every parameter in its direct format | None |
-| `gemma4_31b_fp8` | FP8 row projections, FP8 embedding, target head, and MTP head | None |
-| `gemma4_31b_nvfp4_base` | NVFP4 4/6 MSE projections, FP8 embedding, target head, and MTP head | None |
+| `gemma4_31b_fp8` | FP8 row projections, one FP8 vocabulary table, FP8 MTP head | None |
+| `gemma4_31b_nvfp4_base` | NVFP4 4/6 MSE projections, one FP8 vocabulary table, FP8 MTP head | None |
 | `gemma4_31b_nvfp4_qat` | As `nvfp4_base`, quantized from Google's QAT BF16 weights | `qat` |
 | `gemma4_31b_nvfp4_nvidia` | As `nvfp4_base`, MLP words imported from NVIDIA ModelOpt NVFP4 | `quantized` |
 | `gemma4_31b_nvfp4_mixed` | As `nvfp4_base`, but layers 0-1 and the last two, and global-layer attention, in FP8 | None |
-| `gemma4_31b_nvfp4_mlp` | NVFP4 MLP, FP8 attention, FP8 embedding, target head, and MTP head | None |
+| `gemma4_31b_nvfp4_mlp` | NVFP4 MLP, FP8 attention, one FP8 vocabulary table, FP8 MTP head | None |
 
 The Gemma 4 recipes pack Q/K/V (Q/K on global layers) and gate/up into one stored matrix each.
+The FP8 and NVFP4 recipes store the vocabulary table once: the token embedding binds the output
+head's unscaled FP8 table, and the gather multiplies each row by the BF16 `sqrt(hidden)`
+normalizer, as Hugging Face does. This saves about 1.4 GB of weights and VRAM. Artifacts converted
+before this change keep a separate, pre-scaled embedding and still load.
 `gemma4_nvfp4_a4` is an override for the NVFP4 Gemma recipes: it permits A4 on every NVFP4 text
 projection and stores the divisor `448*6/amax` for each projection input. It reads
 `--source calibration=FILE`, a Safetensors file with one F32 activation amax per input name, such
 as `text/layers/0/mixer_input`, `attention_output`, `ffn_input` and `mlp/product`.
 `gemma4_nvfp4_a4_mlp` does the same for the NVFP4 MLP projections only and leaves attention at A16.
 `gemma4_fp8_a8` is an override for `gemma4_31b_fp8`: it permits A8 (per-token FP8 activations) on
-every FP8 text-layer projection, so prefills of 128 tokens and more run on the FP8 A8 kernels. The
+every FP8 text-layer projection, so prefills of 33 tokens and more run on the FP8 A8 kernels. The
 embedding and the output head stay A16. Without it the text trunk is A16 only, and a prefill of 512
 tokens or more goes through cuBLAS, about twice the time at 512 and 2048 tokens. An artifact
 that serves images needs it as well: add `--override gemma4_fp8_a8` to the `--components
 text,vision` (or `text,vision,mtp`) conversion.
+`gemma4_31b_q4_qat` reads text and vision values from `--source qat` and stores text projections as
+`q4_g32_fp16` with `q4_g32_qat`, and the embedding and target head as separate `q4_g32_fp16`
+tables the same way. The MTP head stays row-scaled FP8, and the MTP assistant stays on
+`--source mtp`. `gemma4_q4_a8` is the matching override: it permits A8 on those
+q4 projections, so prefills of 9 tokens and more use W4A8 (FP8 activations, q4 codes widened to
+E4M3). Without it they stay on the A16 GEMVs.
 
 These names select conversion choices. Runtime execution is selected from the architecture,
 configuration and actual bindings stored in the artifact. `--name` sets the public model name;
@@ -173,6 +183,7 @@ The converter currently writes these formats:
 |---|---|---|
 | `bf16`, `fp32`, `int32` | `cast_direct` | Direct words through the source reader |
 | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16` | `grouped_absmax` | Supply a custom method/source if needed |
+| `q4_g32_fp16` | `q4_g32_qat` | Recovers the scale already stored in a QAT matrix. `grouped_absmax` is also legal and requantizes |
 | `fp8_e4m3fn_row_bf16` | `fp8_row_maxabs` | `import_encoded` |
 | `nvfp4` | Supply a custom quantizer | `import_encoded` |
 
