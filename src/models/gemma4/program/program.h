@@ -16,20 +16,32 @@ struct DeviceContext;
 
 namespace ninfer::models::gemma4 {
 
+// Retained prompt prefixes: `device_slots` sliding-window snapshots on the device, a pinned host
+// arena of `host_bytes`, and `extra_tokens` of global KV pages that checkpoints may hold beyond
+// the live sequence's. `history` off keeps only the live cache.
+struct CacheBudget {
+    bool history               = true;
+    std::uint32_t device_slots = 0;
+    std::size_t host_bytes     = 0;
+    std::uint32_t extra_tokens = 0;
+};
+
 class Program {
 public:
     // One lane with `capacity` KV positions; prefill runs in chunks of `prefill_chunk` tokens.
     // A nonzero `draft_tokens` (1..15, needs model.draft) drafts that many tokens per decode
-    // round with the MTP assistant for greedy requests without penalties.
+    // round with the MTP assistant.
     Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
-            std::uint32_t draft_tokens, cudaStream_t stream);
+            std::uint32_t draft_tokens, cudaStream_t stream, const CacheBudget& cache = {});
     ~Program();
 
     // KV bytes per position of the global layers; the sliding layers' ring is in fixed_bytes.
     [[nodiscard]] static std::size_t kv_bytes_per_token(const LoadedText& model);
-    // Device bytes the Program needs besides the global layers' KV.
+    // Device bytes the Program needs besides the global layers' KV, with `device_slots`
+    // checkpoint snapshots.
     [[nodiscard]] static std::size_t fixed_bytes(const LoadedText& model,
-                                                 std::uint32_t prefill_chunk);
+                                                 std::uint32_t prefill_chunk,
+                                                 std::uint32_t device_slots = 0);
 
 #include "program/program_methods.inc"
 

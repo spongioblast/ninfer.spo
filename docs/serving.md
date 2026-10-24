@@ -978,6 +978,68 @@ previous requests resumes from the newest prompt that did not contain one, howev
 `--no-prefix-reuse` disables cross-request history reads and writes; pause/replay recovery remains
 available, and the capacity flags may still be specified.
 
+### Gemma 4 for voice chat
+
+Gemma 4 31B (an FP8 A8 artifact with the MTP assistant and the vision tower) serves one request at
+a time. A voice client launches:
+
+```
+ninfer-spo-serve <artifact> --port 8080 --model-id local --max-context 16384 --kv-dtype bf16 \
+    --spec mtp --draft-tokens 4 --vision --no-thinking \
+    --device-state-slots 4 --host-context-mib 8192
+```
+
+`/health` answering `{"status":"ok"}` means ready. Send one `max_tokens: 1` request with the system
+prompt and tools first: it prefills them and leaves a checkpoint at the end of the leading turn.
+
+- MTP drafts 4 tokens per round on the launch line above: on a recorded voice session, where
+  replies are 20 to 100 tokens, that was faster than 6 (87 tok/s against 80), and the time to the
+  first token was the same at every draft count. `--draft-tokens auto` drafts 6, which is faster
+  once replies reach a few hundred tokens. Greedy rounds keep the argmax; sampled rounds
+  (temperature above 0 or a penalty) accept each draft with its target probability and draw the
+  correction from the residual, so output follows the same distribution as plain decode. `top_k`
+  above 20 is rejected (400), so Gemma's suggested 64 cannot be sent; the model default is
+  `temperature` 1.0, `top_k` 20, `top_p` 0.95.
+- `tool_choice` `required` and a named function force the tool-call opener into the prompt.
+  Arguments are not grammar-constrained, and `response_format` and other output constraints are
+  rejected for Gemma.
+- `stop` strings, `developer` messages, tool results, and `image_url` parts work as for Qwen.
+  Response `timings` carry `cache_n`, `prompt_n`, `draft_n`, and `draft_n_accepted`.
+
+**Checkpoints.** A request resumes from the longest of the live cache and the kept checkpoints. A
+checkpoint is taken:
+
+- at the end of a leading `system` or `developer` turn, which holds the instructions and the tools;
+- at each explicit `prompt_cache_breakpoint` on a message or content part (the tool-list form and
+  the server's automatic boundary after the last message are ignored, since the live state
+  already continues the conversation);
+- of the live state, when a request that does not continue it is about to overwrite at least 256 of
+  its tokens (a summary or OCR request between voice turns; not a repeated prompt or a cut reply).
+
+Keep a changing memory block in its own message after the first system message: a change then
+resumes from the system-plus-tools checkpoint. A breakpoint on the memory message keeps that frontier
+as well.
+
+The global layers' KV is a pool of 64-token pages that checkpoints share with the live sequence, so
+a capture copies nothing there. The sliding layers' ring is overwritten by later tokens, so each
+checkpoint snapshots at least the last 1,279 positions (21 pages, about 1.05 GiB for the 31B). That
+snapshot also limits the resume point. A prompt that diverges from a displaced state more than about
+256 tokens before that state's end cannot use it; it resumes from an earlier frontier.
+
+| Budget | Size for the 31B |
+|---|---|
+| `--device-state-slots H` | H snapshots on the device, 1.05 GiB each |
+| spare KV pages | `min(max_context x H, 65,536)` tokens at 80 KiB per token (5 GiB for 16k x 4) |
+| `--host-context-mib` (default 8192) | pinned host memory; a demoted checkpoint takes its snapshot plus 80 KiB per token |
+
+The least recently used checkpoint moves to the host when the slots or the page pool run out, and is
+dropped when the host arena is full too. A checkpoint counts as used whenever a prompt extends it,
+and the one a request restores is never the one dropped to make room. A checkpoint is used instead of the live state only when
+it saves at least 256 prompt tokens (1,024 from the host, whose restore moves the snapshot over
+PCIe). Image positions are keyed by a hash of the image, so an
+image request resumes only before or across the same image, and a fully reused image is not
+encoded again. `--no-prefix-reuse` turns reuse and checkpoints off.
+
 Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
 Serve writes human-readable operational records to stderr using

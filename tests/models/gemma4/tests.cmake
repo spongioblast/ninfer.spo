@@ -34,7 +34,12 @@ ninfer_add_op_test(ninfer_gemma4_engine_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_real.cpp"
   LIBRARIES ninfer_engine)
 
+ninfer_add_op_test(ninfer_gemma4_checkpoints_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_checkpoints_real.cpp"
+  LIBRARIES ninfer_engine)
+
 set_tests_properties(
+  ninfer_gemma4_checkpoints_real_test
   ninfer_gemma4_france_real_test
   ninfer_gemma4_parity_real_test
   ninfer_gemma4_draft_real_test
@@ -58,6 +63,10 @@ target_compile_definitions(ninfer_gemma4_frontend_fixtures_test PRIVATE
 
 ninfer_add_op_test(ninfer_gemma4_tool_parser_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_tool_parser.cpp"
+  LIBRARIES ninfer_model_runtime)
+
+ninfer_add_op_test(ninfer_gemma4_prefix_store_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_store.cpp"
   LIBRARIES ninfer_model_runtime)
 
 ninfer_add_op_test(ninfer_gemma4_top_tokens_test

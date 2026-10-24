@@ -1,10 +1,13 @@
 // Gemma 4 31B through the public Engine: raw-token greedy parity, chat text output, sampling,
 // a prompt longer than one prefill chunk, HF greedy fixtures (NINFER_GEMMA4_PARITY), prefix
-// reuse across turns, causal scoring, and MTP greedy equality (NINFER_GEMMA4_MTP_WEIGHTS). Needs
+// reuse across turns, causal scoring, and MTP greedy equality and sampled-MTP distribution and
+// seed checks (NINFER_GEMMA4_MTP_WEIGHTS). Needs
 // the bf16 artifact (NINFER_GEMMA4_WEIGHTS) and about 75 GB of device memory.
 
 #include "ninfer/engine.h"
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -12,6 +15,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -370,6 +374,103 @@ void mtp_equality(const char* artifact) {
     }
 }
 
+ninfer::RequestOptions sampled(std::uint32_t tokens, std::uint64_t seed) {
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = tokens;
+    request.execution.sampling.temperature    = 1.0F;
+    request.execution.sampling.top_k          = 20;
+    request.execution.sampling.top_p          = 0.95F;
+    request.execution.sampling.seed           = seed;
+    request.execution.allow_prefix_reuse      = false;
+    return request;
+}
+
+// Sampled MTP keeps the target distribution: the first three generated tokens (two of them
+// decided by rounds) have the same histogram with and without MTP, and a seed repeats its
+// tokens. The histogram samples flatter than the voice default, because Gemma opens a reply
+// with the same two tokens 90% of the time at temperature 1.
+void mtp_sampling(const char* artifact) {
+    constexpr std::uint64_t kSeeds = 300;
+    const std::string prompt = "Write the opening sentence of a fantasy novel.";
+    using Opening = std::array<ninfer::TokenId, 3>;
+    std::map<Opening, int> histogram[2];
+    for (const bool speculative : {false, true}) {
+        ninfer::EngineOptions options;
+        options.artifact_path = artifact;
+        options.max_context   = 4096;
+        options.kv_capacity   = ninfer::KvCapacityPolicy::automatic();
+        options.enable_vision = false;
+        if (speculative) {
+            options.speculative.backend      = ninfer::SpeculativeBackend::Mtp;
+            options.speculative.draft_tokens = 5;
+        }
+        ninfer::Engine engine(options);
+        const auto start = std::chrono::steady_clock::now();
+        for (std::uint64_t seed = 0; seed < kSeeds; ++seed) {
+            auto flat                           = sampled(4, seed);
+            flat.execution.sampling.temperature = 1.5F;
+            flat.execution.sampling.top_k       = 20;
+            flat.execution.sampling.top_p       = 1.0F;
+            const auto result = engine.generate(engine.prepare(chat(prompt)), flat);
+            const auto& ids   = result.generated_token_ids;
+            if (ids.size() < 3) { continue; }
+            ++histogram[speculative ? 1 : 0][{ids[0], ids[1], ids[2]}];
+        }
+        std::cout << (speculative ? "mtp" : "plain") << " sampled: " << kSeeds << " runs, "
+                  << since(start) << " s\n";
+        if (!speculative) { continue; }
+        const std::string story = "Tell a short story about a lighthouse keeper.";
+        const auto first        = engine.generate(engine.prepare(chat(story)), sampled(96, 7));
+        const auto again        = engine.generate(engine.prepare(chat(story)), sampled(96, 7));
+        const auto other        = engine.generate(engine.prepare(chat(story)), sampled(96, 8));
+        std::cout << "mtp sampled story: rounds " << first.speculative.rounds << ", drafted "
+                  << first.speculative.drafted_tokens << ", accepted "
+                  << first.speculative.accepted_tokens << ", content \"" << first.content
+                  << "\"\n";
+        check(first.generated_token_ids == again.generated_token_ids,
+              "mtp sampling repeats with the same seed");
+        check(first.generated_token_ids != other.generated_token_ids,
+              "mtp sampling differs with another seed");
+        check(first.speculative.rounds > 0 && first.speculative.accepted_tokens > 0,
+              "mtp drafts are accepted at temperature 1");
+    }
+    std::map<Opening, std::array<int, 2>> joined;
+    for (int side = 0; side < 2; ++side) {
+        for (const auto& [key, count] : histogram[side]) { joined[key][side] = count; }
+    }
+    double distance = 0.0;
+    int plain_total = 0;
+    int mtp_total   = 0;
+    for (const auto& [key, counts] : joined) {
+        plain_total += counts[0];
+        mtp_total += counts[1];
+    }
+    for (const auto& [key, counts] : joined) {
+        distance += std::fabs(static_cast<double>(counts[0]) / std::max(plain_total, 1) -
+                              static_cast<double>(counts[1]) / std::max(mtp_total, 1));
+    }
+    distance /= 2.0;
+    std::cout << "sampled three-token openings: " << joined.size()
+              << " distinct, total variation " << distance << '\n';
+    check(plain_total > 0 && mtp_total > 0 && joined.size() >= 8,
+          "sampled runs produce varied openings");
+    // The most common openings have the same frequency within four standard errors.
+    std::vector<std::pair<int, std::array<int, 2>>> common;
+    for (const auto& [key, counts] : joined) { common.push_back({counts[0] + counts[1], counts}); }
+    std::sort(common.begin(), common.end(),
+              [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (std::size_t index = 0; index < std::min<std::size_t>(3, common.size()); ++index) {
+        const double plain = static_cast<double>(common[index].second[0]) / plain_total;
+        const double mtp   = static_cast<double>(common[index].second[1]) / mtp_total;
+        const double pool  = (plain + mtp) / 2.0;
+        const double error =
+            std::sqrt(std::max(pool * (1.0 - pool), 1.0e-4) * (1.0 / plain_total + 1.0 / mtp_total));
+        std::cout << "opening " << index << ": plain " << plain << ", mtp " << mtp << '\n';
+        check(std::fabs(plain - mtp) <= 4.0 * error,
+              "mtp sampling matches plain frequency of opening " + std::to_string(index));
+    }
+}
+
 bool usable(const char* path) {
     return path != nullptr && path[0] != '\0' && std::ifstream(path).good();
 }
@@ -433,7 +534,10 @@ int main() {
     }
     try {
         if (usable(artifact)) { bf16_checks(artifact); }
-        if (usable(mtp)) { mtp_equality(mtp); }
+        if (usable(mtp)) {
+            mtp_equality(mtp);
+            mtp_sampling(mtp);
+        }
         if (usable(vision)) { vision_checks(vision); }
     } catch (const std::exception& error) {
         std::cerr << "EXC " << error.what() << '\n';

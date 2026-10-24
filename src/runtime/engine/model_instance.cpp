@@ -344,8 +344,15 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
                                           options.kv_capacity.automatic_headroom_bytes != 0
                                        ? options.kv_capacity.automatic_headroom_bytes
                                        : std::size_t{3} << 30U;
+    // Checkpoints: device snapshot slots, a pinned host arena (8 GiB unless set), and spare
+    // global KV pages for the prefixes they keep, up to 64k tokens.
+    const ContextCacheOptions& history = options.context_cache;
+    const std::uint32_t slots = history.enabled ? history.device_state_slots.value_or(0) : 0U;
+    const std::size_t host_bytes =
+        history.enabled ? history.host_capacity_bytes.value_or(std::size_t{8} << 30U) : 0U;
     const std::size_t free_bytes = current_free_device_bytes();
-    const std::size_t fixed = models::gemma4::Program::fixed_bytes(*loaded, options.prefill_chunk);
+    const std::size_t fixed =
+        models::gemma4::Program::fixed_bytes(*loaded, options.prefill_chunk, slots);
     const std::size_t per_token = models::gemma4::Program::kv_bytes_per_token(*loaded);
     const std::size_t fit =
         free_bytes > fixed + kHeadroom ? (free_bytes - fixed - kHeadroom) / per_token : 0;
@@ -361,11 +368,18 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
         throw std::invalid_argument("gemma4 KV capacity does not fit in device memory");
     }
     options.max_context = static_cast<std::uint32_t>(tokens);
-    auto program        = std::make_unique<models::gemma4::Program>(
-        *loaded, options.max_context, options.prefill_chunk, draft_tokens, device.stream);
+    const std::uint64_t spare = fit > tokens ? fit - tokens : 0U;
+    const auto extra_tokens   = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>({tokens * slots, std::uint64_t{65536}, spare}) / 64U * 64U);
+    auto program = std::make_unique<models::gemma4::Program>(
+        *loaded, options.max_context, options.prefill_chunk, draft_tokens, device.stream,
+        models::gemma4::CacheBudget{.history      = history.enabled,
+                                    .device_slots = slots,
+                                    .host_bytes   = host_bytes,
+                                    .extra_tokens = extra_tokens});
     device.synchronize();
     auto instance                         = std::make_unique<Gemma4Instance>(std::move(loaded),
-                                                                             models::gemma4::Frontend(tokenizer, chat),
+                                                                             models::gemma4::Frontend(tokenizer, chat, options.max_context),
                                                                              std::move(program), options.max_context);
     instance->kv_capacity_resolution.mode = options.kv_capacity.mode;
     instance->kv_capacity_resolution.resolved_tokens  = options.max_context;
@@ -379,7 +393,8 @@ ConstructedModel construct_gemma4(EngineOptions& options, DeviceContext& device,
                                                           context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
                                                       .prefill_signature = signature},
         options.context_cost.preset_path);
-    options.context_cache.host_capacity_bytes = 0;
+    options.context_cache.device_state_slots  = slots;
+    options.context_cache.host_capacity_bytes = host_bytes;
     LoadSummary summary;
     summary.architecture = std::string(models::architecture_name(models::Architecture::Gemma4));
     summary.model_name   = reader.directory().metadata.value("name", std::string("gemma4"));

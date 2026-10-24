@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace ninfer::models::gemma4 {
@@ -38,11 +39,23 @@ private:
         : tokens_(std::move(tokens)), summary_(summary), stats_(stats), images_(std::move(images)),
           image_scatter_(std::move(image_scatter)) {}
 
+    // A declared tool's name ("" for none) and the tokens of "call:<name>", which follow
+    // `<|tool_call>` when a tool choice forces the call.
+    struct ToolOpener {
+        std::string name;
+        std::vector<TokenId> tokens;
+    };
+
     std::vector<TokenId> tokens_;
     PromptSummary summary_;
     PromptPreparationStats stats_;
     std::vector<Gemma4PreparedImage> images_;
     std::vector<std::int32_t> image_scatter_;
+    std::vector<ToolOpener> tool_openers_;
+    std::optional<std::string> forced_call_;
+    // Ascending prompt positions worth a checkpoint: the end of the leading instruction turn
+    // and the prompt_cache_breakpoint markers.
+    std::vector<std::uint32_t> cache_frontiers_;
 
     friend class Frontend;
     friend class Program;

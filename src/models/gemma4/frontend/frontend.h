@@ -3,6 +3,7 @@
 #include "models/gemma4/frontend/output_session.h"
 #include "models/gemma4/frontend/prompt.h"
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -12,7 +13,8 @@ namespace ninfer::models::gemma4 {
 
 class Frontend {
 public:
-    Frontend(std::string tokenizer_json, std::string chat_template);
+    // Prompts longer than max_context tokens (after image expansion) are rejected.
+    Frontend(std::string tokenizer_json, std::string chat_template, std::uint32_t max_context);
     Frontend(Frontend&&) noexcept;
     Frontend& operator=(Frontend&&) noexcept;
     ~Frontend();
@@ -35,6 +37,9 @@ public:
                                                     const ThinkingControlOptions& thinking,
                                                     const std::optional<OutputConstraint>& constraint,
                                                     const ToolChoice& tool_choice) const;
+    // A required tool choice ends the prompt with `<|tool_call>call:` plus the name when it
+    // allows one tool; the output session then starts inside that call.
+    static void apply_tool_choice(PreparedPrompt& prompt, const ToolChoice& tool_choice);
 
 private:
     struct Impl;

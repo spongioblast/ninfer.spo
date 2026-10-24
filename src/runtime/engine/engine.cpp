@@ -414,6 +414,10 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else if (resolved_options.execution.capture || steering.strength != 0) {
                 throw std::invalid_argument("capture and steering require Qwen3.8 Flash-Next");
             }
+            if constexpr (std::is_same_v<Prompt, models::gemma4::PreparedPrompt>) {
+                models::gemma4::Frontend::apply_tool_choice(value, resolved_options.tool_choice);
+                prompt.impl_->summary = value.summary();
+            }
         },
         prompt.impl_->value);
     resolved_options.execution.steering = steering;

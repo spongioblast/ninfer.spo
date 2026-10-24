@@ -7,13 +7,17 @@
 
 #include "models/gemma4/frontend/frontend.h"
 #include "models/gemma4/frontend/tokenizer.h"
+#include "ninfer/types/error.h"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -70,6 +74,146 @@ ninfer::PromptInput prompt_of(const Json& item) {
     return input;
 }
 
+struct Run {
+    std::string content;
+    ninfer::FinishReason finish = ninfer::FinishReason::None;
+    std::uint32_t accepted      = 0;
+};
+
+// Feeds `tokens` in previews of `step` tokens and collects the published content.
+Run feed(ninfer::models::gemma4::OutputSession& session, const std::vector<ninfer::TokenId>& tokens,
+         std::size_t step) {
+    Run run;
+    for (std::size_t at = 0; at < tokens.size() && run.finish == ninfer::FinishReason::None;
+         at += step) {
+        const std::size_t count = std::min(step, tokens.size() - at);
+        const auto decision     = session.preview_model(
+            std::span<const ninfer::TokenId>(tokens).subspan(at, count), 1000,
+            ninfer::FinishReason::OutputLimit);
+        run.finish = decision.finish_reason;
+        run.accepted += decision.accepted_tokens;
+        for (const auto& delta : session.commit_preview()) {
+            if (delta.channel == ninfer::OutputChannel::Content) { run.content += delta.text; }
+        }
+    }
+    if (run.finish == ninfer::FinishReason::None) {
+        (void)session.preview_terminal(ninfer::FinishReason::OutputLimit);
+        for (const auto& delta : session.commit_preview()) {
+            if (delta.channel == ninfer::OutputChannel::Content) { run.content += delta.text; }
+        }
+    }
+    return run;
+}
+
+int output_checks(const ninfer::models::gemma4::Frontend& frontend) {
+    using ninfer::models::gemma4::Frontend;
+    int failures    = 0;
+    const auto fail = [&](bool ok, const std::string& label) {
+        if (!ok) {
+            std::cerr << "FAIL " << label << '\n';
+            ++failures;
+        }
+    };
+    const auto tools_input = [] {
+        ninfer::PromptInput input;
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = "What time is it?",
+                              .media = {}});
+        input.messages.push_back(std::move(user));
+        input.options.enable_thinking = false;
+        for (const char* name : {"get_weather", "get_time"}) {
+            input.options.tool_jsons.push_back(
+                Json{{"type", "function"},
+                     {"function",
+                      {{"name", name},
+                       {"parameters", {{"type", "object"}, {"properties", Json::object()}}}}}}
+                    .dump());
+        }
+        return input;
+    };
+    const auto ids = [&](std::string_view text) { return frontend.tokenize_text(text); };
+    const auto with = [](std::vector<ninfer::TokenId> tokens,
+                         std::initializer_list<ninfer::TokenId> tail) {
+        tokens.insert(tokens.end(), tail);
+        return tokens;
+    };
+    constexpr ninfer::TokenId kOpen = 48, kClose = 49, kTurnEnd = 106;
+
+    {
+        auto prompt          = frontend.prepare(tools_input(), {});
+        const auto plain     = prompt.tokens();
+        ninfer::ToolChoice choice;
+        choice.mode          = ninfer::ToolChoiceMode::Required;
+        choice.allowed_names = std::vector<std::string>{"get_time"};
+        Frontend::apply_tool_choice(prompt, choice);
+        auto expect = plain;
+        expect.push_back(kOpen);
+        for (const auto id : ids("call:get_time")) { expect.push_back(id); }
+        fail(prompt.tokens() == expect && prompt.summary().prompt_tokens == expect.size(),
+             "named tool choice appends <|tool_call>call:get_time");
+        auto session = frontend.make_output_session(prompt, {}, {}, {}, std::nullopt, choice);
+        const Run run =
+            feed(session, with(ids("{zone:<|\"|>Berlin<|\"|>}"), {kClose, kTurnEnd}), 3);
+        const auto calls = session.take_tool_calls();
+        fail(run.finish == ninfer::FinishReason::StopToken && run.content.empty() &&
+                 calls.size() == 1 && calls[0].name == "get_time" &&
+                 calls[0].arguments_json == "{\"zone\":\"Berlin\"}",
+             "named tool choice parses the forced call");
+    }
+    {
+        auto prompt = frontend.prepare(tools_input(), {});
+        ninfer::ToolChoice choice;
+        choice.mode = ninfer::ToolChoiceMode::Required;
+        Frontend::apply_tool_choice(prompt, choice);
+        auto session = frontend.make_output_session(prompt, {}, {}, {}, std::nullopt, choice);
+        (void)feed(session, with(ids("get_weather{city:<|\"|>Paris<|\"|>}"), {kClose, kTurnEnd}),
+                   1);
+        const auto calls = session.take_tool_calls();
+        fail(calls.size() == 1 && calls[0].name == "get_weather" &&
+                 calls[0].arguments_json == "{\"city\":\"Paris\"}",
+             "required tool choice opens the call without a name");
+    }
+    {
+        auto prompt = frontend.prepare(tools_input(), {});
+        ninfer::ToolChoice choice;
+        choice.mode          = ninfer::ToolChoiceMode::Required;
+        choice.allowed_names = std::vector<std::string>{"get_weather", "get_time"};
+        Frontend::apply_tool_choice(prompt, choice);
+        auto session = frontend.make_output_session(prompt, {}, {}, {}, std::nullopt, choice);
+        (void)feed(session, with(ids("send_mail{to:1}"), {kClose, kTurnEnd}), 4);
+        fail(session.take_tool_calls().empty() &&
+                 session.tool_call_parse_diagnostics().fallback_reason ==
+                     ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+             "a call outside allowed_names is rejected");
+        ninfer::ToolChoice missing;
+        missing.mode          = ninfer::ToolChoiceMode::Required;
+        missing.allowed_names = std::vector<std::string>{"send_mail"};
+        auto other            = frontend.prepare(tools_input(), {});
+        bool threw            = false;
+        try {
+            Frontend::apply_tool_choice(other, missing);
+        } catch (const std::invalid_argument&) { threw = true; }
+        fail(threw, "a named tool choice outside the declared tools throws");
+    }
+    for (const std::size_t step : {std::size_t{1}, std::size_t{8}}) {
+        auto prompt = frontend.prepare(tools_input(), {});
+        ninfer::StopPolicy stop;
+        stop.strings.push_back({.text = "lo wor", .channel = ninfer::OutputChannel::Content,
+                                .include_in_output = false});
+        auto session = frontend.make_output_session(prompt, stop, {}, {}, std::nullopt, {});
+        const auto tokens = ids("Hello world, again");
+        const Run run     = feed(session, tokens, step);
+        fail(tokens.size() >= 3 && run.finish == ninfer::FinishReason::StopString &&
+                 run.content == "Hel" && run.accepted == 2 &&
+                 session.matched_stop_string() == std::optional<std::string>("lo wor"),
+             "a stop string split across tokens cuts the content (step " +
+                 std::to_string(step) + ", got \"" + run.content + "\")");
+    }
+    std::cout << "output session: " << (failures ? "FAIL" : "ok") << '\n';
+    return failures;
+}
+
 std::string first_difference(const std::string& got, const std::string& want) {
     std::size_t at = 0;
     while (at < got.size() && at < want.size() && got[at] == want[at]) { ++at; }
@@ -92,8 +236,8 @@ int main() {
     try {
         const std::string tokenizer_json = read_file(model / "tokenizer.json");
         const ninfer::models::gemma4::Tokenizer tokenizer(tokenizer_json);
-        const ninfer::models::gemma4::Frontend frontend(tokenizer_json,
-                                                        read_file(model / "chat_template.jinja"));
+        const ninfer::models::gemma4::Frontend frontend(
+            tokenizer_json, read_file(model / "chat_template.jinja"), 262144);
 
         int token_failures = 0;
         const Json strings = Json::parse(read_file(std::filesystem::path(fixtures) / "tok_fixtures.json"));
@@ -143,7 +287,28 @@ int main() {
         }
         std::cout << "chat template: " << chats.size() - chat_failures << '/' << chats.size()
                   << " conversations match\n";
-        const bool ok = token_failures == 0 && chat_failures == 0;
+        const int output_failures = output_checks(frontend);
+
+        // A prompt past max_context is a request error, which serve answers with HTTP 400.
+        const ninfer::models::gemma4::Frontend tight(
+            tokenizer_json, read_file(model / "chat_template.jinja"), 16);
+        ninfer::PromptInput long_input;
+        ninfer::ChatMessage long_user;
+        long_user.role = ninfer::ChatRole::User;
+        std::string words;
+        for (int index = 0; index < 40; ++index) { words += "word "; }
+        long_user.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = words, .media = {}});
+        long_input.messages.push_back(std::move(long_user));
+        bool length_ok = false;
+        try {
+            (void)tight.prepare(std::move(long_input), {});
+        } catch (const ninfer::RequestError& error) {
+            length_ok = error.kind() == ninfer::RequestErrorKind::ContextLengthExceeded;
+        }
+        std::cout << "context length: " << (length_ok ? "rejected" : "FAIL not rejected") << '\n';
+
+        const bool ok =
+            token_failures == 0 && chat_failures == 0 && output_failures == 0 && length_ok;
         std::cout << (ok ? "OK" : "FAIL") << " gemma4 frontend fixtures\n";
         return ok ? 0 : 1;
     } catch (const std::exception& error) {

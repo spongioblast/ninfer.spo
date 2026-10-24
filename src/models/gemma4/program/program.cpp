@@ -7,6 +7,7 @@
 #include "models/gemma4/execution/text_forward.h"
 #include "models/gemma4/execution/vision.h"
 #include "models/gemma4/program/prefill_graphs.h"
+#include "models/gemma4/program/prefix_cache.h"
 #include "models/gemma4/program/sliding_ring.h"
 #include "models/gemma4/program/top_tokens.h"
 #include "ninfer/ops/argmax.h"
@@ -14,6 +15,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/scatter.h"
+#include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/target_logprobs.h"
 
 #include <cuda_runtime.h>
@@ -51,12 +53,22 @@ constexpr std::uint32_t kMaxChunk = 16384;
 // A round verifies the anchor and its drafts in one forward of at most kMinChunk tokens.
 constexpr std::uint32_t kMaxDraftTokens = kMinChunk - 1;
 // Round slots: the drafter's position, the anchor then the drafts (the verify ids), the verify
-// positions, and the verify argmax.
+// positions, and the verify argmax. A sampled round also has the licensed tokens and the
+// speculative accept scalars: committed length before the round (columns draw at length + 1 +
+// i), anchor out, draft count, licensed count, accepted drafts, and the logical position a
+// draftless round samples.
 constexpr std::size_t kRoundPosition = 0;
 constexpr std::size_t kRoundIds      = 1;
 constexpr std::size_t kRoundVerify   = kRoundIds + kMinChunk;
 constexpr std::size_t kRoundOut      = kRoundVerify + kMinChunk;
-constexpr std::size_t kRoundSlots    = kRoundOut + kMinChunk;
+constexpr std::size_t kRoundLicensed = kRoundOut + kMinChunk;
+constexpr std::size_t kRoundLength   = kRoundLicensed + kMinChunk;
+constexpr std::size_t kRoundAnchor   = kRoundLength + 1;
+constexpr std::size_t kRoundExtent   = kRoundAnchor + 1;
+constexpr std::size_t kRoundCount    = kRoundExtent + 1;
+constexpr std::size_t kRoundAccepted = kRoundCount + 1;
+constexpr std::size_t kRoundLogical  = kRoundAccepted + 1;
+constexpr std::size_t kRoundSlots    = kRoundLogical + 1;
 
 // Workspace bytes of the widest layer for a `chunk`-token prefill.
 std::size_t layer_bytes(const LoadedText& model, std::uint32_t chunk) {
@@ -111,22 +123,21 @@ struct Program::Impl {
     std::vector<DeviceBuffer> v_store;
     std::vector<Tensor> k_pages;
     std::vector<Tensor> v_pages;
+    // Global layers: `pool_pages` pages behind the live page table `block` (see PrefixCache).
+    // Sliding layers: `ring_pages` physical pages behind `ring_block`.
     Tensor block;
-    // Sliding layers: `ring_pages` physical pages behind `ring_block`. ring_high is the highest
-    // position written since the cache last restarted at 0; a slot may hold it instead of the
-    // position ring_pages * 64 below.
+    int pool_pages = 0;
     int window     = 0;
     int ring_pages = 0;
     Tensor ring_block;
-    std::int64_t ring_high = -1;
     std::vector<Gemma4CacheLayer> caches;
+    std::unique_ptr<PrefixCache> cache;
 
     bool binding = false;
     std::shared_ptr<detail::RequestPlan> plan;
     runtime::BeginSummary begin;
-    std::uint32_t bind_reused = 0;
-    // Tokens whose K/V sit at positions [0, size) of the cache; kept across requests for reuse.
-    std::vector<TokenId> resident;
+    PrefixCache::Source bind_source;
+    std::size_t next_frontier = 0;
     std::vector<std::uint16_t> top_logits;
 
     bool occupied         = false;
@@ -148,9 +159,13 @@ struct Program::Impl {
     // MTP. A round drafts up to draft_tokens tokens from carry_buf (the target's final-normed
     // hidden state at fed - 1), verifies the anchor next_id and the drafts in one forward at
     // positions [fed, fed + drafts], and offers the argmax of every column up to the first
-    // mismatch. Rejected K/V past the committed length is overwritten by the next round.
+    // mismatch. A sampled round (temperature or a penalty) instead accepts each draft with its
+    // target probability and samples the correction from the residual
+    // (ops::speculative_accept_greedy_drafts). Rejected K/V past the committed length is
+    // overwritten by the next round.
     std::uint32_t draft_tokens = 0;
     bool speculating           = false;
+    bool sampled_rounds        = false;
     bool round_pending         = false;
     std::uint32_t round_drafts = 0;
     std::uint32_t round_agreed = 0;
@@ -161,6 +176,8 @@ struct Program::Impl {
     PinnedHostBuffer round_host{kRoundSlots * sizeof(std::int32_t)};
     DecodeGraphDefinition round_definition;
     DecodeGraphExecutable round_graph;
+    DecodeGraphDefinition sampled_round_definition;
+    DecodeGraphExecutable sampled_round_graph;
     std::vector<TokenId> round_ids;
     SpeculativeStats spec_stats;
 
@@ -169,8 +186,17 @@ struct Program::Impl {
         const std::size_t logits = static_cast<std::size_t>(loaded.vocab) * kScoreTile * 2U +
                                    gemma4_logits_workspace_bytes(loaded.output_head, kScoreTile);
         const std::size_t sampling = ops::sampling_workspace_capacity_bytes(loaded.vocab, 1, 1);
-        const std::size_t draft =
-            loaded.draft != nullptr ? gemma4_draft_workspace_bytes(*loaded.draft) : 0;
+        std::size_t draft = 0;
+        if (loaded.draft != nullptr) {
+            const auto columns = static_cast<std::size_t>(kMinChunk);
+            const std::size_t round_logits =
+                static_cast<std::size_t>(loaded.vocab) * columns * 2U +
+                gemma4_logits_workspace_bytes(loaded.output_head, static_cast<int>(columns)) +
+                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                    loaded.vocab, 1, static_cast<std::int32_t>(kMaxDraftTokens), 1, 1);
+            draft = std::max(gemma4_draft_workspace_bytes(*loaded.draft),
+                             layer_bytes(loaded, kMinChunk) + round_logits);
+        }
         std::size_t vision = 0;
         if (loaded.vision) {
             const int pooled  = loaded.vision->default_output_length;
@@ -182,7 +208,7 @@ struct Program::Impl {
     }
 
     Impl(LoadedText& loaded, std::uint32_t token_capacity, std::uint32_t prefill_chunk,
-         std::uint32_t drafts, cudaStream_t device_stream)
+         std::uint32_t drafts, cudaStream_t device_stream, const CacheBudget& budget)
         : model(&loaded), stream(device_stream), gemm(device_stream), vocab(loaded.vocab),
           hidden(loaded.hidden), capacity(token_capacity),
           chunk(std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk)),
@@ -206,9 +232,9 @@ struct Program::Impl {
         step_buf   = DeviceBuffer(3 * sizeof(std::int32_t));
         window     = sliding_window(loaded);
         ring_pages = window > 0 ? std::min(pages, sliding_ring_pages(chunk, window)) : pages;
-        const std::vector<std::int32_t> table = ring_block_table(pages, pages);
-        table_buf                             = DeviceBuffer(table.size() * 4);
-        table_buf.copy_from_host(table.data(), table_buf.bytes);
+        pool_pages = pages + static_cast<int>(budget.extra_tokens / 64U);
+        table_buf  = DeviceBuffer(static_cast<std::size_t>(pages) * 4);
+        table_buf.fill(0);
         block                                = Tensor(table_buf.p, DType::I32, {pages});
         const std::vector<std::int32_t> ring = ring_block_table(pages, ring_pages);
         ring_table_buf                       = DeviceBuffer(ring.size() * 4);
@@ -220,7 +246,7 @@ struct Program::Impl {
         v_pages.reserve(loaded.layers.size());
         caches.reserve(loaded.layers.size());
         for (const Gemma4LayerWeights& layer : loaded.layers) {
-            const int layer_pages   = layer.global_layer ? pages : ring_pages;
+            const int layer_pages   = layer.global_layer ? pool_pages : ring_pages;
             const std::size_t bytes = layer_kv_bytes(layer, layer_pages) / 2U;
             k_store.emplace_back(bytes);
             v_store.emplace_back(bytes);
@@ -231,10 +257,26 @@ struct Program::Impl {
             k_pages.emplace_back(k_store.back().p, DType::BF16, shape);
             v_pages.emplace_back(v_store.back().p, DType::BF16, shape);
         }
+        PrefixCache::Config setup{.table_pages = pages,
+                                  .table       = static_cast<std::int32_t*>(table_buf.p),
+                                  .history     = budget.history};
         for (std::size_t index = 0; index < loaded.layers.size(); ++index) {
-            const Tensor* table_of = loaded.layers[index].global_layer ? &block : &ring_block;
+            const bool global      = loaded.layers[index].global_layer;
+            const Tensor* table_of = global ? &block : &ring_block;
             caches.push_back({&k_pages[index], &v_pages[index], table_of});
+            const std::size_t page_bytes = layer_kv_bytes(loaded.layers[index], 1) / 2U;
+            for (const DeviceBuffer* store : {&k_store[index], &v_store[index]}) {
+                (global ? setup.store.global : setup.store.ring)
+                    .push_back({static_cast<std::uint8_t*>(store->p), page_bytes});
+            }
         }
+        setup.store.pool_pages   = pool_pages;
+        setup.store.ring_pages   = ring_pages;
+        setup.store.window       = window;
+        setup.store.device_slots = budget.history ? budget.device_slots : 0U;
+        setup.store.host_bytes   = budget.history ? budget.host_bytes : 0U;
+        setup.store.stream       = stream;
+        cache                    = std::make_unique<PrefixCache>(std::move(setup));
     }
 
     [[nodiscard]] bool owns(SequenceHandle sequence) const {
@@ -321,11 +363,15 @@ struct Program::Impl {
 
     // Runs `count` tokens at positions [first, first + count) through every layer. The hidden
     // states land in hidden_buf columns [0, count). Earlier positions must already be in the KV.
-    void run_layers(const TokenId* ids, std::uint32_t first, std::uint32_t count) {
-        if (count == 0 || count > chunk || first + count > capacity || first > resident.size()) {
+    // `keys` identify the positions for reuse; null takes the token ids.
+    void run_layers(const TokenId* ids, const PositionKey* keys, std::uint32_t first,
+                    std::uint32_t count) {
+        if (count == 0 || count > chunk || first + count > capacity ||
+            first > cache->resident().size()) {
             throw std::logic_error("gemma4 forward is outside the chunk or KV capacity");
         }
-        resident.resize(first);
+        cache->truncate(first);
+        cache->prepare_write(first, count);
         std::vector<std::int32_t> positions(count);
         for (std::uint32_t index = 0; index < count; ++index) {
             positions[index] = static_cast<std::int32_t>(first + index);
@@ -380,31 +426,18 @@ struct Program::Impl {
                           position_tensor, gemm, workspace, stream, visual_embeddings,
                           visual_indices);
         }
-        resident.insert(resident.end(), ids, ids + count);
-        note_written(first, count);
+        if (keys != nullptr) {
+            cache->wrote(first, {keys, count});
+        } else {
+            cache->wrote_tokens(first, {ids, count});
+        }
     }
 
-    void note_written(std::uint32_t first, std::uint32_t count) {
-        const std::int64_t last = static_cast<std::int64_t>(first) + count - 1;
-        ring_high               = first == 0 ? last : std::max(ring_high, last);
-    }
-
-    // Prompt tokens whose K/V can be kept from the resident cache. At least the last prompt
-    // token is always recomputed, because its logits pick the first output token.
-    [[nodiscard]] std::uint32_t reusable_tokens(const detail::RequestPlan& request) const {
-        if (!request.images.empty() || !request.allow_prefix_reuse || request.tokens.size() < 2) {
-            return 0;
-        }
-        const std::size_t limit = std::min(resident.size(), request.tokens.size() - 1);
-        std::size_t length      = 0;
-        while (length < limit && resident[length] == request.tokens[length]) { ++length; }
-        // The sliding window before the reuse point must still be in the ring.
-        const std::int64_t oldest =
-            std::max<std::int64_t>(0, static_cast<std::int64_t>(length) - (window - 1));
-        if (length > 0 && oldest + std::int64_t{ring_pages} * kKvPageTokens <= ring_high) {
-            return 0;
-        }
-        return static_cast<std::uint32_t>(length);
+    // Where the request resumes: at least the last prompt token is always recomputed, because
+    // its logits pick the first output token.
+    [[nodiscard]] PrefixCache::Source source_for(const detail::RequestPlan& request) const {
+        if (!request.allow_prefix_reuse || occupied || binding) { return {}; }
+        return cache->best(request.keys);
     }
 
     [[nodiscard]] Tensor hidden_columns(std::int32_t start, std::int32_t count) const {
@@ -472,10 +505,11 @@ struct Program::Impl {
 
     // Feeds `id` at position `fed` and returns the token sampled for position fed + 1.
     [[nodiscard]] TokenId decode_step(TokenId id) {
-        if (fed >= capacity || fed > resident.size()) {
+        if (fed >= capacity || fed > cache->resident().size()) {
             throw std::logic_error("gemma4 decode is outside the KV capacity");
         }
-        resident.resize(fed);
+        cache->truncate(fed);
+        cache->prepare_write(fed, 1);
         auto* host = static_cast<std::int32_t*>(step_host.data());
         host[0]    = id;
         host[1]    = static_cast<std::int32_t>(fed);
@@ -488,8 +522,7 @@ struct Program::Impl {
         }
         decode_graph.launch(stream);
         check(cudaStreamSynchronize(stream), "decode sync");
-        resident.push_back(id);
-        note_written(fed, 1);
+        cache->wrote_tokens(fed, {&id, 1});
         return host[3];
     }
 
@@ -535,9 +568,10 @@ struct Program::Impl {
     }
 
     // Drafts `drafts` tokens from carry_buf, then verifies the anchor and the drafts in one
-    // forward and writes the argmax of every column. Reads and writes only round_buf, carry_buf,
-    // hidden_buf, the caches and the workspace, so it can be captured once and replayed.
-    void round_body(std::uint32_t drafts) {
+    // forward and writes the argmax of every column; a sampled round also writes the licensed
+    // tokens. Reads and writes only round_buf, carry_buf, hidden_buf, config_buf, counts_buf,
+    // the caches and the workspace, so it can be captured once and replayed.
+    void round_body(std::uint32_t drafts, bool sampled) {
         workspace.reset();
         auto* slots = static_cast<std::int32_t*>(round_buf.p);
         const Tensor position(slots + kRoundPosition, DType::I32, {1});
@@ -559,6 +593,28 @@ struct Program::Impl {
         gemma4_logits(columns, logits, model->final_norm, model->output_head, model->softcap,
                       model->rms_eps, gemm, workspace, stream);
         ops::argmax(logits, out, vocab, stream);
+        if (!sampled) { return; }
+        const auto* config = static_cast<const ops::SamplingConfig*>(config_buf.p);
+        if (drafts == 0) {
+            Tensor licensed(slots + kRoundLicensed, DType::I32, {1});
+            const Tensor logical(slots + kRoundLogical, DType::I32, {1});
+            ops::sample(logits, licensed, vocab, config, logical, ops::kSamplePurposeDecode,
+                        workspace, stream);
+            return;
+        }
+        const auto k = static_cast<std::int32_t>(drafts);
+        const Tensor verify_logits(logits.data, DType::BF16, {vocab, width, 1});
+        const Tensor targets(slots + kRoundOut, DType::I32, {width, 1});
+        const Tensor draft_ids(slots + kRoundIds + 1, DType::I32, {k, 1});
+        const Tensor extents(slots + kRoundExtent, DType::I32, {1});
+        Tensor lengths(slots + kRoundLength, DType::I32, {1});
+        Tensor anchors(slots + kRoundAnchor, DType::I32, {1});
+        Tensor licensed(slots + kRoundLicensed, DType::I32, {width, 1});
+        Tensor counts(slots + kRoundCount, DType::I32, {1});
+        Tensor accepted(slots + kRoundAccepted, DType::I32, {1});
+        ops::speculative_accept_greedy_drafts(targets, verify_logits, draft_ids, extents, lengths,
+                                              anchors, licensed, counts, accepted, vocab, config,
+                                              workspace, stream);
     }
 
     PendingBatch speculative_round(std::uint32_t remaining,
@@ -567,38 +623,54 @@ struct Program::Impl {
         const std::uint32_t drafts =
             std::min({draft_tokens, remaining > 0 ? remaining - 1U : 0U, room - 1U});
         const std::uint32_t width = drafts + 1U;
-        if (fed == 0 || fed > resident.size()) {
+        if (fed == 0 || fed > cache->resident().size()) {
             throw std::logic_error("gemma4 round is outside the resident cache");
         }
+        cache->truncate(fed);
+        cache->prepare_write(fed, width);
         auto* host                  = static_cast<std::int32_t*>(round_host.data());
         host[kRoundPosition]        = static_cast<std::int32_t>(fed) - 1;
         host[kRoundIds]             = next_id;
         for (std::uint32_t index = 0; index < width; ++index) {
             host[kRoundVerify + index] = static_cast<std::int32_t>(fed + index);
         }
-        check(cudaMemcpyAsync(round_buf.p, host, kRoundOut * sizeof(std::int32_t),
+        host[kRoundLength]  = static_cast<std::int32_t>(fed);
+        host[kRoundExtent]  = static_cast<std::int32_t>(drafts);
+        host[kRoundLogical] = static_cast<std::int32_t>(fed + 1U);
+        check(cudaMemcpyAsync(round_buf.p, host, kRoundSlots * sizeof(std::int32_t),
                               cudaMemcpyHostToDevice, stream),
               "round upload");
+        const bool sampled = sampled_rounds;
         if (drafts == draft_tokens) {
-            if (!round_graph.ready()) {
-                round_definition.capture(stream, [this, drafts] { round_body(drafts); });
-                round_graph.instantiate(round_definition);
+            DecodeGraphDefinition& definition =
+                sampled ? sampled_round_definition : round_definition;
+            DecodeGraphExecutable& graph = sampled ? sampled_round_graph : round_graph;
+            if (!graph.ready()) {
+                definition.capture(stream,
+                                   [this, drafts, sampled] { round_body(drafts, sampled); });
+                graph.instantiate(definition);
             }
-            round_graph.launch(stream);
+            graph.launch(stream);
         } else {
-            round_body(drafts);
+            round_body(drafts, sampled);
         }
         check(cudaMemcpyAsync(host, round_buf.p, kRoundSlots * sizeof(std::int32_t),
                               cudaMemcpyDeviceToHost, stream),
               "round copy");
         check(cudaStreamSynchronize(stream), "round sync");
         round_ids.assign(host + kRoundIds, host + kRoundIds + width);
-        pending_tokens.assign(host + kRoundOut, host + kRoundOut + width);
-        resident.resize(fed);
-        resident.insert(resident.end(), round_ids.begin(), round_ids.end());
-        note_written(fed, width);
+        cache->wrote_tokens(fed, round_ids);
         std::uint32_t agreed = 0;
-        while (agreed < drafts && round_ids[agreed + 1U] == pending_tokens[agreed]) { ++agreed; }
+        if (sampled) {
+            pending_tokens.assign(host + kRoundLicensed, host + kRoundLicensed + width);
+            agreed = drafts == 0 ? 0U : static_cast<std::uint32_t>(host[kRoundAccepted]);
+            if (agreed > drafts) { throw std::logic_error("gemma4 round accepted past its drafts"); }
+        } else {
+            pending_tokens.assign(host + kRoundOut, host + kRoundOut + width);
+            while (agreed < drafts && round_ids[agreed + 1U] == pending_tokens[agreed]) {
+                ++agreed;
+            }
+        }
         round_drafts   = drafts;
         round_agreed   = agreed;
         round_pending  = true;
@@ -625,7 +697,7 @@ struct Program::Impl {
         for (std::uint32_t index = 0; index < drafted; ++index) {
             ++spec_stats.accepted_per_position[index];
         }
-        resident.resize(fed + accepted);
+        cache->truncate(fed + accepted);
         if (accepted == 0) { return; }
         fed += accepted;
         next_id  = pending_tokens[accepted - 1U];
@@ -645,8 +717,8 @@ struct Program::Impl {
 };
 
 Program::Program(LoadedText& model, std::uint32_t capacity, std::uint32_t prefill_chunk,
-                 std::uint32_t draft_tokens, cudaStream_t stream)
-    : impl_(std::make_unique<Impl>(model, capacity, prefill_chunk, draft_tokens, stream)) {}
+                 std::uint32_t draft_tokens, cudaStream_t stream, const CacheBudget& cache)
+    : impl_(std::make_unique<Impl>(model, capacity, prefill_chunk, draft_tokens, stream, cache)) {}
 
 Program::~Program() = default;
 
@@ -660,15 +732,20 @@ std::size_t Program::kv_bytes_per_token(const LoadedText& model) {
     return bytes;
 }
 
-std::size_t Program::fixed_bytes(const LoadedText& model, std::uint32_t prefill_chunk) {
+std::size_t Program::fixed_bytes(const LoadedText& model, std::uint32_t prefill_chunk,
+                                 std::uint32_t device_slots) {
     const std::uint32_t chunk = std::clamp<std::uint32_t>(prefill_chunk, kMinChunk, kMaxChunk);
     const int window          = sliding_window(model);
+    const int ring_pages      = sliding_ring_pages(chunk, window);
     std::size_t rings         = 0;
+    std::vector<std::size_t> ring_page_bytes;
     for (const Gemma4LayerWeights& layer : model.layers) {
         if (!layer.global_layer) {
-            rings += layer_kv_bytes(layer, sliding_ring_pages(chunk, window));
+            rings += layer_kv_bytes(layer, ring_pages);
+            ring_page_bytes.insert(ring_page_bytes.end(), 2, layer_kv_bytes(layer, 1) / 2U);
         }
     }
+    rings += device_slots * PrefixStore::snapshot_bytes(ring_page_bytes, ring_pages, window);
     return Impl::workspace_bytes(model, chunk) + rings +
            static_cast<std::size_t>(model.hidden) * chunk * 2U +
            static_cast<std::size_t>(model.vocab) * 4U;
@@ -684,8 +761,12 @@ RequestBasePlan Program::plan_request(PreparedPrompt&& prompt,
     plan->tokens                          = prompt.tokens();
     plan->images                          = std::move(prompt.images_);
     plan->image_scatter                   = std::move(prompt.image_scatter_);
+    plan->keys                            = prompt_keys(plan->tokens, plan->images, plan->image_scatter);
+    for (const std::uint32_t frontier : prompt.cache_frontiers_) {
+        if (frontier >= kMinCheckpointTokens) { plan->frontiers.push_back(frontier); }
+    }
     plan->sampling                        = options.sampling;
-    plan->allow_prefix_reuse              = options.allow_prefix_reuse && plan->images.empty();
+    plan->allow_prefix_reuse              = options.allow_prefix_reuse;
     plan->summary.prompt_tokens           = static_cast<std::uint32_t>(plan->tokens.size());
     plan->summary.requested_output_tokens = options.requested_output_tokens;
     plan->summary.effective_output_tokens = options.requested_output_tokens;
@@ -717,7 +798,7 @@ std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t 
     output.reserve(count - first_target);
     for (std::uint32_t cursor = 0; cursor < predictors;) {
         const std::uint32_t width = std::min(impl_->chunk, predictors - cursor);
-        impl_->run_layers(tokens.data() + cursor, cursor, width);
+        impl_->run_layers(tokens.data() + cursor, nullptr, cursor, width);
         const std::uint32_t first = std::max(cursor, first_target - 1U);
         if (first < cursor + width) {
             impl_->score_columns(static_cast<std::int32_t>(first - cursor),
@@ -738,8 +819,7 @@ std::optional<SourceCandidate> Program::inspect_source(const RequestBasePlan& ba
                                                        std::span<const CheckpointHandle>) const {
     if (checkpoint) { return std::nullopt; }
     SourceCandidate source;
-    source.reused_tokens =
-        impl_->occupied || impl_->binding ? 0 : impl_->reusable_tokens(*base.impl_);
+    source.reused_tokens  = impl_->source_for(*base.impl_).reuse;
     source.remaining_work = runtime::make_prefill_work(
         source.reused_tokens, base.summary().prompt_tokens - source.reused_tokens, 0, 0,
         impl_->chunk);
@@ -800,15 +880,17 @@ void Program::release_units(std::span<const SequenceHandle>) noexcept {}
 BindingReservation Program::start_binding(const RequestBasePlan& base, runtime::LaneId lane,
                                           const SourceCandidate& source, ResumeState*,
                                           ExecutionUnitKind, std::uint32_t) {
-    if (source.checkpoint || source.reused_tokens > impl_->reusable_tokens(*base.impl_)) {
-        return {.reserved = false, .source_valid = false, .capacity_possible = true};
-    }
     if (lane.value != 0 || impl_->binding || impl_->occupied) {
         return {.reserved = false, .source_valid = true, .capacity_possible = true};
     }
+    PrefixCache::Source chosen = impl_->source_for(*base.impl_);
+    if (source.reused_tokens == 0) { chosen = {}; }
+    if (source.checkpoint || source.reused_tokens != chosen.reuse) {
+        return {.reserved = false, .source_valid = false, .capacity_possible = true};
+    }
     impl_->plan        = base.impl_;
     impl_->binding     = true;
-    impl_->bind_reused = source.reused_tokens;
+    impl_->bind_source = chosen;
     impl_->begin       = {.prompt_tokens        = base.summary().prompt_tokens,
                           .reused_prompt_tokens = source.reused_tokens,
                           .prefix_reuse_path =
@@ -851,10 +933,12 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
         impl_->plan.reset();
         return progress;
     }
+    impl_->cache->bind(impl_->bind_source, impl_->plan->keys);
     const ResolvedSamplingParameters& sampling = impl_->plan->sampling;
     impl_->upload_sampling(sampling);
-    impl_->speculating = impl_->draft_tokens > 0 && sampling.temperature <= 0.0F &&
-                         sampling.presence_penalty == 0.0F && sampling.frequency_penalty == 0.0F;
+    impl_->speculating    = impl_->draft_tokens > 0;
+    impl_->sampled_rounds = sampling.temperature > 0.0F || sampling.presence_penalty != 0.0F ||
+                            sampling.frequency_penalty != 0.0F;
     impl_->spec_stats  = {};
     if (impl_->speculating) {
         impl_->spec_stats.backend      = SpeculativeBackend::Mtp;
@@ -862,9 +946,10 @@ ContextProgress Program::poll_context(runtime::CancellationFlagView cancellation
         impl_->spec_stats.draft_window = impl_->draft_tokens;
         impl_->spec_stats.accepted_per_position.assign(impl_->draft_tokens, 0);
     }
-    impl_->occupied  = true;
-    impl_->fed       = impl_->bind_reused;
-    impl_->has_next  = false;
+    impl_->occupied      = true;
+    impl_->fed           = impl_->bind_source.reuse;
+    impl_->next_frontier = 0;
+    impl_->has_next      = false;
     impl_->prefilled = false;
     impl_->pending_tokens.clear();
     impl_->handle =
@@ -886,13 +971,31 @@ PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::Execu
     if (!impl_->owns(sequence) || impl_->prefilled) {
         throw std::logic_error("gemma4 prefill sequence is not waiting");
     }
-    const auto start          = std::chrono::steady_clock::now();
-    const auto& tokens        = impl_->plan->tokens;
-    const auto total          = static_cast<std::uint32_t>(tokens.size());
-    if (!impl_->vision_ready) { impl_->encode_vision(*impl_->plan); }
-    const std::uint32_t width = std::min(impl_->chunk, total - impl_->fed);
-    impl_->run_layers(tokens.data() + impl_->fed, impl_->fed, width);
+    const auto start   = std::chrono::steady_clock::now();
+    const auto& plan   = *impl_->plan;
+    const auto& tokens = plan.tokens;
+    const auto total   = static_cast<std::uint32_t>(tokens.size());
+    if (!impl_->vision_ready) {
+        // Images wholly inside the reused prefix need no encoding.
+        if (plan.image_scatter.empty() ||
+            static_cast<std::uint32_t>(plan.image_scatter.back()) < impl_->fed) {
+            impl_->vision_ready = true;
+        } else {
+            impl_->encode_vision(plan);
+        }
+    }
+    // A chunk ends at the next checkpoint frontier, which is captured once the chunk is in.
+    std::size_t& frontier = impl_->next_frontier;
+    while (frontier < plan.frontiers.size() && plan.frontiers[frontier] <= impl_->fed) { ++frontier; }
+    std::uint32_t width = std::min(impl_->chunk, total - impl_->fed);
+    if (frontier < plan.frontiers.size()) {
+        width = std::min(width, plan.frontiers[frontier] - impl_->fed);
+    }
+    impl_->run_layers(tokens.data() + impl_->fed, plan.keys.data() + impl_->fed, impl_->fed, width);
     impl_->fed += width;
+    if (frontier < plan.frontiers.size() && plan.frontiers[frontier] == impl_->fed) {
+        impl_->cache->capture(impl_->fed);
+    }
     PrefillProgress progress;
     progress.summary                 = impl_->begin;
     progress.processed_prompt_tokens = width;
@@ -984,7 +1087,7 @@ DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
     }
     if (impl_->round_pending) {
         impl_->round_pending = false;
-        impl_->resident.resize(impl_->fed);
+        impl_->cache->truncate(impl_->fed);
     }
     impl_->pending_tokens.clear();
     program::HandleAccess::consume(pending);
@@ -1008,7 +1111,7 @@ AbortResult Program::abort(SequenceHandle sequence) noexcept {
 }
 
 void Program::fail_all_cleanup() noexcept {
-    impl_->resident.clear();
+    impl_->cache->clear();
     impl_->binding = false;
     impl_->pending_tokens.clear();
     impl_->clear_lane();

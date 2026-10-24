@@ -8,6 +8,20 @@ The binaries are `ninfer-spo`, `ninfer-spo-serve`, and `ninfer-spo-perplexity`. 
 
 The architectures the registry accepts are `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`, `Qwen3_8FlashNextForCausalLM`, and `Gemma4ForCausalLM` (`src/models/registry.h`). Gemma 4 31B-it is the ported size: text, the MTP assistant, and the vision tower.
 
+## What to serve
+
+**Gemma 4 31B, voice chat.** Convert `gemma4_31b_fp8` with `--components text,vision,mtp` and `--override gemma4_fp8_a8` (`docs/weight-conversion.md`). That artifact has the FP8 A8 text trunk, one FP8 vocabulary table, the MTP assistant, and the vision tower. Serve that one. The text-only FP8 artifact has no vision. The NVFP4 recipes missed the quality gate. QAT `q4_g32` decodes faster but its MTP acceptance collapses on chat prompts, so it is not the voice setup.
+
+```
+ninfer-spo-serve <artifact> --port 8080 --model-id local --max-context 16384 --kv-dtype bf16 \
+    --spec mtp --draft-tokens 4 --vision --no-thinking \
+    --device-state-slots 4 --host-context-mib 8192
+```
+
+One request at a time. A client that omits sampling gets temperature 1.0, top_k 20, top_p 0.95. top_k above 20 is rejected. Four drafts is the measured best for replies of 20 to 100 tokens; `--draft-tokens auto` (6) is faster once replies reach a few hundred tokens. The checkpoint behaviour, the prewarm request, and the sizing are in `docs/serving.md` under "Gemma 4 for voice chat".
+
+**Qwen3.8 Flash-Next, the Pi server.** `scripts/serve.cmd` is that configuration: set `NINFER_MODEL` to the NVFP4 artifact. It serves 262,144 context, bf16 KV, MTP with `auto`, vision, preserve-thinking, and 16 device state slots. The wiring is in `docs/pi.md`.
+
 On 2026-10-11, quick perplexity of the Flash-Next NVFP4 artifact against the 1M corpus scored 261,167 tokens at overall perplexity 3.554 (`ninfer-spo-perplexity --quick`). The release comparison against the previous engine is recorded when the acceptance gates run.
 
 This engine is derived from NInfer (https://github.com/Neroued/ninfer), including the Windows build notes checked against the headpiece747 ninfer-5090-windows tree. Those projects remain under their own copyrights. The license is Apache-2.0. See `NOTICE`.

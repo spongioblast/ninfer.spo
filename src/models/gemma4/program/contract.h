@@ -21,6 +21,9 @@ struct RequestPlan {
     std::vector<TokenId> tokens;
     std::vector<Gemma4PreparedImage> images;
     std::vector<std::int32_t> image_scatter;
+    // PositionKey of every prompt position, and the ascending positions to checkpoint at.
+    std::vector<std::uint64_t> keys;
+    std::vector<std::uint32_t> frontiers;
     ResolvedSamplingParameters sampling;
     bool allow_prefix_reuse = false;
 };

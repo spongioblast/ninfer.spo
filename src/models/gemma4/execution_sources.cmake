@@ -9,6 +9,8 @@ target_sources(ninfer_model_runtime PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tokenizer.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tool_parser.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix_cache.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/program/prefix_store.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/program.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/program/top_tokens.cpp"
 )

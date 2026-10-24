@@ -40,7 +40,9 @@ private:
 
 // Turns committed model tokens into content and reasoning text. `<|channel>thought\n` ...
 // `<channel|>` is reasoning, `<|tool_call>` ... `<tool_call|>` is one structured tool call, and
-// other special tokens are hidden. Text is published only at complete UTF-8 boundaries.
+// other special tokens are hidden. Text is published only at complete UTF-8 boundaries. Stop
+// strings match the decoded channel text; a suffix that may still begin one is held back. A
+// forced tool choice starts inside the call the prompt opened.
 class OutputSession {
 public:
     OutputSession() noexcept = default;
@@ -76,45 +78,65 @@ public:
         staged_terminal_ = false;
     }
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept {
-        return std::move(tool_calls_);
+        return std::move(state_.tool_calls);
     }
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept {
-        return diagnostics_;
+        return state_.diagnostics;
     }
-    [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept { return reasoning_tokens_; }
+    [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept {
+        return state_.reasoning_tokens;
+    }
     [[nodiscard]] ThinkingBudgetStats thinking_stats() const noexcept { return thinking_; }
-    [[nodiscard]] std::optional<std::string> matched_stop_string() const { return std::nullopt; }
+    [[nodiscard]] std::optional<std::string> matched_stop_string() const;
 
 private:
     enum class Mode : std::uint8_t { Content, ReasoningHeader, Reasoning, ToolCall };
 
-    OutputSession(std::shared_ptr<const Tokenizer> tokenizer, std::vector<TokenId> stop_ids,
-                  bool publish_stop, ThinkingBudgetStats thinking, bool starts_in_reasoning)
-        : tokenizer_(std::move(tokenizer)), stop_ids_(std::move(stop_ids)),
-          publish_stop_(publish_stop), thinking_(thinking),
-          mode_(starts_in_reasoning ? Mode::Reasoning : Mode::Content) {}
+    // Everything committed tokens change. content and reasoning hold bytes not yet published.
+    struct State {
+        Mode mode = Mode::Content;
+        std::string content;
+        std::string reasoning;
+        std::string header;
+        std::string tool_text;
+        std::vector<GeneratedToolCall> tool_calls;
+        ToolCallParseDiagnostics diagnostics;
+        std::uint32_t reasoning_tokens = 0;
+        std::optional<std::size_t> matched_stop;
+    };
+
+    struct Setup {
+        std::vector<TokenId> stop_ids;
+        std::vector<StopString> stop_strings;
+        bool publish_stop = false;
+        ThinkingBudgetStats thinking;
+        bool starts_in_reasoning = false;
+        // "call:" or "call:<name>" when the prompt ends inside a forced tool call.
+        std::optional<std::string> forced_call;
+        std::optional<std::vector<std::string>> allowed_names;
+    };
+
+    OutputSession(std::shared_ptr<const Tokenizer> tokenizer, Setup setup);
 
     [[nodiscard]] bool is_stop(TokenId token) const noexcept;
-    void consume(TokenId token);
-    void append_text(const std::string& bytes);
-    void close_reasoning();
-    void close_tool_call();
-    void flush_terminal();
+    void consume(State& state, TokenId token) const;
+    static void append_text(State& state, const std::string& bytes);
+    static void close_reasoning(State& state);
+    void close_tool_call(State& state) const;
+    static void flush_terminal(State& state);
+    [[nodiscard]] bool match_stop_string(State& state) const;
+    [[nodiscard]] std::size_t stop_hold(const std::string& text, OutputChannel channel) const;
 
     std::shared_ptr<const Tokenizer> tokenizer_;
     std::vector<TokenId> stop_ids_;
+    std::vector<StopString> stop_strings_;
+    std::optional<std::vector<std::string>> allowed_names_;
     bool publish_stop_ = false;
     ThinkingBudgetStats thinking_;
-    Mode mode_ = Mode::Content;
+    State state_;
+    State staged_;
     std::vector<TokenId> staged_tokens_;
     bool staged_terminal_ = false;
-    std::string content_;
-    std::string reasoning_;
-    std::string header_;
-    std::string tool_text_;
-    std::vector<GeneratedToolCall> tool_calls_;
-    ToolCallParseDiagnostics diagnostics_;
-    std::uint32_t reasoning_tokens_ = 0;
 
     friend class Frontend;
 };
