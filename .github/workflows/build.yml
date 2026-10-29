@@ -1,0 +1,84 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: FFmpeg
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n9.0-latest-win64-lgpl-shared-9.0.zip"
+          $zip = Join-Path $env:RUNNER_TEMP "ffmpeg.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $stage = Join-Path $env:RUNNER_TEMP "ffmpeg-src"
+          Expand-Archive -Path $zip -DestinationPath $stage
+          $inner = Get-ChildItem $stage -Directory | Select-Object -First 1
+          if (-not $inner) { throw "FFmpeg archive had no directory" }
+          Move-Item $inner.FullName (Join-Path $env:GITHUB_WORKSPACE "ffmpeg")
+          foreach ($name in @("avcodec","avformat","avutil","swscale","swresample")) {
+            $dll = Get-ChildItem (Join-Path $env:GITHUB_WORKSPACE "ffmpeg\bin") -Filter "$name-*.dll"
+            if (-not $dll) { throw "missing $name DLL" }
+          }
+
+      - name: CUDA 13.3
+        shell: pwsh
+        run: |
+          $url = "https://developer.download.nvidia.com/compute/cuda/13.3.0/network_installers/cuda_13.3.0_windows_network.exe"
+          $exe = Join-Path $env:RUNNER_TEMP "cuda_13.3.0_windows_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile $exe
+          $packages = @(
+            "nvcc_13.3", "crt_13.3", "cudart_13.3",
+            "cublas_13.3", "cublas_dev_13.3",
+            "nvtx_13.3", "thrust_13.3"
+          )
+          $args = @("-s") + $packages
+          $proc = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
+          Write-Host "CUDA installer exit $($proc.ExitCode)"
+          $nvcc = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\nvcc.exe"
+          if (-not (Test-Path $nvcc)) { throw "nvcc was not installed" }
+          Remove-Item $exe
+
+      - name: Visual Studio
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -version "[17.0,18.0)" -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) {
+            $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          }
+          if (-not $vs) { throw "Visual Studio C++ tools not found" }
+          "VS=$vs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host $vs
+
+      - name: Release
+        shell: cmd
+        run: |
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          set "CUDA_PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          set "PATH=%CUDA_PATH%\bin;%PATH%"
+          nvcc --version || exit /b 1
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=120a -DNINFER_BUILD_APPS=ON || exit /b 1
+          cmake --build build || exit /b 1
+          for %%D in (avcodec avformat avutil swscale swresample) do xcopy /y /q "ffmpeg\bin\%%D-*.dll" "build\apps\" >nul || exit /b 1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          if-no-files-found: error
+          path: |
+            build/apps/ninfer-spo.exe
+            build/apps/ninfer-spo-serve.exe
+            build/apps/ninfer-spo-perplexity.exe
+            build/apps/avcodec-*.dll
+            build/apps/avformat-*.dll
+            build/apps/avutil-*.dll
+            build/apps/swscale-*.dll
+            build/apps/swresample-*.dll

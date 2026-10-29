@@ -2,7 +2,7 @@
 
 A fast low latency Windows and Linux CUDA inference engine for Qwen3.8 Flash-Next, Qwen3.5, and Gemma 4 31B on Blackwell (`sm_120`, RTX 6000 MaxQ and others). One process, one GPU, one resident model. The artifact is a V3 `.ninfer` file. The namespace stays `ninfer`.
 
-The binaries are `ninfer-spo`, `ninfer-spo-serve`, and `ninfer-spo-perplexity`. They speak the local CLI and OpenAI- and Anthropic-compatible HTTP. Build with `scripts/build.cmd` on Windows or `scripts/build.sh` on Linux. The steps, the CUDA architecture, and FFmpeg are in `docs/building.md`. Flags and `NINFER_*` switches are in `docs/configuration.md`.
+The binaries are `ninfer-spo`, `ninfer-spo-serve`, and `ninfer-spo-perplexity`. They speak the local CLI and OpenAI- and Anthropic-compatible HTTP. Build with `scripts/build.cmd` on Windows or `scripts/build.sh` on Linux. GitHub Actions also builds the Windows release on each push to `main`; the run's `windows-release` artifact is the three programs plus the FFmpeg DLLs. The steps, the CUDA architecture, and FFmpeg are in `docs/building.md`. Flags and `NINFER_*` switches are in `docs/configuration.md`.
 
 The architectures the registry accepts are `Qwen3_5ForCausalLM`, `Qwen3_5MoeForCausalLM`, `Qwen3_8FlashNextForCausalLM`, and `Gemma4ForCausalLM` (`src/models/registry.h`). Gemma 4 31B-it is the ported size: text, the MTP assistant, and the vision tower.
 

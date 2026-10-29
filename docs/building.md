@@ -18,6 +18,10 @@ scripts\build.cmd dev --target ninfer-spo-serve
 
 The compiler database is written into the build directory (`CMAKE_EXPORT_COMPILE_COMMANDS`).
 
+## GitHub
+
+`.github/workflows/build.yml` builds the Windows release on each push to `main`. The runner installs CUDA 13.3 and an FFmpeg 9.0 LGPL shared build, then configures the same way as `scripts/build.cmd release`. It has no GPU, so the run only compiles. The `windows-release` artifact holds `ninfer-spo`, `ninfer-spo-serve`, `ninfer-spo-perplexity`, and the five FFmpeg DLLs those programs load.
+
 ## Linux
 
 `scripts/build.sh` configures the same way. `CUDA_ARCH` overrides the architecture and must stay `120a` or CMake rejects it. `JOBS` is the parallel level (default 8).
