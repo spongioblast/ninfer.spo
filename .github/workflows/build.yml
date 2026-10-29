@@ -38,15 +38,16 @@ jobs:
           $exe = Join-Path $env:RUNNER_TEMP "cuda_13.3.0_windows_network.exe"
           Invoke-WebRequest -Uri $url -OutFile $exe
           $packages = @(
-            "nvcc_13.3", "crt_13.3", "cudart_13.3",
+            "nvcc_13.3", "nvvm_13.3", "crt_13.3", "cudart_13.3",
             "cublas_13.3", "cublas_dev_13.3",
             "nvtx_13.3", "thrust_13.3"
           )
           $args = @("-s") + $packages
           $proc = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru
           Write-Host "CUDA installer exit $($proc.ExitCode)"
-          $nvcc = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\nvcc.exe"
-          if (-not (Test-Path $nvcc)) { throw "nvcc was not installed" }
+          $root = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3"
+          if (-not (Test-Path "$root\bin\nvcc.exe")) { throw "nvcc was not installed" }
+          if (-not (Test-Path "$root\nvvm\bin\cicc.exe")) { throw "cicc was not installed" }
           Remove-Item $exe
 
       - name: Visual Studio
