@@ -36,6 +36,18 @@ struct RuntimeSwitches {
 
     // q4_g32 prefill keeps one FP32 scale per group instead of the baked E4M3 weights.
     bool q4_exact_prefill = false;
+
+    // 0 keeps every routed expert in VRAM. A positive value is the VRAM budget, in GiB,
+    // for the hottest routed experts; the rest stay in pinned host memory.
+    int expert_vram_gib = 0;
+    // Optional "<artifact>.experts.json": hottest [layer, expert] pairs first.
+    std::string expert_profile;
+    // 0 means the CPU tier's own default (8 workers).
+    int expert_cpu_threads = 0;
+    // False freezes the hot set. True lets each round swap toward recent routes.
+    bool expert_adapt = true;
+    // Empty disables the route dump. A path appends one line per MoE call.
+    std::string routing_dump;
 };
 
 struct RuntimeSwitchFlags {
@@ -48,6 +60,8 @@ struct RuntimeSwitchFlags {
     std::optional<int> prefill_graph_max_tokens;
     std::optional<int> prefill_graph_cache;
     std::optional<bool> prefill_graphs_off;
+    std::optional<int> expert_vram_gib;
+    std::optional<std::string> expert_profile;
 };
 
 [[nodiscard]] const RuntimeSwitches& runtime_switches();

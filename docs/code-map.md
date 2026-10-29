@@ -9,6 +9,7 @@ Each directory owns one layer. The gate names are `python tools/gates/run.py` le
 | `src/program` | Shared KV storage, program value types, MTP alignment, vision scatter | `src/program/program_types.h` | through the model program tests | `full` |
 | `src/models/qwen3_5` | Qwen3.5 frontend, execution, and program | `src/models/qwen3_5/program/program.h` | `tests/models` names containing `qwen3_5` | `full` (`frontend`, `grammar`) |
 | `src/models/qwen3_8_flash_next` | Flash-Next frontend, execution, and V3 program | `src/models/qwen3_8_flash_next/program/v3_program.h` | `tests/models` names containing `qwen3_8_flash_next` or `flash_next` | `full` |
+| `src/models/qwen3_8_flash_next_125b_a6b` | Flash-Next load plan, package, and expert VRAM tier | `src/models/qwen3_8_flash_next_125b_a6b/impl/model.cpp` | `ninfer_qwen3_8_flash_next_load_plan_test`, `ninfer_flash_next_moe_tier_test` | `full` |
 | `src/models/gemma4` | Gemma 4 31B frontend, execution, MTP assistant, vision, and program. Text prefill buckets live in `program/prefill_graphs.h`. | `src/models/gemma4/program/program.h` | `tests/models` names containing `gemma4` | `full` |
 | `src/models` | Architecture registry | `src/models/registry.h` | load-plan tests | `full` |
 | `src/runtime/engine` | The generation loop, scheduler, context cache | `src/runtime/engine/engine_core.h` | `tests/runtime` | `quick`; real tests in `full` |
@@ -31,17 +32,18 @@ Each directory owns one layer. The gate names are `python tools/gates/run.py` le
 |---:|---|
 | 2038 | `tools/bench/ttft/cases.py` |
 | 1547 | `tools/bench/ttft/report.py` |
+| 1377 | `src/ops/sparse_moe/flash_next/flash_next_moe.cu` |
 | 1329 | `tools/bench/run_serve_corpus.py` |
 | 1204 | `src/models/qwen3_5/program/transactions/reclaim.cpp` |
 | 1203 | `src/ops/launcher/hyperconnection.cu` |
 | 1196 | `src/models/qwen3_8_flash_next/frontend/tokenizer.cpp` |
 | 1175 | `src/program/storage/kv_address_space.h` |
-| 1171 | `src/ops/sparse_moe/flash_next/flash_next_moe.cu` |
 | 1151 | `tools/bench/run_serve_concurrency.py` |
+| 1138 | `src/models/gemma4/program/program.cpp` |
+| 1105 | `src/runtime/engine/engine_core.h` |
 | 1098 | `src/models/qwen3_5/frontend/processor.cpp` |
 | 1095 | `src/models/qwen3_8_flash_next/frontend/processor.cpp` |
-| 1091 | `src/runtime/engine/engine_core.h` |
-| 1074 | `src/serve/anthropic_messages_request.cpp` |
+| 1076 | `src/serve/anthropic_messages_request.cpp` |
 | 1026 | `src/ops/wrapper/gdn_input_proj.cpp` |
 | 1001 | `tools/convert/qwen3_5.py` |
 | 1000 | `src/models/qwen3_5/frontend/tokenizer.cpp` |
@@ -50,13 +52,14 @@ Each directory owns one layer. The gate names are `python tools/gates/run.py` le
 | 975 | `src/models/qwen3_5/program/planning/startup.cpp` |
 | 966 | `src/models/qwen3_5/frontend/frontend.cpp` |
 | 879 | `tools/bench/ttft/render.py` |
-| 863 | `src/serve/openai_chat_request.cpp` |
+| 875 | `src/models/qwen3_8_flash_next/program/v3_program.cpp` |
+| 864 | `src/serve/openai_chat_request.cpp` |
 | 859 | `src/ops/sparse_moe/prefill/sparse_moe_prefill_gemm.cuh` |
-| 847 | `src/models/qwen3_8_flash_next/program/v3_program.cpp` |
 | 840 | `src/models/qwen3_5/program/decode.cpp` |
 | 831 | `tools/bench/ttft/build_fixtures.py` |
 | 818 | `src/ops/softmax_attention/qsa/qsa_attention.cu` |
-| 789 | `src/models/qwen3_8_flash_next/impl/runtime/layouts.cpp` |
+| 793 | `src/models/qwen3_8_flash_next/impl/runtime/layouts.cpp` |
+| 782 | `tools/convert/gemma4.py` |
 | 779 | `src/models/qwen3_5/program/prefill.cpp` |
 | 778 | `src/models/qwen3_8_flash_next/impl/runtime/state_image_store.h` |
 | 775 | `src/models/qwen3_5/frontend/output_session.cpp` |
@@ -64,10 +67,8 @@ Each directory owns one layer. The gate names are `python tools/gates/run.py` le
 | 766 | `src/models/qwen3_5/program/storage/state_store.h` |
 | 760 | `src/ops/sparse_moe/decode/sparse_moe_decode_kernels.cu` |
 | 758 | `src/models/qwen3_5/frontend/tool_call_parser.cpp` |
+| 757 | `tests/convert/test_gemma4.py` |
+| 757 | `src/ops/linear/q4/q4_g32_w4a8.cu` |
 | 753 | `src/ops/linear_attention/gated_delta_net/chunked/prepare_wy_wu.cuh` |
-| 751 | `src/runtime/engine/context_cache/resource_sources.inl` |
-| 728 | `tools/bench/run_serve_ttft_campaign.py` |
-| 725 | `src/models/qwen3_5/execution/draft.cpp` |
-| 719 | `src/ops/kernel/speculative_round.cuh` |
 
 <!-- health:sizes:end -->

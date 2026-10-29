@@ -3,6 +3,7 @@
 #include "artifact/formats.h"
 #include "artifact/resident_memory.h"
 #include "core/process_tuning.h"
+#include "core/runtime_options.h"
 
 #include <array>
 #include <chrono>
@@ -124,7 +125,36 @@ FinalHyperConnectionPlan bind_final_hc(artifact::Binder& binder, const std::stri
     };
 }
 
+std::optional<artifact::MappedRange> map_expert_bank(artifact::Binder& binder,
+                                                         const std::string& name) {
+    const auto& binding = binder.reader().directory().bindings.at(name);
+    const auto object   = binding.parts.front().object;
+    const auto& tensor  = binder.reader().directory().tensor(object);
+    if (tensor.layout != "expert_block_scale_k16_m128x4_v1") {
+        throw artifact::ArtifactError(name + ": unsupported expert-bank representation");
+    }
+    return binder.reader().map_range(tensor.offset, tensor.bytes, artifact::MappingAccess::Normal);
+}
+
 MoePlan bind_main_moe(artifact::Binder& binder, const std::string& prefix) {
+    if (runtime_switches().expert_vram_gib > 0) {
+        MoePlan out{
+            .router      = projection(binder, prefix + "gate.weight", {512, 2560}),
+            .shared_gate = projection(binder, prefix + "shared_expert.gate_proj.weight", {640, 2560}),
+            .shared_up   = projection(binder, prefix + "shared_expert.up_proj.weight", {640, 2560}),
+            .shared_down = device(binder, prefix + "shared_expert.down_proj.weight", QType::BF16,
+                                  {2560, 640}),
+            .shared_scale =
+                device(binder, prefix + "shared_expert_gate.weight", QType::BF16, {1, 2560}),
+            .routed_gate_up_input_divisors =
+                expert_input_divisors(binder, prefix + "experts.gate_up"),
+            .routed_down_input_divisors = expert_input_divisors(binder, prefix + "experts.down"),
+            .nvfp4_experts = true,
+            .gate_file     = map_expert_bank(binder, prefix + "experts.gate_up"),
+            .down_file     = map_expert_bank(binder, prefix + "experts.down"),
+        };
+        return out;
+    }
     return {
         .router      = projection(binder, prefix + "gate.weight", {512, 2560}),
         .shared_gate = projection(binder, prefix + "shared_expert.gate_proj.weight", {640, 2560}),

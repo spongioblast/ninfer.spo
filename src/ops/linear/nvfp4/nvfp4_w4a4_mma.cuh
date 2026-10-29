@@ -50,6 +50,7 @@ struct Nvfp4W4a4MaterializedActivation {
 
 struct Nvfp4W4a4IdentityRows {
     static constexpr bool kContiguous = true;
+    static constexpr bool kScattered  = false;
 
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
         return row_begin + local_row;
@@ -143,6 +144,12 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
                                                         Nvfp4W4a4SharedStorage<Schedule>& shared,
                                                         int stage, int k_tile, int row_begin,
                                                         RowPolicy row_policy) {
+    const std::uint8_t* code_base  = codes;
+    const std::uint8_t* scale_base = scales;
+    if constexpr (RowPolicy::kScattered) {
+        code_base  = row_policy.code_bases[row_policy.expert];
+        scale_base = row_policy.scale_bases[row_policy.expert];
+    }
     constexpr int kCodeTasks = Schedule::kBlockN * Schedule::kSegmentsPerRow;
     for (int task = static_cast<int>(threadIdx.x); task < kCodeTasks; task += Schedule::kThreads) {
         const int row             = task / Schedule::kSegmentsPerRow;
@@ -150,7 +157,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
         const int weight_row      = row_policy.weight_row(row_begin, row);
         const int physical_byte   = nvfp4_w4a4_swizzled_byte<Schedule>(row, logical_segment * 16);
         auto* destination = shared.b_codes[stage] + row * Schedule::kCodeRowBytes + physical_byte;
-        const auto* input = codes +
+        const auto* input = code_base +
                             static_cast<std::int64_t>(weight_row) * Geometry::kCodeBytesPerRow +
                             k_tile * Schedule::kCodeRowBytes + logical_segment * 16;
         cp_async<16, Cache::cg>(destination, input);
@@ -175,7 +182,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
             auto* destination          = shared.b_scales[stage] +
                                 ((row_tile * Schedule::kK64PerStage + local_k64) * 32 + row_mod32) *
                                     kScaleBytesPerTask;
-            const auto* input = scales +
+            const auto* input = scale_base +
                                 static_cast<std::int64_t>(
                                     persistent_tile * Geometry::kScaleTilesPerRow + global_k64) *
                                     512 +
@@ -196,7 +203,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
             const int row_quartile    = row_in_tile >> 5;
             auto* destination =
                 shared.b_scales[stage] + (row * Schedule::kK64PerStage + local_k64) * 4;
-            const auto* input = scales +
+            const auto* input = scale_base +
                                 static_cast<std::int64_t>(
                                     persistent_tile * Geometry::kScaleTilesPerRow + global_k64) *
                                     512 +
@@ -237,6 +244,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     if constexpr (WorkPolicy::kPersistent) {
         work_policy.configure(work, kRowsPerBlock, token_begin, active_tokens, row_begin,
                               work_alpha, row_policy);
+        if (!work_policy.keep(work, kRowsPerBlock)) {
+            work += static_cast<int>(gridDim.x);
+            continue;
+        }
     } else {
         token_begin = static_cast<int>(blockIdx.y) * Schedule::kBlockM;
         active_tokens = tokens;

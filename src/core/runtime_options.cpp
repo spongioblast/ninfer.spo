@@ -71,7 +71,10 @@ void log_if_set(const RuntimeSwitches& switches) {
                        switches.prefill_graph_max_tokens == 64 && switches.prefill_graph_cache == 64 &&
                        !switches.prefill_graph_audit && !switches.prefill_graphs_forced_off &&
                        !switches.prefill_graph_memlog && switches.decode_wait.empty() &&
-                       !switches.wake_margin_us && switches.round_stats == 0;
+                       !switches.wake_margin_us && switches.round_stats == 0 &&
+                       switches.expert_vram_gib == 0 && switches.expert_profile.empty() &&
+                       switches.expert_cpu_threads == 0 && switches.expert_adapt &&
+                       switches.routing_dump.empty();
     if (quiet) { return; }
     std::fprintf(stderr, "ninfer switches:");
     if (switches.cuda_sync) { std::fprintf(stderr, " cuda_sync=%s", switches.cuda_sync->c_str()); }
@@ -109,6 +112,19 @@ void log_if_set(const RuntimeSwitches& switches) {
     }
     if (switches.round_stats != 0) { std::fprintf(stderr, " round_stats=%d", switches.round_stats); }
     if (switches.q4_exact_prefill) { std::fprintf(stderr, " q4_exact_prefill=1"); }
+    if (switches.expert_vram_gib != 0) {
+        std::fprintf(stderr, " expert_vram_gib=%d", switches.expert_vram_gib);
+    }
+    if (!switches.expert_profile.empty()) {
+        std::fprintf(stderr, " expert_profile=%s", switches.expert_profile.c_str());
+    }
+    if (switches.expert_cpu_threads != 0) {
+        std::fprintf(stderr, " expert_cpu_threads=%d", switches.expert_cpu_threads);
+    }
+    if (!switches.expert_adapt) { std::fprintf(stderr, " expert_adapt=off"); }
+    if (!switches.routing_dump.empty()) {
+        std::fprintf(stderr, " routing_dump=%s", switches.routing_dump.c_str());
+    }
     std::fprintf(stderr, "\n");
 }
 
@@ -146,6 +162,17 @@ RuntimeSwitches& mutable_switches() {
         const int stats = env_int("NINFER_DEBUG_ROUND_STATS", 0);
         out.round_stats = stats < 0 ? 0 : (stats > 10000 ? 10000 : stats);
         out.q4_exact_prefill = env_present("NINFER_Q4_EXACT");
+        if (env_present("NINFER_EXPERT_VRAM_GIB")) {
+            const int gib = env_int("NINFER_EXPERT_VRAM_GIB", 0);
+            out.expert_vram_gib = gib < 0 ? 0 : gib;
+        }
+        out.expert_profile = env_string("NINFER_EXPERT_PROFILE");
+        if (env_present("NINFER_EXPERT_CPU_THREADS")) {
+            const int workers = env_int("NINFER_EXPERT_CPU_THREADS", 8);
+            out.expert_cpu_threads = workers < 1 ? 8 : (workers > 32 ? 32 : workers);
+        }
+        if (env_string("NINFER_EXPERT_ADAPT") == "0") { out.expert_adapt = false; }
+        out.routing_dump = env_string("NINFER_ROUTING_DUMP");
         return out;
     }();
     return switches;
@@ -179,6 +206,8 @@ void apply_runtime_switch_flags(const RuntimeSwitchFlags& flags) {
     }
     if (flags.prefill_graph_cache) { out.prefill_graph_cache = *flags.prefill_graph_cache; }
     if (flags.prefill_graphs_off) { out.prefill_graphs_forced_off = *flags.prefill_graphs_off; }
+    if (flags.expert_vram_gib) { out.expert_vram_gib = *flags.expert_vram_gib; }
+    if (flags.expert_profile) { out.expert_profile = *flags.expert_profile; }
 }
 
 } // namespace ninfer

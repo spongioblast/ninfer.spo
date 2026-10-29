@@ -1,6 +1,6 @@
 # Architecture
 
-One process loads one V3 `.ninfer` artifact onto one GPU. The registry (`src/models/registry.h`) picks Qwen3.5, Qwen3.5 MoE, Qwen3.8 Flash-Next, or Gemma 4. `construct_model` in `src/runtime/engine/model_instance.h` builds a `ModelInstance`, a `FlashNextInstance`, or a `Gemma4Instance`. Each instance owns a frontend, the loaded weights, and a `Program`.
+One process loads one V3 `.ninfer` artifact onto one GPU. With `--expert-vram-gib`, Flash-Next routed experts that miss that VRAM budget stay in pinned host memory. Decode computes those misses on the CPU; prefill copies them into VRAM and uses the GPU kernels. The registry (`src/models/registry.h`) picks Qwen3.5, Qwen3.5 MoE, Qwen3.8 Flash-Next, or Gemma 4. `construct_model` in `src/runtime/engine/model_instance.h` builds a `ModelInstance`, a `FlashNextInstance`, or a `Gemma4Instance`. Each instance owns a frontend, the loaded weights, and a `Program`.
 
 ## Engine
 

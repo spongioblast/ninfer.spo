@@ -18,6 +18,15 @@ struct FlashNextExpertBank {
     const void* scales = nullptr;
     const float* weight_scale_divisors = nullptr;
     const float* input_scale_divisors = nullptr;
+    // Device arrays of 512 pointers. Null keeps the contiguous bank (codes + expert * stride).
+    // Set, each expert's codes and scales may sit in VRAM or in device-mapped host memory.
+    const std::uint8_t* const* expert_code_bases = nullptr;
+    const std::uint8_t* const* expert_scale_bases = nullptr;
+    // 16 device words, bit set when that expert is in VRAM. Null runs every expert on the GPU.
+    // Decode then computes the clear bits on the CPU. Prefill copies those experts to VRAM first.
+    const std::uint32_t* resident_mask = nullptr;
+    // Index into the CPU tier's layer table. -1 keeps this bank on the GPU (the MTP bank).
+    std::int32_t cpu_layer = -1;
     QType qtype = QType::NVFP4;
     std::int32_t experts = 0;
     std::int32_t rows = 0;

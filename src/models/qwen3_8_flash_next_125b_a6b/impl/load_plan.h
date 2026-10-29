@@ -37,6 +37,10 @@ struct MoePlan {
     artifact::ParameterReference routed_down_input_divisors;
     // Main banks are NVFP4. The MTP bank is BF16 unless the artifact stores NVFP4 drafter experts.
     bool nvfp4_experts = true;
+    // Set only with --expert-vram-gib. The file mapping is the source the tier copies from,
+    // so the expert bytes are not uploaded and not held as a second heap copy.
+    std::optional<artifact::MappedRange> gate_file;
+    std::optional<artifact::MappedRange> down_file;
 };
 
 struct FullAttentionPlan {

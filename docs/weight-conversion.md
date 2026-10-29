@@ -5,7 +5,7 @@ can reuse an official conversion, change selected layers or projections, combine
 your own conversion method. The artifact contains the resulting configuration, encoded weights,
 logical bindings and frontend resources.
 
-Run the commands below from the repository root.
+Run the commands below from the repository root. Qwen3.8 Flash-Next is not one of these recipes. The RadixArk checkpoint and the command that builds the serving artifact are in the README.
 
 ## Upgrade an existing v2 artifact
 

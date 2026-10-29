@@ -291,6 +291,9 @@ void append_timings_json(std::ostringstream& out, const GenerationTimings& timin
         << ", " << "\"vision_seconds\": " << number(timings.vision_seconds) << ", "
         << "\"prefill_seconds\": " << number(timings.prefill_seconds) << ", "
         << "\"decode_seconds\": " << number(timings.decode_seconds) << ", "
+        << "\"first_token_seconds\": " << number(timings.first_token_seconds) << ", "
+        << "\"prompt_wall_seconds\": " << number(timings.prompt_wall_seconds) << ", "
+        << "\"generation_wall_seconds\": " << number(timings.generation_wall_seconds) << ", "
         << "\"total_seconds\": " << number(timings.total_seconds) << '}';
 }
 

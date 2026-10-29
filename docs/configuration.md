@@ -1,6 +1,6 @@
 # Configuration
 
-Serve flags win over the environment for the switches in `src/core/runtime_options.h`. Every `NINFER_*` variable the engine reads is read in `src/core/runtime_options.cpp`; the ones scripts and gates read are listed at the end. Diagnostics have no flag.
+Serve flags win over the environment for the switches in `src/core/runtime_options.h`. The engine reads `NINFER_*` in `src/core/runtime_options.cpp`. The variables scripts and gates read are listed at the end. Diagnostics have no flag.
 
 ## Environment
 
@@ -17,6 +17,11 @@ Serve flags win over the environment for the switches in `src/core/runtime_optio
 | `NINFER_FLASH_NEXT_PREFILL_GRAPH_CACHE` | How many prefill graphs to keep, at least 1. Default 64. |
 | `NINFER_FLASH_NEXT_PREFILL_GRAPHS` | `0` turns prefill graphs off. |
 | `NINFER_Q4_EXACT` | Present means `q4_g32_fp16` trunk projections never round their codes to E4M3: 128 tokens and more take the exact W4A8 GEMM (one FP32 scale per group), shorter prefills the A16 routes. Lower KL, slower prefill. |
+| `NINFER_EXPERT_VRAM_GIB` | Flash-Next only. GiB of VRAM for the hottest routed experts. Decode computes a miss on the CPU. Prefill copies the misses a layer needs into a VRAM scratch, then runs the GPU kernels. `0` or unset keeps every expert in VRAM. The cold copy is pinned and counts toward `NINFER_PIN_CEILING_GIB`. |
+| `NINFER_EXPERT_PROFILE` | Path of a JSON file whose integers are `[layer, expert]` pairs, hottest first. Used only with `NINFER_EXPERT_VRAM_GIB`. Missing or empty falls back to expert-id order. |
+| `NINFER_EXPERT_CPU_THREADS` | Workers for the CPU experts. Default 8. |
+| `NINFER_EXPERT_ADAPT` | `0` keeps the profile's hot set fixed. Otherwise, after each round, up to four experts are swapped so the recent routes stay in VRAM. |
+| `NINFER_ROUTING_DUMP` | Diagnostic. Appends one line per MoE call, `call router_address tokens id id ...`, when CUDA graphs are off (`--no-cuda-graph`). The router address names the layer; `tools/bench/expert_tier_model.py` reads the file and writes the `NINFER_EXPERT_PROFILE` JSON. |
 | `NINFER_DEBUG_PLANNER_TRACE` | Present means trace the planner. |
 | `NINFER_DEBUG_LOGITS_DIR` | Directory for logit dumps. |
 | `NINFER_DEBUG_STATE_DIR` | Directory for state dumps. Setting it also turns prefill graphs off. |
@@ -27,7 +32,7 @@ Serve flags win over the environment for the switches in `src/core/runtime_optio
 
 A numeric variable that is not a whole number is ignored with a warning and keeps its default.
 
-The matching serve flags are `--cuda-sync`, `--priority`, `--no-thread-tuning`, `--pin-ceiling-gib`, `--decode-wait`, `--wake-margin-us`, `--prefill-graph-max-tokens`, `--prefill-graph-cache`, and `--no-prefill-graphs`.
+The matching serve flags are `--cuda-sync`, `--priority`, `--no-thread-tuning`, `--pin-ceiling-gib`, `--decode-wait`, `--wake-margin-us`, `--prefill-graph-max-tokens`, `--prefill-graph-cache`, `--no-prefill-graphs`, and `--expert-vram-gib`.
 
 ## Scripts, tests, and gates
 

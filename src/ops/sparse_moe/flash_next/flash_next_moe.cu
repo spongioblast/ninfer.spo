@@ -3,6 +3,7 @@
 #include "ops/flash_next_work.h"
 
 #include "core/device.h"
+#include "core/runtime_options.h"
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ops/linear/bf16/bf16_config.h"
@@ -14,6 +15,7 @@
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_w4a4_mma.cuh"
+#include "ops/sparse_moe/flash_next/cpu_tier.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -22,9 +24,12 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace ninfer::ops {
 namespace {
@@ -468,29 +473,41 @@ __global__ void quantize_grouped_kernel(const __nv_bfloat16* input, const int* p
     scales[static_cast<std::int64_t>(row) * groups + group] = quantized.scale;
 }
 
+// Scattered: weight_row is the row inside one expert, and the stage reads that expert's own
+// codes and scales. The bytes are the same slice the contiguous bank uses.
+template <bool Scattered = false>
 struct GroupedGateRows {
     static constexpr bool kContiguous = false;
+    static constexpr bool kScattered  = Scattered;
     int expert                        = 0;
     int rows_per_branch               = 0;
+    const std::uint8_t* const* code_bases  = nullptr;
+    const std::uint8_t* const* scale_bases = nullptr;
 
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
         const int branch = local_row >= rows_per_branch ? 1 : 0;
         const int logical =
             row_begin + local_row - branch * rows_per_branch + branch * kIntermediate;
+        if constexpr (Scattered) { return logical; }
         return expert * (2 * kIntermediate) + logical;
     }
 };
 
+template <bool Scattered = false>
 struct GroupedDownRows {
     static constexpr bool kContiguous = false;
+    static constexpr bool kScattered  = Scattered;
     int expert                        = 0;
+    const std::uint8_t* const* code_bases  = nullptr;
+    const std::uint8_t* const* scale_bases = nullptr;
 
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
-        return expert * kHidden + row_begin + local_row;
+        const int local = row_begin + local_row;
+        if constexpr (Scattered) { return local; }
+        return expert * kHidden + local;
     }
 };
 
-template <class RowPolicy>
 struct GroupedWork {
     static constexpr bool kPersistent = true;
     const int* job_count;
@@ -505,9 +522,12 @@ struct GroupedWork {
         return *job_count * (output_rows / rows_per_block);
     }
 
+    __device__ __forceinline__ bool keep(int, int) const { return true; }
+
+    template <class Rows>
     __device__ __forceinline__ void configure(int work, int rows_per_block, int& token_begin,
                                               int& active_tokens, int& row_begin, float& alpha,
-                                              RowPolicy& rows) const {
+                                              Rows& rows) const {
         const int row_blocks = output_rows / rows_per_block;
         const int job        = work / row_blocks;
         const int row_block  = work - job * row_blocks;
@@ -520,6 +540,7 @@ struct GroupedWork {
     }
 };
 
+template <bool Masked>
 struct DecodeRouteWork {
     static constexpr bool kPersistent = true;
     const int* ids;
@@ -527,6 +548,14 @@ struct DecodeRouteWork {
     const float* input_divisors;
     int assignments;
     int output_rows;
+    const std::uint32_t* resident = nullptr;
+
+    __device__ __forceinline__ bool keep(int work, int rows_per_block) const {
+        if constexpr (!Masked) { return true; }
+        const int assignment = work / (output_rows / rows_per_block);
+        const int expert     = ids[assignment];
+        return (resident[expert >> 5] & (1u << (expert & 31))) != 0;
+    }
 
     __device__ __forceinline__ int work_count(int rows_per_block) const {
         return assignments * (output_rows / rows_per_block);
@@ -628,7 +657,8 @@ __global__ void reduce_grouped_kernel(const __nv_bfloat16* grouped, const int* p
 
 __global__ void reduce_decode_routes_kernel(const __nv_bfloat16* grouped, const float* alpha,
                                             const float* shared_alpha, __nv_bfloat16* destination,
-                                            int tokens) {
+                                            int tokens, const int* ids, const std::uint32_t* resident,
+                                            const __nv_bfloat16* cpu_rows) {
     const int token = static_cast<int>(blockIdx.y);
     const int row =
         static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + static_cast<int>(threadIdx.x);
@@ -637,9 +667,13 @@ __global__ void reduce_decode_routes_kernel(const __nv_bfloat16* grouped, const 
 #pragma unroll
     for (int path = 0; path < kTop; ++path) {
         const int assignment = path + kTop * token;
-        sum = fmaf(alpha[assignment],
-                   __bfloat162float(grouped[row + static_cast<std::int64_t>(kHidden) * assignment]),
-                   sum);
+        const int expert     = resident == nullptr ? 0 : ids[assignment];
+        const bool cold      = resident != nullptr &&
+                          (resident[expert >> 5] & (1u << (expert & 31))) == 0;
+        const __nv_bfloat16 value =
+            cold ? cpu_rows[row + static_cast<std::int64_t>(kHidden) * assignment]
+                 : grouped[row + static_cast<std::int64_t>(kHidden) * assignment];
+        sum = fmaf(alpha[assignment], __bfloat162float(value), sum);
     }
     const std::int64_t output = row + static_cast<std::int64_t>(kHidden) * token;
     const float shared        = __bfloat162float(
@@ -767,14 +801,194 @@ routed_down_kernel(const __nv_bfloat16* activations, const int* ids, const float
 }
 
 void require_bank(const FlashNextExpertBank& bank, int rows, int columns, const char* label) {
-    const bool nvfp4 = bank.qtype == QType::NVFP4;
-    const bool bf16  = bank.qtype == QType::BF16;
-    if (bank.codes == nullptr || (!nvfp4 && !bf16) ||
-        (nvfp4 && (bank.scales == nullptr || bank.weight_scale_divisors == nullptr ||
+    const bool nvfp4     = bank.qtype == QType::NVFP4;
+    const bool bf16      = bank.qtype == QType::BF16;
+    const bool scattered = bank.expert_code_bases != nullptr;
+    if ((scattered ? !nvfp4 || bank.expert_scale_bases == nullptr : bank.codes == nullptr) ||
+        (!nvfp4 && !bf16) ||
+        (nvfp4 && ((!scattered && bank.scales == nullptr) || bank.weight_scale_divisors == nullptr ||
                    bank.input_scale_divisors == nullptr)) ||
         bank.experts != kExperts || bank.rows != rows || bank.columns != columns) {
         throw std::invalid_argument(label);
     }
+}
+
+template <class Geometry, class Schedule, class Output, bool Pair, class Work, bool Scattered>
+void launch_gate_rows(const FlashNextExpertBank& bank, Output output, Work work, int blocks,
+                      int rows_per_branch, detail::Nvfp4W4a4MaterializedActivation activation,
+                      int assignments, cudaStream_t stream) {
+    GroupedGateRows<Scattered> rows;
+    rows.rows_per_branch = rows_per_branch;
+    if constexpr (Scattered) {
+        rows.code_bases  = bank.expert_code_bases;
+        rows.scale_bases = bank.expert_scale_bases;
+    }
+    detail::nvfp4_w4a4_mma_kernel<Geometry, Schedule, detail::Nvfp4IdentityEpilogue, Output,
+                                  GroupedGateRows<Scattered>, Pair, Work>
+        <<<blocks, Schedule::kThreads, 0, stream>>>(
+            activation, static_cast<const std::uint8_t*>(bank.codes),
+            static_cast<const std::uint8_t*>(bank.scales), assignments, 1.0F,
+            detail::Nvfp4IdentityEpilogue{}, output, rows, work);
+}
+
+template <class Geometry, class Schedule, class Output, bool Pair, class Work>
+void launch_gate(const FlashNextExpertBank& bank, Output output, Work work, int blocks,
+                 int rows_per_branch, detail::Nvfp4W4a4MaterializedActivation activation,
+                 int assignments, cudaStream_t stream) {
+    if (bank.expert_code_bases != nullptr) {
+        launch_gate_rows<Geometry, Schedule, Output, Pair, Work, true>(
+            bank, output, work, blocks, rows_per_branch, activation, assignments, stream);
+    } else {
+        launch_gate_rows<Geometry, Schedule, Output, Pair, Work, false>(
+            bank, output, work, blocks, rows_per_branch, activation, assignments, stream);
+    }
+}
+
+template <class Geometry, class Schedule, class Output, bool Pair, class Work, bool Scattered>
+void launch_down_rows(const FlashNextExpertBank& bank, Output output, Work work, int blocks,
+                      detail::Nvfp4W4a4MaterializedActivation activation, int assignments,
+                      cudaStream_t stream) {
+    GroupedDownRows<Scattered> rows;
+    if constexpr (Scattered) {
+        rows.code_bases  = bank.expert_code_bases;
+        rows.scale_bases = bank.expert_scale_bases;
+    }
+    detail::nvfp4_w4a4_mma_kernel<Geometry, Schedule, detail::Nvfp4IdentityEpilogue, Output,
+                                  GroupedDownRows<Scattered>, Pair, Work>
+        <<<blocks, Schedule::kThreads, 0, stream>>>(
+            activation, static_cast<const std::uint8_t*>(bank.codes),
+            static_cast<const std::uint8_t*>(bank.scales), assignments, 1.0F,
+            detail::Nvfp4IdentityEpilogue{}, output, rows, work);
+}
+
+template <class Geometry, class Schedule, class Output, bool Pair, class Work>
+void launch_down(const FlashNextExpertBank& bank, Output output, Work work, int blocks,
+                 detail::Nvfp4W4a4MaterializedActivation activation, int assignments,
+                 cudaStream_t stream) {
+    if (bank.expert_code_bases != nullptr) {
+        launch_down_rows<Geometry, Schedule, Output, Pair, Work, true>(
+            bank, output, work, blocks, activation, assignments, stream);
+    } else {
+        launch_down_rows<Geometry, Schedule, Output, Pair, Work, false>(
+            bank, output, work, blocks, activation, assignments, stream);
+    }
+}
+
+// Diagnostic. Off unless NINFER_ROUTING_DUMP is a path. Skipped while a graph is captured,
+// because the copy would be replayed and the file write would not.
+// One line per call: call index, router weight address (names the layer), tokens, ids.
+void maybe_dump_routes(const Tensor& ids, const void* router, int tokens, cudaStream_t stream) {
+    const std::string& path = ninfer::runtime_switches().routing_dump;
+    if (path.empty() || tokens <= 0) { return; }
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamGetCaptureInfo(stream, &capture, nullptr) != cudaSuccess ||
+        capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    static FILE* file = std::fopen(path.c_str(), "ab");
+    if (file == nullptr) { return; }
+    static int call = 0;
+    std::vector<int> host(static_cast<std::size_t>(tokens) * kTop);
+    // The model stream is non-blocking, so a legacy-stream copy would not wait for the router.
+    if (cudaMemcpyAsync(host.data(), ids.data, host.size() * sizeof(int), cudaMemcpyDeviceToHost,
+                        stream) != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+        return;
+    }
+    std::fprintf(file, "%d %p %d", call++, router, tokens);
+    for (const int id : host) { std::fprintf(file, " %d", id); }
+    std::fputc('\n', file);
+    std::fflush(file);
+}
+
+__global__ void copy_cpu_activation(const int* ids, const std::uint8_t* codes,
+                                    const std::uint8_t* scales, int assignments, int* dst_ids,
+                                    std::uint8_t* dst_codes, std::uint8_t* dst_scales) {
+    const int assignment = static_cast<int>(blockIdx.x);
+    if (assignment >= assignments) { return; }
+    if (threadIdx.x == 0) { dst_ids[assignment] = ids[assignment]; }
+    for (int i = static_cast<int>(threadIdx.x); i < kHidden / 2; i += static_cast<int>(blockDim.x)) {
+        dst_codes[static_cast<std::int64_t>(assignment) * (kHidden / 2) + i] =
+            codes[static_cast<std::int64_t>(assignment) * (kHidden / 2) + i];
+    }
+    for (int i = static_cast<int>(threadIdx.x); i < kHidden / 16; i += static_cast<int>(blockDim.x)) {
+        dst_scales[static_cast<std::int64_t>(assignment) * (kHidden / 16) + i] =
+            scales[static_cast<std::int64_t>(assignment) * (kHidden / 16) + i];
+    }
+    __threadfence_system();
+}
+
+__global__ void publish_cpu_seq(std::uint32_t* seq, std::uint32_t* swapping, int* meta,
+                               int assignments, int layer) {
+    if (layer == 0) {
+        while (*reinterpret_cast<volatile std::uint32_t*>(swapping) != 0) {}
+    }
+    meta[0] = assignments;
+    meta[1] = layer;
+    __threadfence_system();
+    *seq = *seq + 1;
+}
+
+__global__ void wait_cpu_done(const std::uint32_t* seq, std::uint32_t* done) {
+    const std::uint32_t target = *seq;
+    while (*reinterpret_cast<volatile std::uint32_t*>(done) < target) {}
+}
+
+__global__ void stage_cold_experts(const int* ids, int assignments, const std::uint32_t* resident,
+                                  const std::uint8_t** gate_codes, const std::uint8_t** gate_scales,
+                                  const std::uint8_t** down_codes, const std::uint8_t** down_scales,
+                                  std::uint8_t* scratch, int slots, int* count) {
+    const int expert = static_cast<int>(blockIdx.x);
+    if ((resident[expert >> 5] & (1u << (expert & 31))) != 0) { return; }
+    bool used = false;
+    for (int i = static_cast<int>(threadIdx.x); i < assignments; i += static_cast<int>(blockDim.x)) {
+        used = used || ids[i] == expert;
+    }
+    if (!__syncthreads_or(used)) { return; }
+    __shared__ int slot;
+    if (threadIdx.x == 0) {
+        const int claimed = atomicAdd(count, 1);
+        slot              = claimed < slots ? claimed : -1;
+    }
+    __syncthreads();
+    if (slot < 0) { return; }
+    constexpr int kGateCodes  = kIntermediate * 2 * (kHidden / 2);
+    constexpr int kGateScales = (kIntermediate * 2 / 128) * (kHidden / 64) * 512;
+    constexpr int kDownCodes  = kHidden * (kIntermediate / 2);
+    constexpr int kDownScales = (kHidden / 128) * (kIntermediate / 64) * 512;
+    auto* base                = scratch + static_cast<std::int64_t>(slot) * kCpuTierSlotBytes;
+    auto copy = [&](const std::uint8_t* src, std::uint8_t* dst, int bytes) {
+        for (int i = static_cast<int>(threadIdx.x); i < bytes; i += static_cast<int>(blockDim.x)) {
+            dst[i] = src[i];
+        }
+    };
+    copy(gate_codes[expert], base, kGateCodes);
+    copy(gate_scales[expert], base + kGateCodes, kGateScales);
+    copy(down_codes[expert], base + kGateCodes + kGateScales, kDownCodes);
+    copy(down_scales[expert], base + kGateCodes + kGateScales + kDownCodes, kDownScales);
+    if (threadIdx.x == 0) {
+        gate_codes[expert]  = base;
+        gate_scales[expert] = base + kGateCodes;
+        down_codes[expert]  = base + kGateCodes + kGateScales;
+        down_scales[expert] = base + kGateCodes + kGateScales + kDownCodes;
+    }
+}
+
+void stage_prefill(const FlashNextMoeWeights& weights, const Tensor& ids, int assignments,
+                   cudaStream_t stream) {
+    const CpuTierDeviceView* tier = cpu_tier_device();
+    if (tier == nullptr || tier->scratch == nullptr || weights.routed_gate_up.resident_mask == nullptr ||
+        weights.routed_gate_up.cpu_layer < 0) {
+        return;
+    }
+    CUDA_CHECK(cudaMemsetAsync(tier->stage_count, 0, sizeof(int), stream));
+    stage_cold_experts<<<kExperts, 256, 0, stream>>>(
+        static_cast<const int*>(ids.data), assignments, weights.routed_gate_up.resident_mask,
+        const_cast<const std::uint8_t**>(weights.routed_gate_up.expert_code_bases),
+        const_cast<const std::uint8_t**>(weights.routed_gate_up.expert_scale_bases),
+        const_cast<const std::uint8_t**>(weights.routed_down.expert_code_bases),
+        const_cast<const std::uint8_t**>(weights.routed_down.expert_scale_bases), tier->scratch,
+        tier->scratch_slots, tier->stage_count);
 }
 
 void run_nvfp4_decode_routes(const Tensor& input, const FlashNextMoeWeights& weights,
@@ -794,45 +1008,71 @@ void run_nvfp4_decode_routes(const Tensor& input, const FlashNextMoeWeights& wei
         static_cast<const std::uint8_t*>(gate_scales.data)};
     Tensor down_codes  = workspace.alloc(DType::U8, {kIntermediate / 2, assignments});
     Tensor down_scales = workspace.alloc(DType::U8, {kIntermediate / 16, assignments});
-    const DecodeRouteWork gate_work{
+    const bool cpu = weights.routed_gate_up.resident_mask != nullptr &&
+                     weights.routed_gate_up.cpu_layer >= 0 && cpu_tier_device() != nullptr;
+    if (cpu) {
+        const CpuTierDeviceView* tier = cpu_tier_device();
+        copy_cpu_activation<<<assignments, 256, 0, stream>>>(
+            static_cast<const int*>(ids.data), static_cast<const std::uint8_t*>(gate_codes.data),
+            static_cast<const std::uint8_t*>(gate_scales.data), assignments, tier->ids, tier->act_codes,
+            tier->act_scales);
+        publish_cpu_seq<<<1, 1, 0, stream>>>(tier->seq, tier->swapping, tier->meta, assignments,
+                                            weights.routed_gate_up.cpu_layer);
+    }
+    const DecodeRouteWork<true> masked_gate{
         static_cast<const int*>(ids.data), weights.routed_gate_up.weight_scale_divisors,
-        weights.routed_gate_up.input_scale_divisors, assignments, kIntermediate};
+        weights.routed_gate_up.input_scale_divisors, assignments, kIntermediate,
+        weights.routed_gate_up.resident_mask};
+    const DecodeRouteWork<false> plain_gate{
+        static_cast<const int*>(ids.data), weights.routed_gate_up.weight_scale_divisors,
+        weights.routed_gate_up.input_scale_divisors, assignments, kIntermediate, nullptr};
     const auto gate_output = GroupedSiluQuantizedOutput{
         GroupedSiluOutput{static_cast<__nv_bfloat16*>(routed_activation.data)},
         static_cast<std::uint8_t*>(down_codes.data), static_cast<std::uint8_t*>(down_scales.data),
         static_cast<const int*>(ids.data), weights.routed_down.input_scale_divisors};
     constexpr int kGateRowsPerBlock = DecodeGroupedGateSchedule::kBlockN / 2;
     const int gate_blocks           = assignments * (kIntermediate / kGateRowsPerBlock);
-    detail::nvfp4_w4a4_mma_kernel<GroupedGateGeometry, DecodeGroupedGateSchedule,
-                                  detail::Nvfp4IdentityEpilogue, GroupedSiluQuantizedOutput,
-                                  GroupedGateRows, true, DecodeRouteWork>
-        <<<gate_blocks, DecodeGroupedGateSchedule::kThreads, 0, stream>>>(
-            gate_input, static_cast<const std::uint8_t*>(weights.routed_gate_up.codes),
-            static_cast<const std::uint8_t*>(weights.routed_gate_up.scales), assignments, 1.0F,
-            detail::Nvfp4IdentityEpilogue{}, gate_output, GroupedGateRows{0, kGateRowsPerBlock},
-            gate_work);
+    if (cpu) {
+        launch_gate<GroupedGateGeometry, DecodeGroupedGateSchedule, GroupedSiluQuantizedOutput, true>(
+            weights.routed_gate_up, gate_output, masked_gate, gate_blocks, kGateRowsPerBlock,
+            gate_input, assignments, stream);
+    } else {
+        launch_gate<GroupedGateGeometry, DecodeGroupedGateSchedule, GroupedSiluQuantizedOutput, true>(
+            weights.routed_gate_up, gate_output, plain_gate, gate_blocks, kGateRowsPerBlock,
+            gate_input, assignments, stream);
+    }
     Tensor grouped_output = workspace.alloc(DType::BF16, {kHidden, assignments});
     const detail::Nvfp4W4a4MaterializedActivation down_input{
         static_cast<const std::uint8_t*>(down_codes.data),
         static_cast<const std::uint8_t*>(down_scales.data)};
-    const DecodeRouteWork down_work{static_cast<const int*>(ids.data),
-                                    weights.routed_down.weight_scale_divisors,
-                                    weights.routed_down.input_scale_divisors, assignments, kHidden};
+    const DecodeRouteWork<true> masked_down{
+        static_cast<const int*>(ids.data), weights.routed_down.weight_scale_divisors,
+        weights.routed_down.input_scale_divisors, assignments, kHidden,
+        weights.routed_down.resident_mask};
+    const DecodeRouteWork<false> plain_down{
+        static_cast<const int*>(ids.data), weights.routed_down.weight_scale_divisors,
+        weights.routed_down.input_scale_divisors, assignments, kHidden, nullptr};
     constexpr int kDownRowsPerBlock = DecodeGroupedSchedule::kBlockN;
     const int down_blocks           = assignments * (kHidden / kDownRowsPerBlock);
-    detail::nvfp4_w4a4_mma_kernel<GroupedDownGeometry, DecodeGroupedSchedule,
-                                  detail::Nvfp4IdentityEpilogue, GroupedOutput, GroupedDownRows,
-                                  false, DecodeRouteWork>
-        <<<down_blocks, DecodeGroupedSchedule::kThreads, 0, stream>>>(
-            down_input, static_cast<const std::uint8_t*>(weights.routed_down.codes),
-            static_cast<const std::uint8_t*>(weights.routed_down.scales), assignments, 1.0F,
-            detail::Nvfp4IdentityEpilogue{},
-            GroupedOutput{static_cast<__nv_bfloat16*>(grouped_output.data), kHidden},
-            GroupedDownRows{}, down_work);
+    if (cpu) {
+        launch_down<GroupedDownGeometry, DecodeGroupedSchedule, GroupedOutput, false>(
+            weights.routed_down,
+            GroupedOutput{static_cast<__nv_bfloat16*>(grouped_output.data), kHidden}, masked_down,
+            down_blocks, down_input, assignments, stream);
+        wait_cpu_done<<<1, 1, 0, stream>>>(cpu_tier_device()->seq, cpu_tier_device()->done);
+    } else {
+        launch_down<GroupedDownGeometry, DecodeGroupedSchedule, GroupedOutput, false>(
+            weights.routed_down,
+            GroupedOutput{static_cast<__nv_bfloat16*>(grouped_output.data), kHidden}, plain_down,
+            down_blocks, down_input, assignments, stream);
+    }
     reduce_decode_routes_kernel<<<dim3((kHidden + 255) / 256, tokens), 256, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(grouped_output.data),
         static_cast<const float*>(alpha.data), static_cast<const float*>(shared_alpha.data),
-        static_cast<__nv_bfloat16*>(destination.data), tokens);
+        static_cast<__nv_bfloat16*>(destination.data), tokens,
+        cpu ? static_cast<const int*>(ids.data) : nullptr,
+        cpu ? weights.routed_gate_up.resident_mask : nullptr,
+        cpu ? static_cast<const __nv_bfloat16*>(cpu_tier_device()->rows) : nullptr);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -936,6 +1176,7 @@ void flash_next_moe(const Tensor& input, const FlashNextMoeWeights& weights, Ten
         }
         linear(shared_activation, weights.shared_down, destination, stream, bf16_gemm);
     }
+    maybe_dump_routes(ids, weights.router.payload, tokens, stream);
     Tensor routed_activation = workspace.alloc(DType::BF16, {kIntermediate, kTop, tokens});
     if (weights.routed_gate_up.qtype == QType::NVFP4 && tokens >= kGroupedFirstToken) {
         if (tokens <= kDecodeGroupedTokenTile) {
@@ -982,46 +1223,31 @@ void flash_next_moe(const Tensor& input, const FlashNextMoeWeights& weights, Ten
         detail::Nvfp4W4a4MaterializedActivation gate_input{
             static_cast<const std::uint8_t*>(gate_codes.data),
             static_cast<const std::uint8_t*>(gate_scales.data)};
-        const GroupedWork<GroupedGateRows> gate_work{static_cast<const int*>(job_count.data),
+        const GroupedWork gate_work{static_cast<const int*>(job_count.data),
                                                      static_cast<const int*>(job_experts.data),
                                                      static_cast<const int*>(job_columns.data),
                                                      static_cast<const int*>(offsets.data),
                                                      weights.routed_gate_up.weight_scale_divisors,
                                                      weights.routed_gate_up.input_scale_divisors,
                                                      kIntermediate};
+        const GroupedSiluOutput gate_output{
+            static_cast<__nv_bfloat16*>(routed_activation.data)};
+        stage_prefill(weights, ids, assignments, stream);
         if (decode_grouped) {
             constexpr int kGateRowsPerBlock = DecodeGroupedSchedule::kBlockN / 2;
             const int gate_blocks =
                 std::min(510, assignments * (kIntermediate / kGateRowsPerBlock));
-            detail::nvfp4_w4a4_mma_kernel<GroupedGateGeometry, DecodeGroupedSchedule,
-                                          detail::Nvfp4IdentityEpilogue, GroupedSiluOutput,
-                                          GroupedGateRows, true, GroupedWork<GroupedGateRows>>
-                <<<gate_blocks, DecodeGroupedSchedule::kThreads, 0, stream>>>(
-                    gate_input, static_cast<const std::uint8_t*>(weights.routed_gate_up.codes),
-                    static_cast<const std::uint8_t*>(weights.routed_gate_up.scales), assignments,
-                    1.0F, detail::Nvfp4IdentityEpilogue{},
-                    GroupedSiluOutput{static_cast<__nv_bfloat16*>(routed_activation.data)},
-                    GroupedGateRows{0, kGateRowsPerBlock}, gate_work);
+            launch_gate<GroupedGateGeometry, DecodeGroupedSchedule, GroupedSiluOutput, true>(
+                weights.routed_gate_up, gate_output, gate_work, gate_blocks, kGateRowsPerBlock,
+                gate_input, assignments, stream);
         } else if (large_grouped) {
-            detail::nvfp4_w4a4_mma_kernel<GroupedGateGeometry, LargeGroupedSchedule,
-                                          detail::Nvfp4IdentityEpilogue, GroupedSiluOutput,
-                                          GroupedGateRows, true, GroupedWork<GroupedGateRows>>
-                <<<510, LargeGroupedSchedule::kThreads, 0, stream>>>(
-                    gate_input, static_cast<const std::uint8_t*>(weights.routed_gate_up.codes),
-                    static_cast<const std::uint8_t*>(weights.routed_gate_up.scales), assignments,
-                    1.0F, detail::Nvfp4IdentityEpilogue{},
-                    GroupedSiluOutput{static_cast<__nv_bfloat16*>(routed_activation.data)},
-                    GroupedGateRows{0, LargeGroupedSchedule::kBlockN / 2}, gate_work);
+            launch_gate<GroupedGateGeometry, LargeGroupedSchedule, GroupedSiluOutput, true>(
+                weights.routed_gate_up, gate_output, gate_work, 510,
+                LargeGroupedSchedule::kBlockN / 2, gate_input, assignments, stream);
         } else {
-            detail::nvfp4_w4a4_mma_kernel<GroupedGateGeometry, GroupedGateSchedule,
-                                          detail::Nvfp4IdentityEpilogue, GroupedSiluOutput,
-                                          GroupedGateRows, true, GroupedWork<GroupedGateRows>>
-                <<<510, GroupedGateSchedule::kThreads, 0, stream>>>(
-                    gate_input, static_cast<const std::uint8_t*>(weights.routed_gate_up.codes),
-                    static_cast<const std::uint8_t*>(weights.routed_gate_up.scales), assignments,
-                    1.0F, detail::Nvfp4IdentityEpilogue{},
-                    GroupedSiluOutput{static_cast<__nv_bfloat16*>(routed_activation.data)},
-                    GroupedGateRows{0, GroupedGateSchedule::kBlockN / 2}, gate_work);
+            launch_gate<GroupedGateGeometry, GroupedGateSchedule, GroupedSiluOutput, true>(
+                weights.routed_gate_up, gate_output, gate_work, 510,
+                GroupedGateSchedule::kBlockN / 2, gate_input, assignments, stream);
         }
         Tensor down_codes  = workspace.alloc(DType::U8, {kIntermediate / 2, assignments});
         Tensor down_scales = workspace.alloc(DType::U8, {kIntermediate / 16, assignments});
@@ -1035,45 +1261,26 @@ void flash_next_moe(const Tensor& input, const FlashNextMoeWeights& weights, Ten
         detail::Nvfp4W4a4MaterializedActivation down_input{
             static_cast<const std::uint8_t*>(down_codes.data),
             static_cast<const std::uint8_t*>(down_scales.data)};
-        const GroupedWork<GroupedDownRows> down_work{static_cast<const int*>(job_count.data),
+        const GroupedWork down_work{static_cast<const int*>(job_count.data),
                                                      static_cast<const int*>(job_experts.data),
                                                      static_cast<const int*>(job_columns.data),
                                                      static_cast<const int*>(offsets.data),
                                                      weights.routed_down.weight_scale_divisors,
                                                      weights.routed_down.input_scale_divisors,
                                                      kHidden};
+        const GroupedOutput down_output{static_cast<__nv_bfloat16*>(grouped_output.data), kHidden};
         if (decode_grouped) {
             constexpr int kDownRowsPerBlock = DecodeGroupedSchedule::kBlockN;
             const int down_blocks = std::min(510, assignments * (kHidden / kDownRowsPerBlock));
-            detail::nvfp4_w4a4_mma_kernel<GroupedDownGeometry, DecodeGroupedSchedule,
-                                          detail::Nvfp4IdentityEpilogue, GroupedOutput,
-                                          GroupedDownRows, false, GroupedWork<GroupedDownRows>>
-                <<<down_blocks, DecodeGroupedSchedule::kThreads, 0, stream>>>(
-                    down_input, static_cast<const std::uint8_t*>(weights.routed_down.codes),
-                    static_cast<const std::uint8_t*>(weights.routed_down.scales), assignments, 1.0F,
-                    detail::Nvfp4IdentityEpilogue{},
-                    GroupedOutput{static_cast<__nv_bfloat16*>(grouped_output.data), kHidden},
-                    GroupedDownRows{}, down_work);
+            launch_down<GroupedDownGeometry, DecodeGroupedSchedule, GroupedOutput, false>(
+                weights.routed_down, down_output, down_work, down_blocks, down_input, assignments,
+                stream);
         } else if (large_grouped) {
-            detail::nvfp4_w4a4_mma_kernel<GroupedDownGeometry, LargeGroupedSchedule,
-                                          detail::Nvfp4IdentityEpilogue, GroupedOutput,
-                                          GroupedDownRows, false, GroupedWork<GroupedDownRows>>
-                <<<510, LargeGroupedSchedule::kThreads, 0, stream>>>(
-                    down_input, static_cast<const std::uint8_t*>(weights.routed_down.codes),
-                    static_cast<const std::uint8_t*>(weights.routed_down.scales), assignments, 1.0F,
-                    detail::Nvfp4IdentityEpilogue{},
-                    GroupedOutput{static_cast<__nv_bfloat16*>(grouped_output.data), kHidden},
-                    GroupedDownRows{}, down_work);
+            launch_down<GroupedDownGeometry, LargeGroupedSchedule, GroupedOutput, false>(
+                weights.routed_down, down_output, down_work, 510, down_input, assignments, stream);
         } else {
-            detail::nvfp4_w4a4_mma_kernel<GroupedDownGeometry, GroupedDownSchedule,
-                                          detail::Nvfp4IdentityEpilogue, GroupedOutput,
-                                          GroupedDownRows, false, GroupedWork<GroupedDownRows>>
-                <<<510, GroupedDownSchedule::kThreads, 0, stream>>>(
-                    down_input, static_cast<const std::uint8_t*>(weights.routed_down.codes),
-                    static_cast<const std::uint8_t*>(weights.routed_down.scales), assignments, 1.0F,
-                    detail::Nvfp4IdentityEpilogue{},
-                    GroupedOutput{static_cast<__nv_bfloat16*>(grouped_output.data), kHidden},
-                    GroupedDownRows{}, down_work);
+            launch_down<GroupedDownGeometry, GroupedDownSchedule, GroupedOutput, false>(
+                weights.routed_down, down_output, down_work, 510, down_input, assignments, stream);
         }
         reduce_grouped_kernel<<<dim3((kHidden + 255) / 256, tokens), 256, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(grouped_output.data),

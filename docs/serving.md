@@ -1,57 +1,40 @@
-The binary in this tree is `ninfer-spo-serve`. `scripts/build.cmd dev` writes it to `build-spo-dev/apps`. `scripts/serve.cmd` is the Windows launcher. The examples below use the older `build/apps/ninfer-serve` path. Flag names are in `docs/configuration.md`.
-
 # HTTP serving
 
-`build/apps/ninfer-serve` loads one v3 `.ninfer` artifact and exposes OpenAI- and
-Anthropic-compatible HTTP endpoints over one resident NInfer Engine.
+`ninfer-spo-serve` loads one V3 `.ninfer` artifact and exposes OpenAI- and Anthropic-compatible HTTP endpoints over one resident engine. `scripts/build.cmd dev` writes it to `build-spo-dev/apps`. Flags and defaults are in `docs/configuration.md`.
 
 ## Start the server
 
-See [CUDA synchronization](cli.md#cuda-synchronization) for the shared `NINFER_CUDA_SYNC` setting.
+Two setups are the ones to launch. The Pi server is `scripts/serve.cmd` ([Pi](pi.md)): Qwen3.8 Flash-Next on port 8003, with the script's own context, KV, MTP, vision, and checkpoint arguments. Gemma 4 voice chat is [below](#gemma-4-for-voice-chat). `ninfer-spo-serve --help` prints the flag contract.
 
-```bash
-./build/apps/ninfer-serve models/qwen3_8_27b_nvfp4.ninfer \
-  --host 127.0.0.1 \
-  --port 8080 \
-  --max-context 240000 \
-  --kv-capacity 240000 \
-  --max-concurrency 2 \
-  --kv-dtype fp8 \
-  --device-state-slots 2 \
-  --spec mtp --draft-tokens 3 \
-  --lm-head-draft \
-  --preserve-thinking
-```
+See [CUDA synchronization](cli.md#cuda-synchronization) for `NINFER_CUDA_SYNC`.
 
-The command uses Qwen3.8-27B NVFP4. Each request has a 240,000-token logical ceiling. A shared
-240,000-token Main Text KV pool serves admitted requests; either request may use the full capacity
-when running alone. Requests acquire KV pages as execution advances; if concurrent growth exhausts
-the pool, the scheduler can pause a request and restore it later.
+When `--model-id` is omitted, the server advertises the artifact's `metadata.name`, or the architecture name when none is stored. An explicit `--model-id` is only the public HTTP alias.
 
-With `C=2` and two extra Device slots, the process owns four Device StateImages. The default shared
-pinned Host budget is 8 GiB plus eight model StateImages. It holds retained state, KV and pause
-snapshots, including in-flight destinations; `--host-context-mib` sets an explicit total instead.
+Vision is off unless `--vision` is set. Media requests and token-count requests then fail with HTTP 400 `vision_disabled`, and the vision weights are not allocated. `--spec` (`mtp`, `dflash`, or `dflash2`) and `--draft-tokens` freeze the speculative backend at startup. Omitting `--spec` loads none. `--lm-head-draft` loads the proposal head. A later request cannot turn on a capability omitted at startup. The artifact needs the text backbone and the optional components selected for this process. Vision encode and prefill stay outside speculative decode.
 
-Other artifacts use the same command shape with their own path. For 35B-A3B DFlash, replace the MTP
-selection with `--spec dflash --draft-tokens 7 --lm-head-draft`. Qwen3.8-27B
-artifacts with DFlash2 companion weights also support `--spec dflash2 --draft-tokens 7`, with
-`--lm-head-draft` optional. DFlash2 accepts draft counts 1..15 and supports the same sampling,
-concurrency, prefix reuse, and image/video request surfaces. It may remain combined with
-`--vision`.
+Requests acquire KV pages as execution advances. If concurrent growth exhausts the pool, the scheduler can pause a request and restore it later.
 
-When `--model-id` is omitted, the server advertises and accepts the artifact's `metadata.name`,
-falling back to its architecture name when no name is stored. An explicit `--model-id` is a public
-HTTP alias override and does not select or alter model execution.
+## Smaller cards, same artifact
 
-Vision is disabled by default: its weights and Vision-specific unified-workspace extent are not
-allocated, and media requests and token-count requests fail with HTTP 400 `vision_disabled`. Add
-`--vision` when the server must accept image or video input. Speculative residency is likewise
-frozen by `--spec mtp|dflash|dflash2` and `--draft-tokens`; omitting `--spec` loads no speculative backend.
-`--lm-head-draft` additionally loads the optimized proposal head. DFlash on 35B-A3B and DFlash2 on Qwen3.8-27B can be combined
-with `--vision`; each accelerates generated-text decode after multimodal prefill, while Vision encode
-and prefill remain outside speculative acceleration. A later request cannot enable a capability
-omitted at startup. The artifact need only contain the Text backbone and the optional components
-selected for this process.
+`--expert-vram-gib N` keeps the hottest Flash-Next routed experts in N GiB of VRAM and pins the rest in host RAM. On a decode or verify step the CPU computes the misses (AVX-512 VNNI, or AVX2 VNNI, or a scalar fallback) while the GPU computes the hits. A prefill copies the cold experts that layer uses into a VRAM scratch and then runs the same GPU kernels, so a prefill is bit-identical to a full-VRAM run. Unset, nothing is pinned and every expert is uploaded as before.
+
+The CPU dot is fp32. The GPU dot is the FP4 tensor core. On random experts one layer differed by up to 4.5% relative (`ninfer_flash_next_moe_tier_test`), so a greedy reply can diverge from a full-VRAM run rather than only at a near tie. `NINFER_EXPERT_CPU_THREADS` sets the worker count (default 8). `NINFER_EXPERT_ADAPT=0` freezes the hot set; otherwise each round swaps up to four experts toward the recent routes.
+
+Short greedy replies on this RTX PRO 6000 (Windows, PCIe 5.0 x4 at 13.7 GB/s, `--draft-tokens 3`). The same table is in the README. The 286 tok/s row is all 16 short-genre prompts; the miss rows used the first 4 of those, whose full-VRAM rate was 239 tok/s, or 12 of them at 278 tok/s for the 21 GiB PCIe run. The PCIe rows are the earlier decode path, which read each miss from pinned memory. Decode in this build uses the CPU rows. A desktop with a full x16 link stages prefill faster; the CPU decode rate is the cores and RAM, not the link.
+
+| Run | Prompts | tok/s | First token | Greedy text |
+|---|---|---|---|---|
+| Every expert in VRAM | 16 short | 286 | 70–90 ms | reference |
+| Every expert in VRAM | first 4 of those | 239 | ~80 ms | reference |
+| CPU misses, 13 GiB resident, 8 threads, adapt off | those 4 | 18 | 0.7 s | diverges |
+| CPU misses, 19 GiB resident, 8 threads, adapt off | those 4 | 15–19 | 0.2–1.0 s | |
+| CPU misses, 21 GiB resident, 8 threads, adapt off | those 4 | 13–18 | 0.2–1.0 s | |
+| PCIe zero-copy misses, 13 GiB | those 4 | 7.4 | 1.9–2.4 s | matched |
+| PCIe zero-copy misses, 21 GiB | 12 short | 11 | 1.1–1.2 s | matched |
+
+The non-expert part needs about 12 GiB of VRAM with a 32k bf16 KV cache, one lane, two state slots, and no vision or LM-head draft. A 32 GB card therefore holds about 19 GiB of experts; 21 GiB measured 32.9 GiB in use. The cold copy is pinned (42-50 GiB) on top of the 47.7 GiB PLE table, which is page-locked, so the machine wants 128 GB of RAM. Windows pins about RAM/2 − 8 GiB. On Windows `cudaMemGetInfo` under-reports free VRAM once the cold copy is mapped, so set `--kv-capacity` explicitly rather than `auto`. Startup prints the slot count and the pinned size and stops if the pin fails; the pin counts toward `NINFER_PIN_CEILING_GIB`.
+
+`NINFER_EXPERT_PROFILE` points at a JSON file of `[layer, expert]` pairs, hottest first. Write it with `tools/bench/expert_tier_model.py --write-profile` from a `NINFER_ROUTING_DUMP` capture (`--no-cuda-graph`). A profile ranked on other prompts of the same genres hit 74% of routes at 21 GiB and 59% at 13 GiB. Without a profile the tier keeps the lowest expert ids.
 
 ## Endpoints
 
@@ -877,76 +860,15 @@ curl http://127.0.0.1:8080/v1/models \
 
 `--cors` adds permissive browser CORS headers. It is disabled by default.
 
-## Server options
+## Sampling and context storage
 
-The table lists executable defaults. The startup example selects a long-context FP8/MTP3 profile.
+Flags and defaults are in `docs/configuration.md`.
 
-| Option | Meaning | Default |
-|---|---|---:|
-| `--host H` | listen address | `127.0.0.1` |
-| `--port N` | listen port | `8080` |
-| `--api-key KEY` | required bearer or `x-api-key` value | unset |
-| `--model-id ID` | override the public OpenAI model alias | artifact `metadata.name`, or architecture name |
-| `--max-context N` | logical context ceiling of each sequence | `8192` |
-| `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `8192` |
-| `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
-| `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
-| `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
-| `--prefill-chunk N` | text-prefill chunk | `1024` |
-| `--capture-path DIR` | directory for activation captures; unset means requests cannot record | unset |
-| `--capture-sites LIST` | comma-separated `prompt_last` and/or `completion_last` | `prompt_last,completion_last` |
-| `--steering-pack FILE` | steering pack loaded at startup | unset |
-| `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
-| `--log-level trace\|debug\|info\|warning\|error\|critical\|off` | pretty stderr verbosity | `info` |
-| `--device N` | CUDA device index | `0` |
-| `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |
-| `--max-request-mib N` | body-size limit before JSON parsing | `384` |
-| `--media-cache-mib N` | LRU-retained prepared BF16 media payloads; `0` disables retention | `1024` |
-| `--media-live-mib N` | all live prepared BF16 media payloads | `2048` |
-| `--media-preprocess-threads N` | bounded media preprocessing workers; `0` selects at most 16 from host concurrency | `0` |
-| `--request-log-jsonl FILE` | append full-precision server/request records | disabled |
-| `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
-| `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
-| `--kv-dtype bf16\|int8\|fp8\|nvfp4\|k8v4` | KV-cache storage | `bf16` |
-| `--spec mtp\|dflash\|dflash2` | speculative backend | off |
-| `--draft-tokens N` | MTP `1..5`; DFlash/DFlash2 `1..15` | unset |
-| `--lm-head-draft` | optimized proposal head | off |
-| `--default-max-tokens N` | output limit when omitted by a request | `8192` |
-| `--default-thinking-budget N` | positive thinking cap inherited by thinking-enabled requests | unset |
-| `--vision` | enable media input and load Vision GPU allocations | off |
-| `--no-cuda-graph` | disable CUDA Graph decode | graphs on |
-| `--no-prefix-reuse` | disable compatible-prefix caching | prefix reuse on |
-| `--device-state-slots N` | extra Device StateImages beyond `max-concurrency` | `max-concurrency` |
-| `--host-context-mib N` | shared pinned Host budget for StateImages, KV and pause snapshots, including in-flight destinations | `8192 MiB + 8 native StateImages` |
-| `--no-thinking` | disable thinking by default | thinking on |
-| `--preserve-thinking` | preserve closed-turn assistant reasoning by default | off |
-| `--cors` | permissive browser CORS headers | off |
-| `--temperature F` | process-level temperature override | unset |
-| `--top-p F` | process-level top-p override | unset |
-| `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |
-| `--min-p F` | process-level min-p override | unset |
-| `--presence-penalty F` | process-level presence-penalty override | unset |
-| `--frequency-penalty F` | process-level frequency-penalty override | unset |
-| `--seed N` | fixed seed when a request omits one | fresh random seed per request |
-| `--greedy` | force exact argmax for all requests | off |
+Context-cost coefficients resolve once at startup from generic defaults, matching compiled values, and optional transfer or prefill entries from `--context-cost-presets`. Prefill entries match the hardware and a signature derived from the text and vision configuration, bindings, and uses. A representation without a matching measurement uses the generic prefill coefficients. A malformed file aborts startup. The operational context-cost record and the JSONL `server_start` name the source that was selected.
 
-Context-cost coefficients resolve once at startup from generic defaults, matching compiled values,
-and optional transfer or prefill entries from `--context-cost-presets FILE`. Prefill entries match
-the hardware and a signature derived from the actual Text/Vision configuration, bindings and Uses.
-A new representation without a matching measurement uses generic prefill coefficients. A malformed
-file aborts startup; the operational context-cost record and JSONL `server_start` identify the
-selected source.
+Sampling defaults come from the loaded architecture and the request's resolved thinking mode. Flash-Next and Qwen3.5 use temperature 1.0, top-p 0.95, and top-k 20 while thinking, and temperature 0.7, top-p 0.80, top-k 20, and presence penalty 1.5 when thinking is off. Qwen3.5 MoE also uses presence penalty 1.5 while thinking. Gemma 4 uses temperature 1.0, top-k 20, and top-p 0.95. Frequency penalty is 0. Process flags override the preset, request fields override process flags, and `--greedy` forces temperature 0.
 
-Engine selects sampling defaults from the loaded architecture and the request's resolved thinking mode.
-Qwen3.6-27B and Qwen3.8-27B use `1.0/0.95/20/0/0` for
-temperature/top-p/top-k/min-p/presence penalty in thinking mode and `0.7/0.80/20/0/1.5` in
-non-thinking mode. Qwen3.6-35B-A3B differs only in its thinking presence penalty, which is `1.5`.
-Frequency penalty is `0` for all registered presets. Process flags override registered values,
-request fields override process flags, and `--greedy` finally forces temperature `0`.
-
-For `C=--max-concurrency` and `H=--device-state-slots`, total Device StateImage capacity is `C+H`.
-Host state and Main/Backend KV share one startup-fixed byte budget; this is context storage, not a
-limit on total process RAM. `--host-context-mib 0` disables Host context backing.
+For `C=--max-concurrency` and `H=--device-state-slots`, total device state images are `C+H`. Host state and KV share one byte budget fixed at startup. That budget is context storage, not a cap on process RAM. `--host-context-mib 0` disables the host context backing.
 
 ### Flash-Next checkpoint slots
 
@@ -1039,8 +961,6 @@ it saves at least 256 prompt tokens (1,024 from the host, whose restore moves th
 PCIe). Image positions are keyed by a hash of the image, so an
 image request resumes only before or across the same image, and a fully reused image is not
 encoded again. `--no-prefix-reuse` turns reuse and checkpoints off.
-
-Run `./build/apps/ninfer-serve --help` for the exact option contract.
 
 Serve writes human-readable operational records to stderr using
 `YYYY-MM-DD HH:MM:SS.mmm  LEVEL  message`. Normal output covers material startup milestones,

@@ -91,6 +91,10 @@ ninfer_add_op_test(ninfer_sparse_moe_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_sparse_moe.cpp"
   LIBRARIES ninfer_ops)
 
+ninfer_add_op_test(ninfer_flash_next_moe_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_flash_next_moe_tier.cpp"
+  LIBRARIES ninfer_ops)
+
 ninfer_add_op_test(ninfer_mtp_pack_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_mtp_pack.cpp"
   LIBRARIES ninfer_ops)

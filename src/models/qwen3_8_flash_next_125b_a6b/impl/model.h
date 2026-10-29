@@ -6,6 +6,7 @@
 #include "ninfer/ops/flash_next_ple.h"
 #include "ninfer/ops/flash_next_qsa.h"
 #include "ninfer/ops/hyperconnection.h"
+#include "models/qwen3_8_flash_next_125b_a6b/impl/expert_tier.h"
 #include "models/qwen3_8_flash_next_125b_a6b/impl/load_plan.h"
 #include <ninfer/models/qwen3_8_flash_next_125b_a6b/package.h>
 #include <ninfer/models/qwen3_8_flash_next/frontend_resources.h>
@@ -107,6 +108,7 @@ public:
 
     artifact::MaterializedArtifact backing;
     artifact::MappedRange ple_mapping;
+    ExpertTierKeep expert_tier;
     qwen3_8_flash_next::FrontendResources frontend;
     RuntimeModelView runtime;
 };

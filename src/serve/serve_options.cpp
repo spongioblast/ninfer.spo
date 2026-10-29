@@ -132,6 +132,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--capture-path DIR] [--capture-sites prompt_last,completion_last] "
            "[--steering-pack PATH] [--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--chat-template FILE] [--lm-head-draft] [--no-thinking] [--preserve-thinking] "
+           "[--expert-vram-gib N] "
            "[--cors] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
@@ -407,6 +408,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--prefill-graph-cache"), "prefill-graph-cache");
         } else if (arg == "--no-prefill-graphs") {
             options.runtime_switches.prefill_graphs_off = true;
+        } else if (arg == "--expert-vram-gib") {
+            const int gib = parse_nonnegative_int(require_value("--expert-vram-gib"), "expert-vram-gib");
+            if (gib <= 0 || gib > 256) {
+                throw std::invalid_argument("--expert-vram-gib must be in [1,256]");
+            }
+            options.runtime_switches.expert_vram_gib = gib;
         } else if (!product::parse_host_option(
                        arg, [&] { return require_value(argv[i]); }, options.host_residency,
                        kv_headroom_bytes)) {

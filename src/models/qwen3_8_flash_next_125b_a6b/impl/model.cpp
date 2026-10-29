@@ -1,3 +1,4 @@
+#include "models/qwen3_8_flash_next_125b_a6b/impl/expert_tier.h"
 #include "models/qwen3_8_flash_next_125b_a6b/impl/model.h"
 
 #include "artifact/reader.h"
@@ -131,18 +132,36 @@ ops::FlashNextExpertBank bf16_bank(const artifact::MaterializedArtifact& artifac
     };
 }
 
+// Codes, scales and weight divisors stay in the mapped file until apply_expert_tier places them.
+ops::FlashNextExpertBank mapped_nvfp4_bank(const artifact::MaterializedArtifact& artifact,
+                                           const artifact::ParameterReference& input_divisors,
+                                           int rows, int columns) {
+    return {
+        .input_scale_divisors = reinterpret_cast<const float*>(data(artifact, input_divisors)),
+        .qtype                = QType::NVFP4,
+        .experts              = 512,
+        .rows                 = rows,
+        .columns              = columns,
+    };
+}
+
 ops::FlashNextMoeWeights moe(const MoePlan& plan, const artifact::MaterializedArtifact& artifact) {
+    const bool mapped = plan.gate_file.has_value();
     return {
         .router         = bf16(artifact, plan.router, 512, 2560),
         .shared_gate    = bf16(artifact, plan.shared_gate, 640, 2560),
         .shared_up      = bf16(artifact, plan.shared_up, 640, 2560),
         .shared_down    = bf16(artifact, plan.shared_down, 2560, 640),
         .shared_scale   = bf16(artifact, plan.shared_scale, 1, 2560),
-        .routed_gate_up = plan.nvfp4_experts
+        .routed_gate_up = mapped ? mapped_nvfp4_bank(artifact, plan.routed_gate_up_input_divisors,
+                                                     1280, 2560)
+                          : plan.nvfp4_experts
                               ? nvfp4_bank(artifact, plan.routed_gate_up,
                                            plan.routed_gate_up_input_divisors, 1280, 2560)
                               : bf16_bank(artifact, plan.routed_gate_up, 1280, 2560),
-        .routed_down = plan.nvfp4_experts
+        .routed_down = mapped ? mapped_nvfp4_bank(artifact, plan.routed_down_input_divisors,
+                                                  2560, 640)
+                       : plan.nvfp4_experts
                            ? nvfp4_bank(artifact, plan.routed_down, plan.routed_down_input_divisors,
                                         2560, 640)
                            : bf16_bank(artifact, plan.routed_down, 2560, 640),
@@ -250,6 +269,7 @@ LoadedModelData::LoadedModelData(BindingPlan&& plan, artifact::MaterializedArtif
             out.post_mixer = moe(source.moe, backing);
         }
     }
+    apply_expert_tier(runtime, plan, expert_tier);
     runtime.final_hc    = final_hc(plan.final_hc, backing);
     runtime.output_head = bf16(backing, plan.output_head, 248320, 2560);
     runtime.features    = plan.features;

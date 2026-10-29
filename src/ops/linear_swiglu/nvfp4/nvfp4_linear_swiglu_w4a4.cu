@@ -26,6 +26,7 @@ constexpr int kIntermediate = Geometry::kOutputRows / 2;
 
 struct Nvfp4SwiGluRows {
     static constexpr bool kContiguous   = false;
+    static constexpr bool kScattered    = false;
     static constexpr int kRowsPerBranch = M64N128::kBlockN / 2;
 
     __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
