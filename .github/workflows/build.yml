@@ -5,6 +5,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   windows-release:
     runs-on: windows-latest
@@ -58,7 +61,7 @@ jobs:
           "VS=$vs" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Write-Host $vs
 
-      - name: Release
+      - name: Compile
         shell: cmd
         run: |
           call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
@@ -69,16 +72,25 @@ jobs:
           cmake --build build || exit /b 1
           for %%D in (avcodec avformat avutil swscale swresample) do xcopy /y /q "ffmpeg\bin\%%D-*.dll" "build\apps\" >nul || exit /b 1
 
-      - uses: actions/upload-artifact@v4
-        with:
-          name: windows-release
-          if-no-files-found: error
-          path: |
-            build/apps/ninfer-spo.exe
-            build/apps/ninfer-spo-serve.exe
-            build/apps/ninfer-spo-perplexity.exe
-            build/apps/avcodec-*.dll
-            build/apps/avformat-*.dll
-            build/apps/avutil-*.dll
-            build/apps/swscale-*.dll
-            build/apps/swresample-*.dll
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          $tag = "windows-$sha"
+          $dlls = Get-ChildItem build/apps -File | Where-Object {
+            $_.Name -match '^(avcodec|avformat|avutil|swscale|swresample)-.+\.dll$'
+          }
+          if ($dlls.Count -ne 5) { throw "expected 5 FFmpeg DLLs, found $($dlls.Count)" }
+          $files = @(
+            "build/apps/ninfer-spo.exe",
+            "build/apps/ninfer-spo-serve.exe",
+            "build/apps/ninfer-spo-perplexity.exe"
+          ) + @($dlls.FullName)
+          $notes = @"
+          Windows release build of ``$env:GITHUB_SHA`` (``sm_120a``).
+
+          ``ninfer-spo.exe``, ``ninfer-spo-serve.exe``, and ``ninfer-spo-perplexity.exe``. The FFmpeg DLLs sit next to them. The runner has no GPU, so this is a compile only.
+          "@
+          gh release create $tag --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --title "Windows $sha" --notes $notes @files
